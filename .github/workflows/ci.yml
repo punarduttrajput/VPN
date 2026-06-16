@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Unit + integration tests on every push, across Linux and Windows (the dev host).
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Formatting + lint gate (run once, on Linux).
+      - name: rustfmt
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      - name: Test
+        run: cargo test --workspace
+
+  # Real-device + benchmark verification (M3 / M5 / M6) on a Linux runner.
+  verify-linux:
+    name: verify-linux (M3/M5/M6)
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install network + benchmark tools
+        run: sudo apt-get update && sudo apt-get install -y iproute2 iperf3
+
+      - name: Ensure /dev/net/tun is available
+        run: |
+          sudo modprobe tun || true
+          test -e /dev/net/tun && echo "TUN device present"
+
+      - name: Run Phase 1 Linux verification
+        # Preserve PATH so the cargo installed for the runner user is found under sudo.
+        run: sudo -E env "PATH=$PATH" bash ./scripts/verify-linux.sh

@@ -1,0 +1,19 @@
+[package]
+name = "vpn-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "vpn"
+path = "src/main.rs"
+
+[dependencies]
+vpn-core = { path = "../core" }
+vpn-tunnel = { path = "../tunnel" }
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true

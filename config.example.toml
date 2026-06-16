@@ -1,0 +1,12 @@
+# Example Phase 1 tunnel config (PRD FR4).
+# Generate keys with: `vpn keygen` (run on each peer; swap public keys).
+# This peer is 10.8.0.1; the remote peer is 10.8.0.2.
+
+private_key = "QS7buCcJSPaBxgL+RBprA3Jd/4HhbqljS1WPEWad4Yg="
+listen_port = 51820
+interface_address = "10.8.0.1/24"
+
+[peer]
+public_key = "KHyJB+k340kMHCKZfdFOY0ZWRYn7Sab16haK1Yk+WW8="
+endpoint = "203.0.113.5:51820"
+allowed_ips = ["10.8.0.2/32"]

@@ -1,0 +1,26 @@
+[package]
+name = "vpn-tunnel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+# Pulls in the real OS TUN device (Linux/macOS). Off by default so the data
+# plane builds and tests on any host (incl. Windows) without platform drivers.
+real-tun = ["dep:tun"]
+
+[dependencies]
+vpn-core = { path = "../core" }
+boringtun.workspace = true
+x25519-dalek.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+# Real TUN device — only compiled when the `real-tun` feature is enabled,
+# which is intended for Unix (Phase 1 scope: Linux + macOS).
+tun = { version = "0.6", features = ["async"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }

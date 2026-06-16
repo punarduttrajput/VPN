@@ -1,0 +1,12 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Cargo (keep Cargo.lock for the workspace; it has binaries)
+# (Cargo.lock is intentionally committed for reproducible binary builds)
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
