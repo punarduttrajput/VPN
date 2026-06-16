@@ -1,0 +1,8 @@
+# Normalize line endings. Shell scripts MUST stay LF so they run on Linux
+# runners even when authored/checked out on Windows.
+* text=auto
+*.sh text eol=lf
+*.rs text
+*.toml text
+*.md text
+*.yml text eol=lf
