@@ -54,6 +54,8 @@ where
 
     let mut tun_buf = vec![0u8; MAX_PACKET];
     let mut udp_buf = vec![0u8; MAX_PACKET];
+    // Reused across iterations to avoid a heap allocation per packet (throughput).
+    let mut out_buf = vec![0u8; MAX_PACKET];
     let mut timer = tokio::time::interval(Duration::from_millis(250));
     tokio::pin!(shutdown);
 
@@ -70,9 +72,8 @@ where
             // Outbound: OS -> TUN -> encrypt -> UDP.
             read = device.read_packet(&mut tun_buf) => {
                 let n = read?;
-                let mut out = vec![0u8; MAX_PACKET];
                 let mut s = session.lock().await;
-                match s.encapsulate(&tun_buf[..n], &mut out)? {
+                match s.encapsulate(&tun_buf[..n], &mut out_buf)? {
                     Action::SendToPeer(pkt) => { socket.send_to(pkt, peer).await?; }
                     Action::Done => {}
                     Action::WriteToTun(..) => { /* not expected on encap */ }
@@ -82,9 +83,8 @@ where
             // Inbound: UDP -> decrypt -> TUN.
             recv = socket.recv_from(&mut udp_buf) => {
                 let (n, _from) = recv?;
-                let mut out = vec![0u8; MAX_PACKET];
                 let mut s = session.lock().await;
-                match s.decapsulate(&udp_buf[..n], &mut out)? {
+                match s.decapsulate(&udp_buf[..n], &mut out_buf)? {
                     Action::WriteToTun(pkt, _ip) => {
                         let pkt = pkt.to_vec();
                         drop(s);
@@ -98,9 +98,8 @@ where
 
             // Periodic: service WireGuard timers (re-handshake, keepalive) — NFR5.
             _ = timer.tick() => {
-                let mut out = vec![0u8; MAX_PACKET];
                 let mut s = session.lock().await;
-                match s.update_timers(&mut out) {
+                match s.update_timers(&mut out_buf) {
                     Ok(Action::SendToPeer(pkt)) => { socket.send_to(pkt, peer).await?; }
                     Ok(_) => {}
                     Err(e) => warn!("timer update error: {e}"),

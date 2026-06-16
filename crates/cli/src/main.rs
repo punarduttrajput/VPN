@@ -97,8 +97,28 @@ async fn up(config_path: &str, iface: &str, mtu: u16) -> Result<()> {
         .with_context(|| format!("binding UDP socket on {bind_addr}"))?;
     let peer = config.peer_endpoint()?;
 
+    // FR1: graceful teardown on Ctrl-C (SIGINT) or SIGTERM.
     let shutdown = async {
-        let _ = tokio::signal::ctrl_c().await;
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut term = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("could not install SIGTERM handler: {e}");
+                    let _ = tokio::signal::ctrl_c().await;
+                    return;
+                }
+            };
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
     };
 
     info!("starting tunnel event loop (Ctrl-C to stop)");
