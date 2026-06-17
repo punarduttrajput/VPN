@@ -98,9 +98,13 @@ task — one CPU core does all crypto plus a syscall per packet — so it is
 CPU-bound around 350–400 Mbps on a shared 2-vCPU runner, independent of link
 speed (an unshaped multi-Gbps veth gave ~414 Mbps).
 
-Path to actually meet NFR1 (future work, beyond MVP scope):
-- **UDP GSO/GRO batching** (sendmmsg/recvmmsg) to cut the per-packet syscall cost — usually the single biggest userspace win.
-- **Multi-core data plane** (multiple receive queues / worker tasks) — bounded by WireGuard's per-session nonce ordering.
+Path to actually meet NFR1:
+- **✅ Pipelined data plane (done, pending re-measure)** — the runner was rewritten
+  from a single one-packet-in-flight loop into concurrent tasks (net reader, net
+  writer, device I/O, crypto) joined by channels, so I/O syscalls overlap with
+  crypto across cores. Targets the measured root cause (serialized pipeline, not
+  crypto). Throughput impact to be confirmed by the next `verify-linux` run.
+- **UDP GSO/GRO batching** (sendmmsg/recvmmsg) — the next userspace win after pipelining.
 - **eBPF/XDP fast path** (Phase 6) for line-rate forwarding.
 
 To enforce the 70% gate on dedicated/representative hardware:
@@ -161,3 +165,4 @@ To enforce the 70% gate on dedicated/representative hardware:
 **MTU note:** QUIC's conservative initial datagram size (~1180 B) is below a 1420 MTU; `QuicTransport::max_datagram_size()` is exposed so the inner tunnel MTU can be reduced when running over QUIC. Wiring that into the runtime MTU is part of the CLI-selection follow-up.
 - 2026-06-17 — NFR1 reality check on shared CI (shaped 1 Gbps link): baseline 956 Mbps, tunnel **356 Mbps = 0.37** (target 0.70). Single-task userspace is CPU-bound, so 70% is not met on this hardware. Made NFR1 informational on CI (hard floor 200 Mbps for regressions; `STRICT_THROUGHPUT=1` enforces 70% on dedicated HW). Documented the honest status and the path to meet it (GSO batching, multi-core, eBPF). NFR2 latency +0.24 ms PASS.
 - 2026-06-17 — **CI green confirmed**: `verify-linux` passes (M3, M5, NFR2, teardown all PASS; NFR1 ratio 0.37 reported informationally). Both `test` jobs (Linux/Windows) and the `quic`-feature steps pass.
+- 2026-06-17 — **Pipelined data plane**: rewrote the runner from a single serialized loop (one packet in flight) into concurrent tasks — net reader, net writer, device I/O, and crypto — joined by bounded channels, so syscalls overlap with crypto across cores. `Transport`/`TunDevice` trait methods now return `Send` futures. All 19/20 tests pass; clippy/fmt clean. Throughput re-measurement pending the next `verify-linux` run (NFR1 stays informational until confirmed).

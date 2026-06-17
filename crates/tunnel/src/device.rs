@@ -7,12 +7,20 @@
 use crate::Result;
 
 /// A virtual network interface that yields and accepts raw IP packets.
-#[allow(async_fn_in_trait)]
+///
+/// Methods return `Send` futures so the data plane can drive the device from a
+/// spawned task (see the runner's pipeline).
 pub trait TunDevice: Send {
     /// Read one outbound IP packet from the OS into `buf`; returns its length.
-    async fn read_packet(&mut self, buf: &mut [u8]) -> Result<usize>;
+    fn read_packet(
+        &mut self,
+        buf: &mut [u8],
+    ) -> impl std::future::Future<Output = Result<usize>> + Send;
     /// Write one decrypted IP packet to the OS.
-    async fn write_packet(&mut self, packet: &[u8]) -> Result<()>;
+    fn write_packet(
+        &mut self,
+        packet: &[u8],
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
 }
 
 /// Parameters for bringing up a TUN device.

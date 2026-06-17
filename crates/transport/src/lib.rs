@@ -36,12 +36,18 @@ pub enum TransportError {
 /// A bidirectional datagram channel to a single peer.
 ///
 /// Methods take `&self` so the event loop can `send` and `recv` concurrently
-/// without splitting the value (UDP sockets and QUIC connections both allow it).
-#[allow(async_fn_in_trait)]
+/// without splitting the value (UDP sockets and QUIC connections both allow it),
+/// and return `Send` futures so they can be driven from spawned tasks.
 pub trait Transport: Send + Sync {
     /// Send one datagram to the peer.
-    async fn send(&self, datagram: &[u8]) -> Result<(), TransportError>;
+    fn send(
+        &self,
+        datagram: &[u8],
+    ) -> impl std::future::Future<Output = Result<(), TransportError>> + Send;
 
     /// Receive one datagram from the peer into `buf`, returning its length.
-    async fn recv(&self, buf: &mut [u8]) -> Result<usize, TransportError>;
+    fn recv(
+        &self,
+        buf: &mut [u8],
+    ) -> impl std::future::Future<Output = Result<usize, TransportError>> + Send;
 }
