@@ -165,12 +165,15 @@ To enforce the 70% gate on dedicated/representative hardware:
 
 **MTU handling:** over QUIC the CLI clamps the inner TUN MTU to 1100 B so encrypted packets fit QUIC's conservative initial datagram size (~1180 B) minus WireGuard's 32 B overhead.
 
-**QUIC end-to-end over real TUN:** `verify-linux.sh` has an opt-in QUIC pass
-(`TEST_QUIC=1`) — ns2 runs as QUIC server, ns1 as client, then pings across the
-tunnel over real TUN devices. Kept opt-in so the default run stays green. In CI it
-runs via the **CI** workflow's manual trigger: Actions → CI → **Run workflow** →
-tick **test_quic** (the `verify-quic` job is skipped on normal pushes). Pending a
-green run to confirm.
+**QUIC end-to-end over real TUN — ⬜ REMAINING (not yet verified).** The QUIC pass
+exists (`verify-linux.sh TEST_QUIC=1`: ns2 server, ns1 client, ping across a real
+TUN) and the in-process QUIC datagram test passes, but the **real-TUN QUIC path has
+not been run green yet**:
+- The CI `verify-quic` job (manual trigger, `test_quic` input) was still being
+  skipped after the `if:`-condition fix; root cause not yet pinned down.
+- To be verified locally on a Linux machine with `CAP_NET_ADMIN`:
+  `sudo -E env "PATH=$PATH" TEST_QUIC=1 bash ./scripts/verify-linux.sh`.
+Until then, treat QUIC-over-real-TUN as implemented-but-unverified.
 - 2026-06-17 — NFR1 reality check on shared CI (shaped 1 Gbps link): baseline 956 Mbps, tunnel **356 Mbps = 0.37** (target 0.70). Single-task userspace is CPU-bound, so 70% is not met on this hardware. Made NFR1 informational on CI (hard floor 200 Mbps for regressions; `STRICT_THROUGHPUT=1` enforces 70% on dedicated HW). Documented the honest status and the path to meet it (GSO batching, multi-core, eBPF). NFR2 latency +0.24 ms PASS.
 - 2026-06-17 — **CI green confirmed**: `verify-linux` passes (M3, M5, NFR2, teardown all PASS; NFR1 ratio 0.37 reported informationally). Both `test` jobs (Linux/Windows) and the `quic`-feature steps pass.
 - 2026-06-17 — **Pipelined data plane**: rewrote the runner from a single serialized loop (one packet in flight) into concurrent tasks — net reader, net writer, device I/O, and crypto — joined by bounded channels, so syscalls overlap with crypto across cores. `Transport`/`TunDevice` trait methods now return `Send` futures. All 19/20 tests pass; clippy/fmt clean. Throughput re-measurement pending the next `verify-linux` run (NFR1 stays informational until confirmed).
