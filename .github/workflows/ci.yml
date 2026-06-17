@@ -90,7 +90,9 @@ jobs:
     name: verify-quic (QUIC e2e over real TUN)
     runs-on: ubuntu-latest
     needs: test
-    if: github.event_name == 'workflow_dispatch' && inputs.test_quic
+    # github.event.inputs.* is always a string, so compare to 'true' (the typed
+    # `inputs` boolean is unreliable inside `if:`). Skipped on normal pushes.
+    if: ${{ github.event.inputs.test_quic == 'true' }}
     steps:
       - uses: actions/checkout@v4
 
