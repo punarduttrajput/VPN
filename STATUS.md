@@ -156,7 +156,7 @@ To enforce the 70% gate on dedicated/representative hardware:
 |------|--------|-------|
 | FR1 Transport abstraction | ✅ | `Transport` trait in `vpn-transport`; runner is generic over it; UDP ported behind it (no behavior change) |
 | FR2 QUIC transport | ✅ (lib) | `QuicTransport` carries WG packets as QUIC datagrams; `quic_datagram_roundtrip` test passes; behind `quic` feature |
-| FR2 QUIC in CLI | ✅ | `vpn up` selects UDP or QUIC from config; QUIC client/server roles wired; QUIC behind the `quic` build feature (clear error if requested without it) |
+| FR2 QUIC in CLI | ✅ verified e2e | `vpn up` selects UDP or QUIC from config; QUIC client/server roles wired (behind the `quic` feature). Verified end-to-end over a real TUN (Codespaces, 10/10 checks) |
 | FR6 Transport config block | ✅ | `[transport]` TOML block: `mode` (udp/quic), `role` (client/server), `server_name`; validated (quic requires a role); defaults to udp so Phase 1 configs are unchanged |
 | FR5 Padding obfuscation | ✅ | `PaddedTransport<T>` decorator normalizes datagram size (`[u16 len][payload][zero pad]`); composes over UDP or QUIC; `padding`/`pad_to` config; 4 tests (frame/deframe/corrupt/UDP-roundtrip). Timing jitter still deferred |
 | FR3 MASQUE / HTTP3 | ⬜ | deferred to next Phase 2 increment |
@@ -166,15 +166,12 @@ To enforce the 70% gate on dedicated/representative hardware:
 
 **MTU handling:** over QUIC the CLI clamps the inner TUN MTU to 1100 B so encrypted packets fit QUIC's conservative initial datagram size (~1180 B) minus WireGuard's 32 B overhead.
 
-**QUIC end-to-end over real TUN — ⬜ REMAINING (not yet verified).** The QUIC pass
-exists (`verify-linux.sh TEST_QUIC=1`: ns2 server, ns1 client, ping across a real
-TUN) and the in-process QUIC datagram test passes, but the **real-TUN QUIC path has
-not been run green yet**:
-- The CI `verify-quic` job (manual trigger, `test_quic` input) was still being
-  skipped after the `if:`-condition fix; root cause not yet pinned down.
-- To be verified locally on a Linux machine with `CAP_NET_ADMIN`:
-  `sudo -E env "PATH=$PATH" TEST_QUIC=1 bash ./scripts/verify-linux.sh`.
-Until then, treat QUIC-over-real-TUN as implemented-but-unverified.
+**QUIC end-to-end over real TUN — ✅ VERIFIED** (GitHub Codespaces, 2026-06-17).
+`verify-linux.sh TEST_QUIC=1` ran 10/10 checks green: the UDP pass (8) plus the two
+QUIC checks — QUIC `vpn0` up in the client ns and **ping across the tunnel over a
+real TUN with the QUIC transport (client/server roles)**. QUIC throughput in that
+environment was 343 Mbps (0.36 of the shaped 1 Gbps link; CPU-bound, as on CI).
+This confirms the QUIC build-feature wiring and the QUIC MTU clamp on a real device.
 - 2026-06-17 — NFR1 reality check on shared CI (shaped 1 Gbps link): baseline 956 Mbps, tunnel **356 Mbps = 0.37** (target 0.70). Single-task userspace is CPU-bound, so 70% is not met on this hardware. Made NFR1 informational on CI (hard floor 200 Mbps for regressions; `STRICT_THROUGHPUT=1` enforces 70% on dedicated HW). Documented the honest status and the path to meet it (GSO batching, multi-core, eBPF). NFR2 latency +0.24 ms PASS.
 - 2026-06-17 — **CI green confirmed**: `verify-linux` passes (M3, M5, NFR2, teardown all PASS; NFR1 ratio 0.37 reported informationally). Both `test` jobs (Linux/Windows) and the `quic`-feature steps pass.
 - 2026-06-17 — **Pipelined data plane**: rewrote the runner from a single serialized loop (one packet in flight) into concurrent tasks — net reader, net writer, device I/O, and crypto — joined by bounded channels, so syscalls overlap with crypto across cores. `Transport`/`TunDevice` trait methods now return `Send` futures. All 19/20 tests pass; clippy/fmt clean. Throughput re-measurement pending the next `verify-linux` run (NFR1 stays informational until confirmed).
@@ -182,3 +179,4 @@ Until then, treat QUIC-over-real-TUN as implemented-but-unverified.
 - 2026-06-17 — **Phase 2 CLI transport selection (FR2 CLI + FR6)**: added `[transport]` config block (mode/role/server_name) with validation; `vpn up` now builds a UDP or QUIC transport from config (QUIC client/server roles, behind the `quic` feature, inner MTU clamped to 1100 for QUIC). 3 new config tests; 22/23 tests green, clippy/fmt clean. QUIC end-to-end over a real TUN is the next validation step (still UDP in verify-linux).
 - 2026-06-17 — Added opt-in QUIC end-to-end verification: `verify-linux.sh TEST_QUIC=1` brings up a QUIC server/client pair over real TUN and pings across; plus a manual `verify-quic` GitHub Actions workflow (workflow_dispatch). Default push CI unchanged (UDP), so green status is not at risk. Pending a confirming run.
 - 2026-06-17 — **Phase 2 FR5 (padding obfuscation)**: added `PaddedTransport<T>` decorator in `vpn-transport` — frames datagrams as `[u16 len][payload][zero pad]` to a uniform `pad_to` size, composing over UDP or QUIC; stripped on receive. `[transport] padding`/`pad_to` config + CLI wiring (a generic `drive()` helper conditionally wraps). 6 new tests (28/29 total), clippy/fmt clean. Timing jitter deferred; FR3 MASQUE and FR4 migration remain.
+- 2026-06-17 — **QUIC-over-real-TUN VERIFIED**: `verify-linux.sh TEST_QUIC=1` ran 10/10 green in GitHub Codespaces — UDP pass (8) plus the two QUIC checks (QUIC vpn0 up + ping across the tunnel over a real TUN with client/server roles). QUIC throughput 343 Mbps (0.36, CPU-bound). Phase 2 FR2 now verified end-to-end; QUIC build-feature wiring and MTU clamp confirmed on a real device.
