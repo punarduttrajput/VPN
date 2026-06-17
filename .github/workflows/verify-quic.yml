@@ -1,0 +1,28 @@
+name: verify-quic
+
+# Manual-only: QUIC transport end-to-end over a real TUN (Phase 2). Kept off the
+# push path so it never affects the default-green CI; trigger from the Actions tab.
+on:
+  workflow_dispatch:
+
+jobs:
+  verify-quic:
+    name: verify-quic (QUIC e2e over real TUN)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install network + benchmark tools
+        run: sudo apt-get update && sudo apt-get install -y iproute2 iperf3
+
+      - name: Ensure /dev/net/tun is available
+        run: sudo modprobe tun || true
+
+      - name: Run Phase 1+2 verification with QUIC end-to-end
+        run: sudo -E env "PATH=$PATH" TEST_QUIC=1 bash ./scripts/verify-linux.sh

@@ -37,6 +37,9 @@ SHAPE_RATE_MBIT=${SHAPE_RATE_MBIT:-1000}
 # such hardware and is reported informationally by default. Set STRICT_THROUGHPUT=1
 # on dedicated/representative hardware to enforce it as a hard gate.
 STRICT_THROUGHPUT=${STRICT_THROUGHPUT:-0}
+# Also verify the QUIC transport end-to-end over a real TUN (Phase 2). Off by
+# default (extra build + heavier deps); set TEST_QUIC=1 to enable.
+TEST_QUIC=${TEST_QUIC:-0}
 # ---------------------------------------------------------------------------
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -71,8 +74,10 @@ for tool in ip tc iperf3 ping awk; do
   command -v "$tool" >/dev/null || { red "missing required tool: $tool"; exit 2; }
 done
 
-info "Building workspace with real-tun feature (release)"
-( cd "$ROOT" && CARGO_NET_OFFLINE=false cargo build --release --features vpn-tunnel/real-tun )
+BUILD_FEATURES="vpn-tunnel/real-tun"
+[ "$TEST_QUIC" = "1" ] && BUILD_FEATURES="vpn-cli/quic vpn-tunnel/real-tun"
+info "Building workspace (release) with features: $BUILD_FEATURES"
+( cd "$ROOT" && CARGO_NET_OFFLINE=false cargo build --release --features "$BUILD_FEATURES" )
 [ -x "$BIN" ] || { red "binary not found at $BIN"; exit 2; }
 
 # ---- keys + configs -------------------------------------------------------
@@ -217,6 +222,62 @@ teardown_ok() {
 }
 check "tunnel processes exited on SIGTERM" teardown_ok
 PIDS=()
+
+# ---- optional: QUIC transport end-to-end over real TUN (Phase 2) -----------
+# Reuses the namespaces + veth (the UDP tunnels above are now torn down).
+# ns2 is the QUIC server (accepts); ns1 is the QUIC client (connects).
+if [ "$TEST_QUIC" = "1" ]; then
+  info "QUIC end-to-end over real TUN (TEST_QUIC=1)"
+
+  cat > "$WORK/a-quic.toml" <<EOF
+private_key = "$A_PRIV"
+listen_port = $PORT
+interface_address = "$TUN1/24"
+
+[peer]
+public_key = "$B_PUB"
+endpoint = "$UL2:$PORT"
+allowed_ips = ["$TUN2/32"]
+
+[transport]
+mode = "quic"
+role = "client"
+server_name = "vpn"
+EOF
+
+  cat > "$WORK/b-quic.toml" <<EOF
+private_key = "$B_PRIV"
+listen_port = $PORT
+interface_address = "$TUN2/24"
+
+[peer]
+public_key = "$A_PUB"
+endpoint = "$UL1:$PORT"
+allowed_ips = ["$TUN1/32"]
+
+[transport]
+mode = "quic"
+role = "server"
+server_name = "vpn"
+EOF
+
+  # Start the server first so it is accepting before the client connects.
+  ip netns exec "$NS2" "$BIN" up --config "$WORK/b-quic.toml" --iface vpn0 \
+    >"$WORK/b.log" 2>&1 & PIDS+=($!)
+  sleep 1
+  ip netns exec "$NS1" "$BIN" up --config "$WORK/a-quic.toml" --iface vpn0 \
+    >"$WORK/a.log" 2>&1 & PIDS+=($!)
+  sleep 4  # QUIC handshake + tunnel handshake
+
+  check "QUIC: TUN vpn0 up in client ns" \
+    ip netns exec "$NS1" ip link show vpn0 >/dev/null
+  check "QUIC: ping $TUN2 from client over tunnel" \
+    ip netns exec "$NS1" ping -c 5 -W 2 "$TUN2" >/dev/null
+
+  for p in "${PIDS[@]}"; do kill -TERM "$p" 2>/dev/null || true; done
+  sleep 1
+  PIDS=()
+fi
 
 # ---- summary --------------------------------------------------------------
 echo
