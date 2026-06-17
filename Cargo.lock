@@ -2141,6 +2141,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "vpn-client-core"
+version = "0.1.0"
+dependencies = [
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "vpn-control-proto",
+ "vpn-coordinator",
+]
+
+[[package]]
 name = "vpn-control-proto"
 version = "0.1.0"
 dependencies = [

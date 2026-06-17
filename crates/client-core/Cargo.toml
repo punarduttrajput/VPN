@@ -1,0 +1,17 @@
+[package]
+name = "vpn-client-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+vpn-control-proto = { path = "../control-proto" }
+tonic.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+vpn-coordinator = { path = "../coordinator" }
+tokio-stream = { version = "0.1", features = ["net"] }

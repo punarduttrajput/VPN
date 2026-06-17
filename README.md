@@ -12,7 +12,8 @@ A Rust, WireGuard-based point-to-point tunnel. This is Phase 1 of the
 | [`vpn-tunnel`](crates/tunnel) | boringtun session, TUN device trait, transport-generic async event loop |
 | [`vpn-cli`](crates/cli) | `vpn` binary: `keygen`, `up` |
 | [`vpn-control-proto`](crates/control-proto) | gRPC coordinator service contract (Phase 3) |
-| [`vpn-coordinator`](crates/coordinator) | Control-plane coordinator: device registry, IP allocation, network map (Phase 3) |
+| [`vpn-coordinator`](crates/coordinator) | Control-plane coordinator: device registry, IP allocation, network map, ACL policy (Phase 3) |
+| [`vpn-client-core`](crates/client-core) | Client control integration: register with the coordinator, build a tunnel plan from the network map (Phase 3) |
 
 ### Optional features
 

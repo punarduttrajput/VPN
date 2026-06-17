@@ -1,0 +1,170 @@
+//! Client-side control-plane integration (PRD Phase 3, FR6 / Phase 5 client-core).
+//!
+//! [`ControlClient`] talks to the coordinator over gRPC: it registers the device
+//! (receiving an assigned tunnel address) and fetches the network map of peers it
+//! may reach, turning that into a [`TunnelPlan`] the data plane can apply.
+//!
+//! This is the bridge from the control plane (Phase 3) to the data plane
+//! (Phases 1–2): a `TunnelPlan` lists the peers, their endpoints, and allowed IPs
+//! that a `vpn-tunnel` session would be configured from. Applying a multi-peer
+//! plan to the running tunnel (mesh) is a later increment; today the data plane
+//! is point-to-point.
+#![forbid(unsafe_code)]
+
+use thiserror::Error;
+use tonic::transport::Channel;
+use vpn_control_proto::coordinator::coordinator_client::CoordinatorClient;
+use vpn_control_proto::coordinator::{NetworkMapRequest, RegisterDeviceRequest};
+
+/// Errors talking to the coordinator.
+#[derive(Debug, Error)]
+pub enum Error {
+    /// Failed to establish the gRPC channel.
+    #[error("control transport error: {0}")]
+    Transport(#[from] tonic::transport::Error),
+    /// The coordinator returned an RPC error.
+    #[error("control rpc error: {0}")]
+    Rpc(#[from] tonic::Status),
+}
+
+/// One peer the device may reach, as derived from the network map.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerSpec {
+    /// Peer's base64 public key.
+    pub public_key: String,
+    /// Peer's reachable endpoint `ip:port`.
+    pub endpoint: String,
+    /// CIDRs routed to this peer.
+    pub allowed_ips: Vec<String>,
+}
+
+/// The tunnel configuration derived from the control plane for this device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TunnelPlan {
+    /// Assigned tunnel address (e.g. `10.8.0.2/32`).
+    pub address: String,
+    /// Peers this device may reach.
+    pub peers: Vec<PeerSpec>,
+}
+
+/// A client connection to the coordinator.
+pub struct ControlClient {
+    inner: CoordinatorClient<Channel>,
+}
+
+impl ControlClient {
+    /// Connect to the coordinator at `endpoint` (e.g. `http://10.0.0.1:50051`).
+    pub async fn connect(endpoint: impl Into<String>) -> Result<Self, Error> {
+        let inner = CoordinatorClient::connect(endpoint.into()).await?;
+        Ok(Self { inner })
+    }
+
+    /// Register (or re-register) this device; returns the assigned tunnel CIDR.
+    pub async fn register(
+        &mut self,
+        public_key: &str,
+        name: &str,
+        endpoint: &str,
+        tags: &[String],
+    ) -> Result<String, Error> {
+        let resp = self
+            .inner
+            .register_device(RegisterDeviceRequest {
+                public_key: public_key.to_string(),
+                name: name.to_string(),
+                endpoint: endpoint.to_string(),
+                tags: tags.to_vec(),
+            })
+            .await?
+            .into_inner();
+        Ok(resp.assigned_cidr)
+    }
+
+    /// Fetch the peers this device may currently reach.
+    pub async fn network_map(&mut self, public_key: &str) -> Result<Vec<PeerSpec>, Error> {
+        let resp = self
+            .inner
+            .get_network_map(NetworkMapRequest {
+                public_key: public_key.to_string(),
+            })
+            .await?
+            .into_inner();
+        Ok(resp
+            .peers
+            .into_iter()
+            .map(|p| PeerSpec {
+                public_key: p.public_key,
+                endpoint: p.endpoint,
+                allowed_ips: p.allowed_ips,
+            })
+            .collect())
+    }
+
+    /// Register then fetch the map, returning a ready-to-apply [`TunnelPlan`].
+    pub async fn plan(
+        &mut self,
+        public_key: &str,
+        name: &str,
+        endpoint: &str,
+        tags: &[String],
+    ) -> Result<TunnelPlan, Error> {
+        let address = self.register(public_key, name, endpoint, tags).await?;
+        let peers = self.network_map(public_key).await?;
+        Ok(TunnelPlan { address, peers })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+    use std::sync::{Arc, Mutex};
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::transport::Server;
+    use vpn_control_proto::coordinator::coordinator_server::CoordinatorServer;
+    use vpn_coordinator::{CoordinatorService, Registry};
+
+    /// Start an in-process coordinator and return its `http://addr` URL.
+    async fn start_coordinator() -> String {
+        let registry = Arc::new(Mutex::new(Registry::new(Ipv4Addr::new(10, 8, 0, 0), 24)));
+        let svc = CoordinatorService::new(registry);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(CoordinatorServer::new(svc))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_registers_and_builds_plan_from_map() {
+        let url = start_coordinator().await;
+        let mut a = ControlClient::connect(url.clone()).await.unwrap();
+        let mut b = ControlClient::connect(url).await.unwrap();
+
+        // First device: assigned .2, no peers yet.
+        let plan_a = a.plan("AAA", "laptop", "1.1.1.1:51820", &[]).await.unwrap();
+        assert_eq!(plan_a.address, "10.8.0.2/32");
+        assert!(plan_a.peers.is_empty());
+
+        // Second device: assigned .3, sees A.
+        let plan_b = b
+            .plan("BBB", "gateway", "2.2.2.2:51820", &[])
+            .await
+            .unwrap();
+        assert_eq!(plan_b.address, "10.8.0.3/32");
+        assert_eq!(plan_b.peers.len(), 1);
+        assert_eq!(plan_b.peers[0].public_key, "AAA");
+
+        // A re-fetches its map and now sees B with its endpoint + allowed IPs.
+        let peers_a = a.network_map("AAA").await.unwrap();
+        assert_eq!(peers_a.len(), 1);
+        assert_eq!(peers_a[0].public_key, "BBB");
+        assert_eq!(peers_a[0].endpoint, "2.2.2.2:51820");
+        assert_eq!(peers_a[0].allowed_ips, vec!["10.8.0.3/32".to_string()]);
+    }
+}
