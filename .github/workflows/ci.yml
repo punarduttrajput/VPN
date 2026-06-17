@@ -109,4 +109,4 @@ jobs:
         run: sudo modprobe tun || true
 
       - name: Run verification with QUIC end-to-end
-        run: sudo -E env "PATH=$PATH" TEST_QUIC=2 bash ./scripts/verify-linux.sh
+        run: sudo -E env "PATH=$PATH" TEST_QUIC=1 bash ./scripts/verify-linux.sh
