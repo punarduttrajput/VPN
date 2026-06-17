@@ -14,7 +14,7 @@ use clap::{Parser, Subcommand};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use vpn_core::config::{Cidr, Config};
+use vpn_core::config::{Cidr, Config, TransportMode};
 use vpn_core::keys::KeyPair;
 use vpn_transport::UdpTransport;
 use vpn_tunnel::device::{self, TunConfig};
@@ -81,53 +81,111 @@ async fn up(config_path: &str, iface: &str, mtu: u16) -> Result<()> {
     let session = Session::from_base64(&config.private_key, &config.peer.public_key)
         .context("building wireguard session")?;
 
+    // QUIC datagrams cap below a normal MTU; shrink the inner MTU so encrypted
+    // packets (inner + 32 B WireGuard overhead) fit inside a QUIC datagram.
+    let effective_mtu = match config.transport.mode {
+        TransportMode::Quic => mtu.min(QUIC_TUN_MTU),
+        TransportMode::Udp => mtu,
+    };
+
     let iface_cidr: Cidr = config.interface_address.parse()?;
     let tun_cfg = TunConfig {
         name: iface.to_string(),
         address: iface_cidr,
-        mtu,
+        mtu: effective_mtu,
     };
 
     let dev = device::open(&tun_cfg)
         .context("opening TUN device (needs elevated privileges on Linux/macOS)")?;
-    info!(interface = %iface, "TUN device up");
+    info!(interface = %iface, mtu = effective_mtu, "TUN device up");
 
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", config.listen_port).parse()?;
     let peer = config.peer_endpoint()?;
-    // Phase 1 uses the UDP transport; Phase 2's QUIC transport selection will be
-    // wired here once endpoint roles (client/server) are added to config.
-    let transport = UdpTransport::bind(bind_addr, peer)
-        .await
-        .with_context(|| format!("binding UDP socket on {bind_addr}"))?;
-
-    // FR1: graceful teardown on Ctrl-C (SIGINT) or SIGTERM.
-    let shutdown = async {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut term = match signal(SignalKind::terminate()) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("could not install SIGTERM handler: {e}");
-                    let _ = tokio::signal::ctrl_c().await;
-                    return;
-                }
-            };
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = term.recv() => {}
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = tokio::signal::ctrl_c().await;
-        }
-    };
+    let shutdown = shutdown_signal();
 
     info!("starting tunnel event loop (Ctrl-C to stop)");
-    vpn_tunnel::run(session, dev, transport, shutdown)
-        .await
-        .context("tunnel event loop")?;
+    match config.transport.mode {
+        TransportMode::Udp => {
+            let transport = UdpTransport::bind(bind_addr, peer)
+                .await
+                .with_context(|| format!("binding UDP socket on {bind_addr}"))?;
+            info!("transport: udp");
+            vpn_tunnel::run(session, dev, transport, shutdown)
+                .await
+                .context("tunnel event loop")?;
+        }
+        TransportMode::Quic => {
+            #[cfg(feature = "quic")]
+            {
+                use vpn_core::config::TransportRole;
+                use vpn_transport::QuicTransport;
+                let server_name = config
+                    .transport
+                    .server_name
+                    .as_deref()
+                    .unwrap_or("vpn")
+                    .to_string();
+                match config.transport.role {
+                    Some(TransportRole::Server) => {
+                        info!("transport: quic (server), listening on {bind_addr}");
+                        let ep = QuicTransport::server_endpoint(bind_addr)
+                            .context("creating quic server endpoint")?;
+                        let transport = QuicTransport::accept(ep)
+                            .await
+                            .context("accepting quic connection")?;
+                        vpn_tunnel::run(session, dev, transport, shutdown)
+                            .await
+                            .context("tunnel event loop")?;
+                    }
+                    Some(TransportRole::Client) => {
+                        info!("transport: quic (client), connecting to {peer}");
+                        let transport = QuicTransport::connect(bind_addr, peer, &server_name)
+                            .await
+                            .context("connecting quic transport")?;
+                        vpn_tunnel::run(session, dev, transport, shutdown)
+                            .await
+                            .context("tunnel event loop")?;
+                    }
+                    None => anyhow::bail!("transport.role (client|server) required for quic"),
+                }
+            }
+            #[cfg(not(feature = "quic"))]
+            {
+                anyhow::bail!(
+                    "config requests transport.mode = quic, but this binary was built \
+                     without the `quic` feature (rebuild with --features vpn-cli/quic)"
+                );
+            }
+        }
+    }
     info!("tunnel stopped");
     Ok(())
+}
+
+/// QUIC's conservative initial datagram size is ~1180 B; keep the inner MTU
+/// below it (minus WireGuard's 32 B overhead) so packets are not dropped.
+const QUIC_TUN_MTU: u16 = 1100;
+
+/// FR1: a future that resolves on Ctrl-C (SIGINT) or SIGTERM.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("could not install SIGTERM handler: {e}");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }

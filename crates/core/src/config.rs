@@ -32,6 +32,45 @@ pub struct Config {
     pub interface_address: String,
     /// The single remote peer (Phase 1 is point-to-point).
     pub peer: PeerConfig,
+    /// Transport selection (Phase 2). Defaults to plain UDP when omitted, so
+    /// Phase 1 configs keep working unchanged.
+    #[serde(default)]
+    pub transport: TransportConfig,
+}
+
+/// Which network transport carries the encrypted tunnel (PRD Phase 2, FR6).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransportMode {
+    /// Plain UDP (Phase 1 behavior).
+    #[default]
+    Udp,
+    /// QUIC datagrams (Phase 2).
+    Quic,
+}
+
+/// QUIC endpoint role for a point-to-point link: one peer accepts, one connects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransportRole {
+    /// Initiates the QUIC connection to the peer's endpoint.
+    Client,
+    /// Listens and accepts the peer's QUIC connection.
+    Server,
+}
+
+/// The `[transport]` config block.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TransportConfig {
+    /// `udp` (default) or `quic`.
+    #[serde(default)]
+    pub mode: TransportMode,
+    /// Required for `quic`: this endpoint's role (`client` or `server`).
+    #[serde(default)]
+    pub role: Option<TransportRole>,
+    /// TLS server name presented/expected for QUIC (defaults to `vpn`).
+    #[serde(default)]
+    pub server_name: Option<String>,
 }
 
 /// Configuration for the remote peer.
@@ -121,6 +160,13 @@ impl Config {
                 .map_err(|e| Error::ConfigInvalid(format!("peer.allowed_ips: {e}")))?;
         }
 
+        // QUIC requires an explicit endpoint role (one peer accepts, one connects).
+        if self.transport.mode == TransportMode::Quic && self.transport.role.is_none() {
+            return Err(Error::ConfigInvalid(
+                "transport.role (client|server) is required when transport.mode = quic".into(),
+            ));
+        }
+
         Ok(())
     }
 
@@ -208,6 +254,33 @@ mod tests {
     fn rejects_empty_allowed_ips() {
         let mut cfg: Config = toml::from_str(&valid_toml()).unwrap();
         cfg.peer.allowed_ips.clear();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn defaults_to_udp_when_no_transport_block() {
+        let cfg: Config = toml::from_str(&valid_toml()).unwrap();
+        assert_eq!(cfg.transport.mode, TransportMode::Udp);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn parses_quic_transport_block() {
+        let toml_str = format!(
+            "{}\n[transport]\nmode = \"quic\"\nrole = \"client\"\nserver_name = \"vpn\"\n",
+            valid_toml()
+        );
+        let cfg: Config = toml::from_str(&toml_str).unwrap();
+        assert_eq!(cfg.transport.mode, TransportMode::Quic);
+        assert_eq!(cfg.transport.role, Some(TransportRole::Client));
+        assert_eq!(cfg.transport.server_name.as_deref(), Some("vpn"));
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_quic_without_role() {
+        let toml_str = format!("{}\n[transport]\nmode = \"quic\"\n", valid_toml());
+        let cfg: Config = toml::from_str(&toml_str).unwrap();
         assert!(cfg.validate().is_err());
     }
 }

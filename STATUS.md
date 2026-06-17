@@ -6,7 +6,7 @@
 **Last updated:** 2026-06-17
 **Build host:** Windows 11 (Rust 1.96.0)
 **Phase 1 status:** ✅ Functionally complete — all milestones verified in CI. **NFR1 caveat:** measured correctly (shaped 1 Gbps link); the pipelined data plane reached **493/956 = 0.52** on shared CI (up from 0.37), still under the 0.70 target on a 2-vCPU runner. Reported informationally; enforceable on dedicated hardware (`STRICT_THROUGHPUT=1`). See [NFR1 note](#nfr1-throughput--an-honest-status).
-**Phase 2 status:** 🟡 In progress — pluggable `Transport` trait + QUIC datagram transport implemented and tested; MASQUE / migration / obfuscation are later increments. See [Phase 2 section](#phase-2--transport--obfuscation).
+**Phase 2 status:** 🟡 In progress — pluggable `Transport` trait, QUIC datagram transport, `[transport]` config block, and CLI UDP/QUIC selection all done and tested (FR1, FR2, FR6). MASQUE, migration, and obfuscation (FR3–FR5) are later increments. See [Phase 2 section](#phase-2--transport--obfuscation).
 
 > Note on platform: the PRD scopes the real TUN device to Linux/macOS. On this
 > Windows build host the OS packet path cannot run, so the TUN device sits behind
@@ -155,16 +155,19 @@ To enforce the 70% gate on dedicated/representative hardware:
 |------|--------|-------|
 | FR1 Transport abstraction | ✅ | `Transport` trait in `vpn-transport`; runner is generic over it; UDP ported behind it (no behavior change) |
 | FR2 QUIC transport | ✅ (lib) | `QuicTransport` carries WG packets as QUIC datagrams; `quic_datagram_roundtrip` test passes; behind `quic` feature |
-| FR2 QUIC in CLI | 🟡 | library + tests done; CLI transport **selection** (client/server roles in config) not yet wired — UDP remains the CLI default |
+| FR2 QUIC in CLI | ✅ | `vpn up` selects UDP or QUIC from config; QUIC client/server roles wired; QUIC behind the `quic` build feature (clear error if requested without it) |
+| FR6 Transport config block | ✅ | `[transport]` TOML block: `mode` (udp/quic), `role` (client/server), `server_name`; validated (quic requires a role); defaults to udp so Phase 1 configs are unchanged |
 | FR3 MASQUE / HTTP3 | ⬜ | deferred to next Phase 2 increment |
 | FR4 Connection migration | ⬜ | deferred |
 | FR5 Padding / timing obfuscation | ⬜ | deferred |
-| FR6 Transport config block | 🟡 | trait/feature plumbing in place; `[transport]` TOML block not yet added |
 
-**Tests:** `cargo test --workspace --features vpn-cli/quic` → all green (adds `quic_datagram_roundtrip`). Default build stays lean (no rustls/quinn).
+**Tests:** `cargo test --workspace --features vpn-cli/quic` → all green (23): adds `quic_datagram_roundtrip` and 3 transport-config tests. Default build stays lean (no rustls/quinn).
 
-**MTU note:** QUIC's conservative initial datagram size (~1180 B) is below a 1420 MTU; `QuicTransport::max_datagram_size()` is exposed so the inner tunnel MTU can be reduced when running over QUIC. Wiring that into the runtime MTU is part of the CLI-selection follow-up.
+**MTU handling:** over QUIC the CLI clamps the inner TUN MTU to 1100 B so encrypted packets fit QUIC's conservative initial datagram size (~1180 B) minus WireGuard's 32 B overhead.
+
+**Not yet automated:** QUIC end-to-end over a *real* TUN device (the netns `verify-linux` path still exercises UDP). The QUIC datagram path is covered by an in-process test; a real-TUN QUIC run is the next validation step.
 - 2026-06-17 — NFR1 reality check on shared CI (shaped 1 Gbps link): baseline 956 Mbps, tunnel **356 Mbps = 0.37** (target 0.70). Single-task userspace is CPU-bound, so 70% is not met on this hardware. Made NFR1 informational on CI (hard floor 200 Mbps for regressions; `STRICT_THROUGHPUT=1` enforces 70% on dedicated HW). Documented the honest status and the path to meet it (GSO batching, multi-core, eBPF). NFR2 latency +0.24 ms PASS.
 - 2026-06-17 — **CI green confirmed**: `verify-linux` passes (M3, M5, NFR2, teardown all PASS; NFR1 ratio 0.37 reported informationally). Both `test` jobs (Linux/Windows) and the `quic`-feature steps pass.
 - 2026-06-17 — **Pipelined data plane**: rewrote the runner from a single serialized loop (one packet in flight) into concurrent tasks — net reader, net writer, device I/O, and crypto — joined by bounded channels, so syscalls overlap with crypto across cores. `Transport`/`TunDevice` trait methods now return `Send` futures. All 19/20 tests pass; clippy/fmt clean. Throughput re-measurement pending the next `verify-linux` run (NFR1 stays informational until confirmed).
 - 2026-06-17 — **Pipeline verified**: `verify-linux` 8/8 PASS; tunnel throughput **356 → 493 Mbps (ratio 0.37 → 0.52, +38%)** on the shaped 1 Gbps CI link. Confirms the serialized-loop diagnosis. NFR1 (0.70) still short on the shared 2-vCPU runner — remaining gap is per-packet syscall overhead (next lever: UDP GSO batching).
+- 2026-06-17 — **Phase 2 CLI transport selection (FR2 CLI + FR6)**: added `[transport]` config block (mode/role/server_name) with validation; `vpn up` now builds a UDP or QUIC transport from config (QUIC client/server roles, behind the `quic` feature, inner MTU clamped to 1100 for QUIC). 3 new config tests; 22/23 tests green, clippy/fmt clean. QUIC end-to-end over a real TUN is the next validation step (still UDP in verify-linux).

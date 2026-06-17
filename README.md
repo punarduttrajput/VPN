@@ -55,3 +55,18 @@ all crypto/transport logic still builds and is fully tested in-process.
 vpn keygen                          # generate a keypair for each peer
 vpn up --config config.example.toml # bring up the tunnel (Linux/macOS)
 ```
+
+### Transport selection (Phase 2)
+
+The `[transport]` block selects how the encrypted tunnel is carried:
+
+```toml
+[transport]
+mode = "quic"        # "udp" (default) or "quic"
+role = "client"      # quic only: one peer "server" (accepts), one "client"
+server_name = "vpn"  # quic only: TLS SNI (peer identity is via WireGuard)
+```
+
+QUIC requires building with the feature: `cargo build --features vpn-cli/quic`.
+See [config.quic.example.toml](config.quic.example.toml). Omitting `[transport]`
+keeps plain UDP (Phase 1 behavior).
