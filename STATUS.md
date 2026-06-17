@@ -7,6 +7,7 @@
 **Build host:** Windows 11 (Rust 1.96.0)
 **Phase 1 status:** ✅ Functionally complete — all milestones verified in CI. **NFR1 caveat:** measured correctly (shaped 1 Gbps link); the pipelined data plane reached **493/956 = 0.52** on shared CI (up from 0.37), still under the 0.70 target on a 2-vCPU runner. Reported informationally; enforceable on dedicated hardware (`STRICT_THROUGHPUT=1`). See [NFR1 note](#nfr1-throughput--an-honest-status).
 **Phase 2 status:** 🟡 In progress — `Transport` trait, QUIC transport, `[transport]` config + CLI selection, padding obfuscation, and **MASQUE/HTTP3 CONNECT-UDP** (lib + in-process e2e) all done (FR1, FR2, FR3, FR5, FR6). Remaining: MASQUE CLI wiring + interop, and connection migration (FR4). See [Phase 2 section](#phase-2--transport--obfuscation).
+**Phase 3 status:** 🟡 Started (M1) — gRPC coordinator contract (`vpn-control-proto`) + in-memory device registry, tunnel-IP allocation, and full-mesh network map (`vpn-coordinator`), verified by an in-process gRPC test. Persistence, OIDC, mTLS, live update streams, and ACL/policy filtering remain. See [Phase 3 section](#phase-3--control-plane).
 
 > Note on platform: the PRD scopes the real TUN device to Linux/macOS. On this
 > Windows build host the OS packet path cannot run, so the TUN device sits behind
@@ -33,7 +34,7 @@ Legend: ⬜ Not started · 🟡 In progress/partial · ✅ Done · ⚠️ Blocke
 
 ## Test Results
 
-`CARGO_NET_OFFLINE=false cargo test --workspace` — **28 passed** (default); **29** with `--features vpn-cli/quic`; **30** with `--features vpn-cli/masque` (adds the MASQUE CONNECT-UDP roundtrip)
+`CARGO_NET_OFFLINE=false cargo test --workspace` — **34 passed** (default, incl. 6 coordinator); **35** with `--features vpn-cli/quic`; **36** with `--features vpn-cli/masque`
 
 | Suite | Tests | Result | Covers |
 |-------|-------|--------|--------|
@@ -45,6 +46,8 @@ Legend: ⬜ Not started · 🟡 In progress/partial · ✅ Done · ⚠️ Blocke
 | `vpn-transport` (udp) | 1 | ✅ | UDP datagram roundtrip |
 | `vpn-transport` (quic) | 1 | ✅ | QUIC datagram roundtrip (only with `quic` feature) |
 | `loopback` (integration) | 1 | ✅ | full path: handshake → encapsulate → transport → decapsulate → TUN write |
+| `vpn-coordinator` (registry) | 5 | ✅ | IP allocation, idempotent re-register, empty-key reject, map-excludes-self, pool exhaustion |
+| `vpn-coordinator` (grpc) | 1 | ✅ | in-process gRPC: register two devices → network map returns the peer |
 
 Other checks:
 - `cargo clippy --all-targets` → **clean, no warnings**
@@ -181,3 +184,22 @@ This confirms the QUIC build-feature wiring and the QUIC MTU clamp on a real dev
 - 2026-06-17 — **Phase 2 FR5 (padding obfuscation)**: added `PaddedTransport<T>` decorator in `vpn-transport` — frames datagrams as `[u16 len][payload][zero pad]` to a uniform `pad_to` size, composing over UDP or QUIC; stripped on receive. `[transport] padding`/`pad_to` config + CLI wiring (a generic `drive()` helper conditionally wraps). 6 new tests (28/29 total), clippy/fmt clean. Timing jitter deferred; FR3 MASQUE and FR4 migration remain.
 - 2026-06-17 — **QUIC-over-real-TUN VERIFIED**: `verify-linux.sh TEST_QUIC=1` ran 10/10 green in GitHub Codespaces — UDP pass (8) plus the two QUIC checks (QUIC vpn0 up + ping across the tunnel over a real TUN with client/server roles). QUIC throughput 343 Mbps (0.36, CPU-bound). Phase 2 FR2 now verified end-to-end; QUIC build-feature wiring and MTU clamp confirmed on a real device.
 - 2026-06-17 — **Phase 2 FR3 (MASQUE / HTTP3)**: implemented CONNECT-UDP over HTTP/3 (RFC 9298) — `MasqueTransport` client + `MasqueProxy` relay in `vpn-transport` on the `h3`/`h3-quinn`(datagram feature)/`h3-datagram` stack (ALPN `h3`, extended CONNECT `Protocol::CONNECT_UDP`, RFC 9298 context-id framing, channel/task pattern to avoid naming h3 generics). In-process e2e test (client → HTTP/3 datagram → proxy → UDP echo → back) passes. Behind the `masque` feature; CI runs it (30 tests). Remaining: CLI masque selection + proxy subcommand, and third-party-proxy interop.
+
+---
+
+## Phase 3 — Control Plane
+
+**Spec:** [PRD/phase-3-control-plane.md](PRD/phase-3-control-plane.md)
+
+| Item | Status | Notes |
+|------|--------|-------|
+| FR1 Coordinator gRPC service | 🟡 M1 | `vpn-control-proto` defines the `Coordinator` service (`RegisterDevice`, `GetNetworkMap`) via tonic/prost (vendored protoc). `vpn-coordinator` implements it. In-process gRPC test passes. Streaming update push (FR1) deferred |
+| FR3 Key/endpoint distribution | 🟡 M1 | In-memory registry: register public key + endpoint, allocate tunnel IP, return full-mesh network map. Key rotation deferred |
+| FR2 Authentication (OIDC) | ⬜ | deferred |
+| FR4 Policy engine (ACLs) | ⬜ | network map is full-mesh for now; ACL filtering deferred |
+| FR5 Persistence (PostgreSQL) | ⬜ | in-memory only for now |
+| mTLS / sessions | ⬜ | plaintext gRPC for now |
+
+**Run it:** `cargo run -p vpn-coordinator -- --listen 0.0.0.0:50051`.
+**Tests:** registry unit tests + an in-process gRPC integration test (no external services needed — `protoc` is vendored via `protoc-bin-vendored`, so it builds on Windows/Linux/CI without a system install).
+- 2026-06-17 — **Phase 3 started (M1)**: added `vpn-control-proto` (tonic/prost gRPC `Coordinator` contract — RegisterDevice/GetNetworkMap, built with vendored `protoc`) and `vpn-coordinator` (in-memory device registry, tunnel-IP allocation, full-mesh network map + server bin). 6 tests incl. an in-process gRPC integration test; 34 workspace tests, clippy/fmt clean. Persistence/OIDC/mTLS/streaming/ACL remain.

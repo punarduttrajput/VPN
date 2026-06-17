@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package vpn.coordinator.v1;
+
+// The control-plane coordinator (PRD Phase 3, FR1/FR3).
+// Devices register their public key + reachable endpoint and receive a tunnel
+// IP; they then fetch the network map of peers they are permitted to reach.
+// Carries only control metadata — never user traffic (NFR4 privacy).
+service Coordinator {
+  // Register (or re-register) a device; returns its assigned tunnel address.
+  rpc RegisterDevice(RegisterDeviceRequest) returns (RegisterDeviceResponse);
+  // Return the set of peers this device may currently reach.
+  rpc GetNetworkMap(NetworkMapRequest) returns (NetworkMapResponse);
+}
+
+message RegisterDeviceRequest {
+  string public_key = 1; // base64 Curve25519 public key
+  string name = 2;       // human-friendly device label
+  string endpoint = 3;   // reachable UDP endpoint "ip:port" (may be empty)
+}
+
+message RegisterDeviceResponse {
+  string assigned_cidr = 1; // tunnel address, e.g. "10.8.0.2/32"
+}
+
+message NetworkMapRequest {
+  string public_key = 1; // the requesting device
+}
+
+message PeerInfo {
+  string public_key = 1;
+  string endpoint = 2;            // "ip:port"
+  repeated string allowed_ips = 3; // CIDRs routed to this peer
+}
+
+message NetworkMapResponse {
+  repeated PeerInfo peers = 1;
+}

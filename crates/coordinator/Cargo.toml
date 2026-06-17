@@ -1,0 +1,22 @@
+[package]
+name = "vpn-coordinator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "vpn-coordinator"
+path = "src/main.rs"
+
+[dependencies]
+vpn-control-proto = { path = "../control-proto" }
+tonic.workspace = true
+prost.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tokio-stream = { version = "0.1", features = ["net"] }
