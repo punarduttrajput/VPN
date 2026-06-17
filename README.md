@@ -8,8 +8,14 @@ A Rust, WireGuard-based point-to-point tunnel. This is Phase 1 of the
 | Crate | Role |
 |-------|------|
 | [`vpn-core`](crates/core) | Keys, config, errors — `#![forbid(unsafe_code)]` foundation |
-| [`vpn-tunnel`](crates/tunnel) | boringtun session, TUN device trait, async event loop |
+| [`vpn-transport`](crates/transport) | `Transport` trait + UDP and QUIC (`quic` feature) implementations (Phase 2) |
+| [`vpn-tunnel`](crates/tunnel) | boringtun session, TUN device trait, transport-generic async event loop |
 | [`vpn-cli`](crates/cli) | `vpn` binary: `keygen`, `up` |
+
+### Optional features
+
+- `quic` (on `vpn-cli`/`vpn-tunnel`/`vpn-transport`) — build the QUIC datagram transport (quinn + ring-backed rustls). Test it with `cargo test --workspace --features vpn-cli/quic`.
+- `real-tun` (on `vpn-tunnel`) — the real OS TUN device (Linux/macOS).
 
 ## Build & test
 

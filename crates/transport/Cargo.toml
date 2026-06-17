@@ -1,0 +1,24 @@
+[package]
+name = "vpn-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+# QUIC transport (Phase 2 FR2). Off by default so the core data plane builds
+# without the rustls/quinn stack; enable for the obfuscation-capable transport.
+quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:bytes"]
+
+[dependencies]
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+quinn = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rcgen = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }

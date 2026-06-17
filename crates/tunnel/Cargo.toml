@@ -10,9 +10,12 @@ default = []
 # Pulls in the real OS TUN device (Linux/macOS). Off by default so the data
 # plane builds and tests on any host (incl. Windows) without platform drivers.
 real-tun = ["dep:tun"]
+# Forwarded to vpn-transport so a tunnel build can include the QUIC transport.
+quic = ["vpn-transport/quic"]
 
 [dependencies]
 vpn-core = { path = "../core" }
+vpn-transport = { path = "../transport" }
 boringtun.workspace = true
 x25519-dalek.workspace = true
 tokio.workspace = true
@@ -23,4 +26,5 @@ thiserror.workspace = true
 tun = { version = "0.6", features = ["async"], optional = true }
 
 [dev-dependencies]
+vpn-transport = { path = "../transport" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }

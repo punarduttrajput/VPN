@@ -16,6 +16,7 @@ use tracing_subscriber::EnvFilter;
 
 use vpn_core::config::{Cidr, Config};
 use vpn_core::keys::KeyPair;
+use vpn_transport::UdpTransport;
 use vpn_tunnel::device::{self, TunConfig};
 use vpn_tunnel::session::Session;
 
@@ -92,10 +93,12 @@ async fn up(config_path: &str, iface: &str, mtu: u16) -> Result<()> {
     info!(interface = %iface, "TUN device up");
 
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", config.listen_port).parse()?;
-    let socket = tokio::net::UdpSocket::bind(bind_addr)
+    let peer = config.peer_endpoint()?;
+    // Phase 1 uses the UDP transport; Phase 2's QUIC transport selection will be
+    // wired here once endpoint roles (client/server) are added to config.
+    let transport = UdpTransport::bind(bind_addr, peer)
         .await
         .with_context(|| format!("binding UDP socket on {bind_addr}"))?;
-    let peer = config.peer_endpoint()?;
 
     // FR1: graceful teardown on Ctrl-C (SIGINT) or SIGTERM.
     let shutdown = async {
@@ -122,7 +125,7 @@ async fn up(config_path: &str, iface: &str, mtu: u16) -> Result<()> {
     };
 
     info!("starting tunnel event loop (Ctrl-C to stop)");
-    vpn_tunnel::run(session, dev, socket, peer, shutdown)
+    vpn_tunnel::run(session, dev, transport, shutdown)
         .await
         .context("tunnel event loop")?;
     info!("tunnel stopped");

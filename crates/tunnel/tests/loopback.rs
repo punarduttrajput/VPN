@@ -9,6 +9,7 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::oneshot;
 use vpn_core::keys::KeyPair;
+use vpn_transport::UdpTransport;
 use vpn_tunnel::device::mock::MockTun;
 use vpn_tunnel::session::Session;
 
@@ -34,17 +35,21 @@ async fn packet_traverses_tunnel_between_two_peers() {
     let inject_a = tun_a.to_runner.clone();
     let received_b = tun_b.from_runner.clone();
 
+    // Wrap each socket in a UDP transport pointing at the other peer.
+    let trans_a = UdpTransport::from_socket(sock_a, addr_b);
+    let trans_b = UdpTransport::from_socket(sock_b, addr_a);
+
     let (stop_a_tx, stop_a_rx) = oneshot::channel();
     let (stop_b_tx, stop_b_rx) = oneshot::channel();
 
     let run_a = tokio::spawn(async move {
-        vpn_tunnel::run(sess_a, tun_a, sock_a, addr_b, async {
+        vpn_tunnel::run(sess_a, tun_a, trans_a, async {
             stop_a_rx.await.ok();
         })
         .await
     });
     let run_b = tokio::spawn(async move {
-        vpn_tunnel::run(sess_b, tun_b, sock_b, addr_a, async {
+        vpn_tunnel::run(sess_b, tun_b, trans_b, async {
             stop_b_rx.await.ok();
         })
         .await

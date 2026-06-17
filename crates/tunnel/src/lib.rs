@@ -30,6 +30,10 @@ pub enum TunnelError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// A transport (UDP/QUIC) error.
+    #[error(transparent)]
+    Transport(#[from] vpn_transport::TransportError),
+
     /// The TUN device is not available on this platform.
     #[error("TUN device is not supported on this platform (Phase 1: Linux/macOS only)")]
     UnsupportedPlatform,

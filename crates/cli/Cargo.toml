@@ -9,9 +9,15 @@ authors.workspace = true
 name = "vpn"
 path = "src/main.rs"
 
+[features]
+default = []
+# Build the CLI with QUIC transport available (forwarded to vpn-tunnel).
+quic = ["vpn-tunnel/quic"]
+
 [dependencies]
 vpn-core = { path = "../core" }
 vpn-tunnel = { path = "../tunnel" }
+vpn-transport = { path = "../transport" }
 clap.workspace = true
 tokio.workspace = true
 tracing.workspace = true

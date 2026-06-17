@@ -25,13 +25,15 @@ TUN2=10.8.0.2       # tunnel IP — peer B
 PORT=51820
 DUR=5                       # iperf3 seconds
 PING_N=30                   # pings for latency sample
-THROUGHPUT_MIN=0.70         # NFR1: tunnel >= 70% of baseline (1 Gbps link)
+THROUGHPUT_MIN=0.70         # NFR1: tunnel >= 70% of the (1 Gbps) link
 THROUGHPUT_FLOOR=${THROUGHPUT_FLOOR:-100}  # hard floor (Mbps): data path moves real traffic
 LATENCY_MAX_MS=2.0          # NFR2: added latency < 2 ms
-# NFR1 ratio is a hard gate only on real hardware (STRICT_THROUGHPUT=1). On a
-# shared CI runner the baseline is an in-kernel veth (multi-Gbps), so 70% of it
-# is not a fair target for a userspace tunnel — there it is informational.
-STRICT_THROUGHPUT=${STRICT_THROUGHPUT:-0}
+# Shape the underlay to emulate the PRD's "1 Gbps LAN" so the NFR1 ratio is a
+# fair, enforceable gate (a raw veth is an unrealistic multi-Gbps in-kernel link).
+SHAPE=${SHAPE:-1}
+SHAPE_RATE_MBIT=${SHAPE_RATE_MBIT:-1000}
+# Escape hatch: set 0 to keep NFR1 informational even when the link is shaped.
+STRICT_THROUGHPUT=${STRICT_THROUGHPUT:-1}
 # ---------------------------------------------------------------------------
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -62,7 +64,7 @@ trap cleanup EXIT
 
 # ---- preflight ------------------------------------------------------------
 [ "$(id -u)" -eq 0 ] || { red "must run as root (sudo)"; exit 2; }
-for tool in ip iperf3 ping awk; do
+for tool in ip tc iperf3 ping awk; do
   command -v "$tool" >/dev/null || { red "missing required tool: $tool"; exit 2; }
 done
 
@@ -113,6 +115,18 @@ ip -n "$NS2" link set veth-b up; ip -n "$NS2" link set lo up
 check "underlay connectivity (veth)" \
   ip netns exec "$NS1" ping -c 2 -W 2 "$UL2" >/dev/null
 
+# ---- shape the underlay to a realistic 1 Gbps LAN (NFR1 methodology) -------
+if [ "$SHAPE" = "1" ]; then
+  info "Shaping underlay to ${SHAPE_RATE_MBIT} Mbit to emulate a 1 Gbps LAN (NFR1)"
+  if ip netns exec "$NS1" tc qdisc add dev veth-a root netem rate "${SHAPE_RATE_MBIT}mbit" 2>/dev/null \
+     && ip netns exec "$NS2" tc qdisc add dev veth-b root netem rate "${SHAPE_RATE_MBIT}mbit" 2>/dev/null; then
+    green "PASS: underlay shaped to ${SHAPE_RATE_MBIT} Mbit"
+  else
+    info "tc/netem shaping unavailable — continuing unshaped; NFR1 will be informational"
+    SHAPE=0
+  fi
+fi
+
 # ---- bring up tunnels (M3) -----------------------------------------------
 info "Bringing up tunnel in each namespace (M3: real TUN device)"
 ip netns exec "$NS1" "$BIN" up --config "$WORK/a.toml" --iface vpn0 \
@@ -157,17 +171,19 @@ floor_ok() {
 }
 check "tunnel throughput >= ${THROUGHPUT_FLOOR} Mbps (functional floor)" floor_ok
 
-# NFR1 ratio: hard gate only on real hardware; informational on shared CI veth.
+# NFR1 ratio: a hard gate once the link is shaped to a realistic 1 Gbps LAN
+# (the baseline then reflects the PRD's link assumption). Informational only if
+# shaping was unavailable or explicitly disabled.
 ratio_ok() {
   [ -n "${BASE:-}" ] && [ -n "${TUNT:-}" ] && \
     awk -v b="$BASE" -v t="$TUNT" -v m="$THROUGHPUT_MIN" 'BEGIN{ exit !(b>0 && (t/b)>=m) }'
 }
-if [ "$STRICT_THROUGHPUT" = "1" ]; then
-  check "tunnel throughput >= ${THROUGHPUT_MIN} x baseline (NFR1, strict)" ratio_ok
+if [ "$SHAPE" = "1" ] && [ "$STRICT_THROUGHPUT" = "1" ]; then
+  check "tunnel throughput >= ${THROUGHPUT_MIN} x link (NFR1)" ratio_ok
 elif ratio_ok; then
   green "PASS: NFR1 ratio >= ${THROUGHPUT_MIN} (informational)"
 else
-  info "NFR1 ratio ${RATIO} < ${THROUGHPUT_MIN} — informational on CI (in-kernel veth baseline). Validate NFR1 on real 1 Gbps hardware with STRICT_THROUGHPUT=1."
+  info "NFR1 ratio ${RATIO} < ${THROUGHPUT_MIN} — informational (link unshaped). Shape with SHAPE=1 to enforce."
 fi
 
 # ---- M6: added latency ----------------------------------------------------
