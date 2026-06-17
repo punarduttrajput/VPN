@@ -221,5 +221,10 @@ PIDS=()
 # ---- summary --------------------------------------------------------------
 echo
 info "RESULTS: $PASS passed, $FAIL failed"
-[ "$FAIL" -eq 0 ] || { red "Phase 1 Linux verification FAILED"; exit 1; }
+if [ "$FAIL" -ne 0 ]; then
+  red "Phase 1 Linux verification FAILED"
+  echo "----- tunnel A log (tail) -----"; tail -n 30 "$WORK/a.log" 2>/dev/null || true
+  echo "----- tunnel B log (tail) -----"; tail -n 30 "$WORK/b.log" 2>/dev/null || true
+  exit 1
+fi
 green "Phase 1 Linux verification PASSED (M3 + M5 + M6)"

@@ -54,7 +54,11 @@ where
     let (outbound_net_tx, outbound_net_rx) = mpsc::channel::<Vec<u8>>(CHANNEL_CAP);
     let (outbound_tun_tx, outbound_tun_rx) = mpsc::channel::<Vec<u8>>(CHANNEL_CAP);
 
-    let mut tasks: JoinSet<Result<()>> = JoinSet::new();
+    let mut tasks: JoinSet<()> = JoinSet::new();
+
+    // Tasks are resilient: a single transient I/O or packet error is logged and
+    // skipped, never tearing down the tunnel (e.g. a UDP ECONNREFUSED from an
+    // ICMP unreachable during the startup race must not kill the data plane).
 
     // --- net reader: transport.recv → inbound_net -------------------------
     {
@@ -62,12 +66,18 @@ where
         tasks.spawn(async move {
             let mut buf = vec![0u8; MAX_PACKET];
             loop {
-                let n = transport.recv(&mut buf).await?;
-                if inbound_net_tx.send(buf[..n].to_vec()).await.is_err() {
-                    break;
+                match transport.recv(&mut buf).await {
+                    Ok(n) => {
+                        if inbound_net_tx.send(buf[..n].to_vec()).await.is_err() {
+                            break; // crypto task gone
+                        }
+                    }
+                    Err(e) => {
+                        debug!("transport recv error (ignored): {e}");
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
                 }
             }
-            Ok(())
         });
     }
 
@@ -77,9 +87,10 @@ where
         let mut rx = outbound_net_rx;
         tasks.spawn(async move {
             while let Some(pkt) = rx.recv().await {
-                transport.send(&pkt).await?;
+                if let Err(e) = transport.send(&pkt).await {
+                    debug!("transport send error (ignored): {e}");
+                }
             }
-            Ok(())
         });
     }
 
@@ -92,20 +103,27 @@ where
             loop {
                 tokio::select! {
                     read = device.read_packet(&mut buf) => {
-                        let n = read?;
-                        if inbound_tun_tx.send(buf[..n].to_vec()).await.is_err() {
-                            break;
+                        match read {
+                            Ok(n) => {
+                                if inbound_tun_tx.send(buf[..n].to_vec()).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => { warn!("TUN read error: {e}"); break; }
                         }
                     }
                     maybe = out_tun_rx.recv() => {
                         match maybe {
-                            Some(pkt) => device.write_packet(&pkt).await?,
+                            Some(pkt) => {
+                                if let Err(e) = device.write_packet(&pkt).await {
+                                    debug!("TUN write error (ignored): {e}");
+                                }
+                            }
                             None => break,
                         }
                     }
                 }
             }
-            Ok(())
         });
     }
 
@@ -120,9 +138,13 @@ where
             let mut out = vec![0u8; MAX_PACKET];
 
             // Kick off the handshake immediately (NFR4: ready quickly).
-            if let Action::SendToPeer(pkt) = session.start_handshake(&mut out)? {
-                let _ = out_net.send(pkt.to_vec()).await;
-                debug!("sent initial handshake");
+            match session.start_handshake(&mut out) {
+                Ok(Action::SendToPeer(pkt)) => {
+                    let _ = out_net.send(pkt.to_vec()).await;
+                    debug!("sent initial handshake");
+                }
+                Ok(_) => {}
+                Err(e) => warn!("handshake start error: {e}"),
             }
 
             let mut timer = tokio::time::interval(Duration::from_millis(250));
@@ -131,19 +153,20 @@ where
                     // Inbound encrypted datagram → decrypt → TUN (or a control reply).
                     maybe = in_net.recv() => {
                         let Some(datagram) = maybe else { break };
-                        match session.decapsulate(&datagram, &mut out)? {
-                            Action::WriteToTun(pkt, _ip) => { let _ = out_tun.send(pkt.to_vec()).await; }
-                            Action::SendToPeer(pkt) => { let _ = out_net.send(pkt.to_vec()).await; }
-                            Action::Done => {}
+                        match session.decapsulate(&datagram, &mut out) {
+                            Ok(Action::WriteToTun(pkt, _ip)) => { let _ = out_tun.send(pkt.to_vec()).await; }
+                            Ok(Action::SendToPeer(pkt)) => { let _ = out_net.send(pkt.to_vec()).await; }
+                            Ok(Action::Done) => {}
+                            Err(e) => debug!("decapsulate error (dropped packet): {e}"),
                         }
                     }
                     // Outbound plaintext packet → encrypt → peer.
                     maybe = in_tun.recv() => {
                         let Some(packet) = maybe else { break };
-                        match session.encapsulate(&packet, &mut out)? {
-                            Action::SendToPeer(pkt) => { let _ = out_net.send(pkt.to_vec()).await; }
-                            Action::Done => {}
-                            Action::WriteToTun(..) => {}
+                        match session.encapsulate(&packet, &mut out) {
+                            Ok(Action::SendToPeer(pkt)) => { let _ = out_net.send(pkt.to_vec()).await; }
+                            Ok(_) => {}
+                            Err(e) => debug!("encapsulate error (dropped packet): {e}"),
                         }
                     }
                     // Service WireGuard timers (re-handshake / keepalive) — NFR5.
@@ -151,29 +174,21 @@ where
                         match session.update_timers(&mut out) {
                             Ok(Action::SendToPeer(pkt)) => { let _ = out_net.send(pkt.to_vec()).await; }
                             Ok(_) => {}
-                            Err(e) => warn!("timer update error: {e}"),
+                            Err(e) => debug!("timer update error: {e}"),
                         }
                     }
                 }
             }
-            Ok(())
         });
     }
 
     info!("tunnel running (pipelined data plane)");
 
-    // Run until shutdown is requested or any task exits (error/EOF).
+    // Run until shutdown is requested (FR1). Individual stages are resilient, so
+    // the tunnel does not tear down on transient per-packet errors.
     tokio::pin!(shutdown);
-    tokio::select! {
-        _ = &mut shutdown => info!("shutdown requested; tearing down tunnel"),
-        joined = tasks.join_next() => {
-            match joined {
-                Some(Ok(Err(e))) => warn!("data-plane task failed: {e}"),
-                Some(Err(e)) if !e.is_cancelled() => warn!("data-plane task panicked: {e}"),
-                _ => {}
-            }
-        }
-    }
+    shutdown.await;
+    info!("shutdown requested; tearing down tunnel");
 
     // Aborting drops the device (interface teardown) and closes all sockets.
     tasks.shutdown().await;
