@@ -10,6 +10,8 @@ default = []
 # QUIC transport (Phase 2 FR2). Off by default so the core data plane builds
 # without the rustls/quinn stack; enable for the obfuscation-capable transport.
 quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:bytes"]
+# MASQUE / HTTP3 (Phase 2 FR3) — builds on the QUIC stack.
+masque = ["quic", "dep:h3", "dep:h3-quinn", "dep:h3-datagram", "dep:http"]
 
 [dependencies]
 tokio.workspace = true
@@ -19,6 +21,10 @@ quinn = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 rcgen = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
+h3 = { workspace = true, optional = true }
+h3-quinn = { workspace = true, optional = true }
+h3-datagram = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }

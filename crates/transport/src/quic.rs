@@ -27,7 +27,7 @@ fn conn(msg: impl std::fmt::Display) -> TransportError {
 }
 
 /// Install the ring crypto provider once (idempotent across calls/tests).
-fn install_provider() {
+pub(crate) fn install_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
@@ -134,10 +134,10 @@ impl Transport for QuicTransport {
 /// A rustls verifier that accepts any server certificate. Safe here because the
 /// inner WireGuard handshake — not TLS — authenticates the peer (see module docs).
 #[derive(Debug)]
-struct SkipServerVerification(Arc<rustls::crypto::CryptoProvider>);
+pub(crate) struct SkipServerVerification(Arc<rustls::crypto::CryptoProvider>);
 
 impl SkipServerVerification {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self(Arc::new(rustls::crypto::ring::default_provider()))
     }
 }

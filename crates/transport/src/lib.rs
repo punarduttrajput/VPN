@@ -20,6 +20,11 @@ pub mod quic;
 #[cfg(feature = "quic")]
 pub use quic::QuicTransport;
 
+#[cfg(feature = "masque")]
+pub mod masque;
+#[cfg(feature = "masque")]
+pub use masque::{MasqueProxy, MasqueTransport};
+
 /// Errors produced by a transport.
 #[derive(Debug, Error)]
 pub enum TransportError {

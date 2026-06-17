@@ -12,6 +12,8 @@ default = []
 real-tun = ["dep:tun"]
 # Forwarded to vpn-transport so a tunnel build can include the QUIC transport.
 quic = ["vpn-transport/quic"]
+# Forwarded to vpn-transport for the MASQUE / HTTP3 transport.
+masque = ["vpn-transport/masque"]
 
 [dependencies]
 vpn-core = { path = "../core" }

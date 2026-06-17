@@ -34,6 +34,11 @@ quinn = { version = "0.11", default-features = false, features = ["runtime-tokio
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring", "pem"] }
 bytes = "1"
+# MASQUE / HTTP3 (Phase 2 FR3)
+h3 = "0.0.8"
+h3-quinn = { version = "0.0.10", features = ["datagram"] }
+h3-datagram = "0.0.2"
+http = "1"
 # errors
 thiserror = "1"
 anyhow = "1"

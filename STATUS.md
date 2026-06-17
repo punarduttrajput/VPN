@@ -6,7 +6,7 @@
 **Last updated:** 2026-06-17
 **Build host:** Windows 11 (Rust 1.96.0)
 **Phase 1 status:** ✅ Functionally complete — all milestones verified in CI. **NFR1 caveat:** measured correctly (shaped 1 Gbps link); the pipelined data plane reached **493/956 = 0.52** on shared CI (up from 0.37), still under the 0.70 target on a 2-vCPU runner. Reported informationally; enforceable on dedicated hardware (`STRICT_THROUGHPUT=1`). See [NFR1 note](#nfr1-throughput--an-honest-status).
-**Phase 2 status:** 🟡 In progress — `Transport` trait, QUIC datagram transport, `[transport]` config, CLI UDP/QUIC selection, and padding obfuscation all done and tested (FR1, FR2, FR5, FR6). MASQUE (FR3) and connection migration (FR4) remain. See [Phase 2 section](#phase-2--transport--obfuscation).
+**Phase 2 status:** 🟡 In progress — `Transport` trait, QUIC transport, `[transport]` config + CLI selection, padding obfuscation, and **MASQUE/HTTP3 CONNECT-UDP** (lib + in-process e2e) all done (FR1, FR2, FR3, FR5, FR6). Remaining: MASQUE CLI wiring + interop, and connection migration (FR4). See [Phase 2 section](#phase-2--transport--obfuscation).
 
 > Note on platform: the PRD scopes the real TUN device to Linux/macOS. On this
 > Windows build host the OS packet path cannot run, so the TUN device sits behind
@@ -33,7 +33,7 @@ Legend: ⬜ Not started · 🟡 In progress/partial · ✅ Done · ⚠️ Blocke
 
 ## Test Results
 
-`CARGO_NET_OFFLINE=false cargo test --workspace` — **28 passed** (default); **29** with `--features vpn-cli/quic`
+`CARGO_NET_OFFLINE=false cargo test --workspace` — **28 passed** (default); **29** with `--features vpn-cli/quic`; **30** with `--features vpn-cli/masque` (adds the MASQUE CONNECT-UDP roundtrip)
 
 | Suite | Tests | Result | Covers |
 |-------|-------|--------|--------|
@@ -159,7 +159,7 @@ To enforce the 70% gate on dedicated/representative hardware:
 | FR2 QUIC in CLI | ✅ verified e2e | `vpn up` selects UDP or QUIC from config; QUIC client/server roles wired (behind the `quic` feature). Verified end-to-end over a real TUN (Codespaces, 10/10 checks) |
 | FR6 Transport config block | ✅ | `[transport]` TOML block: `mode` (udp/quic), `role` (client/server), `server_name`; validated (quic requires a role); defaults to udp so Phase 1 configs are unchanged |
 | FR5 Padding obfuscation | ✅ | `PaddedTransport<T>` decorator normalizes datagram size (`[u16 len][payload][zero pad]`); composes over UDP or QUIC; `padding`/`pad_to` config; 4 tests (frame/deframe/corrupt/UDP-roundtrip). Timing jitter still deferred |
-| FR3 MASQUE / HTTP3 | ⬜ | deferred to next Phase 2 increment |
+| FR3 MASQUE / HTTP3 | ✅ (lib, e2e-tested) | CONNECT-UDP over HTTP/3 (RFC 9298): `MasqueTransport` client + `MasqueProxy` relay on `h3`/`h3-datagram` (ALPN `h3`, extended CONNECT, context-id framing). In-process test client→proxy→UDP-echo passes (behind `masque` feature). **Remaining:** CLI `masque` selection + a proxy subcommand, and interop with third-party MASQUE proxies (capsule/path conformance) |
 | FR4 Connection migration | ⬜ | deferred |
 
 **Tests:** `cargo test --workspace --features vpn-cli/quic` → all green (23): adds `quic_datagram_roundtrip` and 3 transport-config tests. Default build stays lean (no rustls/quinn).
@@ -180,3 +180,4 @@ This confirms the QUIC build-feature wiring and the QUIC MTU clamp on a real dev
 - 2026-06-17 — Added opt-in QUIC end-to-end verification: `verify-linux.sh TEST_QUIC=1` brings up a QUIC server/client pair over real TUN and pings across; plus a manual `verify-quic` GitHub Actions workflow (workflow_dispatch). Default push CI unchanged (UDP), so green status is not at risk. Pending a confirming run.
 - 2026-06-17 — **Phase 2 FR5 (padding obfuscation)**: added `PaddedTransport<T>` decorator in `vpn-transport` — frames datagrams as `[u16 len][payload][zero pad]` to a uniform `pad_to` size, composing over UDP or QUIC; stripped on receive. `[transport] padding`/`pad_to` config + CLI wiring (a generic `drive()` helper conditionally wraps). 6 new tests (28/29 total), clippy/fmt clean. Timing jitter deferred; FR3 MASQUE and FR4 migration remain.
 - 2026-06-17 — **QUIC-over-real-TUN VERIFIED**: `verify-linux.sh TEST_QUIC=1` ran 10/10 green in GitHub Codespaces — UDP pass (8) plus the two QUIC checks (QUIC vpn0 up + ping across the tunnel over a real TUN with client/server roles). QUIC throughput 343 Mbps (0.36, CPU-bound). Phase 2 FR2 now verified end-to-end; QUIC build-feature wiring and MTU clamp confirmed on a real device.
+- 2026-06-17 — **Phase 2 FR3 (MASQUE / HTTP3)**: implemented CONNECT-UDP over HTTP/3 (RFC 9298) — `MasqueTransport` client + `MasqueProxy` relay in `vpn-transport` on the `h3`/`h3-quinn`(datagram feature)/`h3-datagram` stack (ALPN `h3`, extended CONNECT `Protocol::CONNECT_UDP`, RFC 9298 context-id framing, channel/task pattern to avoid naming h3 generics). In-process e2e test (client → HTTP/3 datagram → proxy → UDP echo → back) passes. Behind the `masque` feature; CI runs it (30 tests). Remaining: CLI masque selection + proxy subcommand, and third-party-proxy interop.

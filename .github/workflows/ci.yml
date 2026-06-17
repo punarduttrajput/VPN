@@ -57,6 +57,14 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo clippy --workspace --all-targets --features vpn-cli/quic -- -D warnings
 
+      # Phase 2: exercise the MASQUE/HTTP3 transport (CONNECT-UDP roundtrip).
+      - name: Test (masque feature)
+        run: cargo test --workspace --features vpn-cli/masque
+
+      - name: clippy (masque feature)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo clippy --workspace --all-targets --features vpn-cli/masque -- -D warnings
+
   # Real-device + benchmark verification (M3 / M5 / M6) on a Linux runner.
   verify-linux:
     name: verify-linux (M3/M5/M6)

@@ -13,6 +13,8 @@ path = "src/main.rs"
 default = []
 # Build the CLI with QUIC transport available (forwarded to vpn-tunnel).
 quic = ["vpn-tunnel/quic"]
+# Build with the MASQUE / HTTP3 transport available.
+masque = ["vpn-tunnel/masque"]
 
 [dependencies]
 vpn-core = { path = "../core" }
