@@ -33,12 +33,12 @@ Legend: ⬜ Not started · 🟡 In progress/partial · ✅ Done · ⚠️ Blocke
 
 ## Test Results
 
-`CARGO_NET_OFFLINE=false cargo test --workspace` — **19 passed** (default); **20** with `--features vpn-cli/quic`
+`CARGO_NET_OFFLINE=false cargo test --workspace` — **22 passed** (default); **23** with `--features vpn-cli/quic`
 
 | Suite | Tests | Result | Covers |
 |-------|-------|--------|--------|
 | `vpn-core` (keys) | 5 | ✅ | keygen, base64 roundtrip, public derivation, length/format rejection |
-| `vpn-core` (config) | 7 | ✅ | TOML parse, CIDR (v4/v6), reject zero-port/bad-endpoint/bad-key/empty-allowed-ips |
+| `vpn-core` (config) | 10 | ✅ | TOML parse, CIDR (v4/v6), reject zero-port/bad-endpoint/bad-key/empty-allowed-ips, transport defaults/quic-parse/quic-role |
 | `vpn-tunnel` (session) | 4 | ✅ | handshake + encrypt/decrypt roundtrip, peer-restart re-handshake recovery (NFR5), mismatched-key rejection, base64 ctor |
 | `vpn-tunnel` (device) | 1 | ✅ | mock TUN read/write |
 | `vpn-transport` (udp) | 1 | ✅ | UDP datagram roundtrip |
