@@ -5,7 +5,7 @@
 | **Product** | Next-Gen VPN (Rust) |
 | **Phase** | 6 of 6 — Production Scale |
 | **Status** | Draft |
-| **Owner** | punarr@plasmacomp.com |
+| **Owner** | punarduttrajput |
 | **Last updated** | 2026-06-16 |
 | **Depends on** | Phases 1–5 |
 
