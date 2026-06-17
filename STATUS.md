@@ -25,7 +25,7 @@
 | M3 | TUN I/O — create/configure/teardown | ✅ Done | Verified in CI: real `vpn0` up in both namespaces + clean SIGTERM teardown (FR1) on a Linux runner |
 | M4 | Crypto session — boringtun handshake | ✅ Done | `handshake_and_packet_roundtrip` test passes |
 | M5 | End-to-end — event loop, packet across tunnel | ✅ Done | `loopback` in-proc test + real `ping` across the tunnel (both directions) verified in CI |
-| M6 | Benchmark — iperf3 throughput/latency | 🟡 NFR2 ✅, NFR1 measured-not-met | CI: NFR2 latency PASS (+0.24 ms). NFR1 measured against a `tc`-shaped 1 Gbps link: tunnel 356 Mbps / 956 = **0.37 < 0.70** — single-task userspace is CPU-bound. Informational on CI; enforce on dedicated HW with `STRICT_THROUGHPUT=1`. See [NFR1 note](#nfr1-throughput--an-honest-status) |
+| M6 | Benchmark — iperf3 throughput/latency | 🟡 NFR2 ✅, NFR1 0.52 on CI | CI: NFR2 latency PASS. NFR1 against a `tc`-shaped 1 Gbps link: tunnel **493/956 = 0.52** (was 0.37 before the pipeline; target 0.70). Per-packet syscall overhead now dominates; likely clears 0.70 on dedicated HW (`STRICT_THROUGHPUT=1`). See [NFR1 note](#nfr1-throughput--an-honest-status) |
 
 Legend: ⬜ Not started · 🟡 In progress/partial · ✅ Done · ⚠️ Blocked/Deferred
 
@@ -89,22 +89,23 @@ Measured on CI with the underlay shaped to a realistic 1 Gbps link
 | | Mbps | Ratio |
 |---|---|---|
 | Baseline (shaped link) | 956 | — |
-| Tunnel (single-task userspace) | 356 | **0.37** |
+| Tunnel — single serialized loop (old) | 356 | 0.37 |
+| Tunnel — **pipelined data plane (current)** | **493** | **0.52** |
 | NFR1 target | — | 0.70 |
 
-**NFR1 is not met by the MVP on shared CI hardware**, and this is reported
-truthfully rather than gated green. Root cause: the data plane is a single async
-task — one CPU core does all crypto plus a syscall per packet — so it is
-CPU-bound around 350–400 Mbps on a shared 2-vCPU runner, independent of link
-speed (an unshaped multi-Gbps veth gave ~414 Mbps).
+**NFR1 is not yet met on the shared 2-vCPU CI runner (0.52)**, reported truthfully
+rather than gated green. The pipeline lifted throughput ~38% by overlapping I/O
+with crypto across cores — confirming the bottleneck was the serialized one-packet
+loop, not the cipher. The remaining gap to 0.70 on this hardware is per-packet
+syscall overhead. Note the runner is the constraint: on dedicated hardware (more
+cores, AVX2) the same build is likely to clear 0.70 — run with `STRICT_THROUGHPUT=1`
+to confirm.
 
 Path to actually meet NFR1:
-- **✅ Pipelined data plane (done, pending re-measure)** — the runner was rewritten
-  from a single one-packet-in-flight loop into concurrent tasks (net reader, net
-  writer, device I/O, crypto) joined by channels, so I/O syscalls overlap with
-  crypto across cores. Targets the measured root cause (serialized pipeline, not
-  crypto). Throughput impact to be confirmed by the next `verify-linux` run.
-- **UDP GSO/GRO batching** (sendmmsg/recvmmsg) — the next userspace win after pipelining.
+- **✅ Pipelined data plane (done)** — measured **+38% (356 → 493 Mbps, 0.37 → 0.52)**
+  by overlapping I/O with crypto across cores.
+- **UDP GSO/GRO batching** (sendmmsg/recvmmsg) — next userspace lever; amortizes the
+  per-packet syscall cost that now dominates. Linux-specific (raw fd + cmsg).
 - **eBPF/XDP fast path** (Phase 6) for line-rate forwarding.
 
 To enforce the 70% gate on dedicated/representative hardware:
@@ -166,3 +167,4 @@ To enforce the 70% gate on dedicated/representative hardware:
 - 2026-06-17 — NFR1 reality check on shared CI (shaped 1 Gbps link): baseline 956 Mbps, tunnel **356 Mbps = 0.37** (target 0.70). Single-task userspace is CPU-bound, so 70% is not met on this hardware. Made NFR1 informational on CI (hard floor 200 Mbps for regressions; `STRICT_THROUGHPUT=1` enforces 70% on dedicated HW). Documented the honest status and the path to meet it (GSO batching, multi-core, eBPF). NFR2 latency +0.24 ms PASS.
 - 2026-06-17 — **CI green confirmed**: `verify-linux` passes (M3, M5, NFR2, teardown all PASS; NFR1 ratio 0.37 reported informationally). Both `test` jobs (Linux/Windows) and the `quic`-feature steps pass.
 - 2026-06-17 — **Pipelined data plane**: rewrote the runner from a single serialized loop (one packet in flight) into concurrent tasks — net reader, net writer, device I/O, and crypto — joined by bounded channels, so syscalls overlap with crypto across cores. `Transport`/`TunDevice` trait methods now return `Send` futures. All 19/20 tests pass; clippy/fmt clean. Throughput re-measurement pending the next `verify-linux` run (NFR1 stays informational until confirmed).
+- 2026-06-17 — **Pipeline verified**: `verify-linux` 8/8 PASS; tunnel throughput **356 → 493 Mbps (ratio 0.37 → 0.52, +38%)** on the shaped 1 Gbps CI link. Confirms the serialized-loop diagnosis. NFR1 (0.70) still short on the shared 2-vCPU runner — remaining gap is per-packet syscall overhead (next lever: UDP GSO batching).
