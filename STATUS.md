@@ -167,9 +167,10 @@ To enforce the 70% gate on dedicated/representative hardware:
 
 **QUIC end-to-end over real TUN:** `verify-linux.sh` has an opt-in QUIC pass
 (`TEST_QUIC=1`) — ns2 runs as QUIC server, ns1 as client, then pings across the
-tunnel over real TUN devices. Kept opt-in so the default run stays green; also
-available as the manual `verify-quic` GitHub Actions workflow (workflow_dispatch).
-Pending a green run to confirm.
+tunnel over real TUN devices. Kept opt-in so the default run stays green. In CI it
+runs via the **CI** workflow's manual trigger: Actions → CI → **Run workflow** →
+tick **test_quic** (the `verify-quic` job is skipped on normal pushes). Pending a
+green run to confirm.
 - 2026-06-17 — NFR1 reality check on shared CI (shaped 1 Gbps link): baseline 956 Mbps, tunnel **356 Mbps = 0.37** (target 0.70). Single-task userspace is CPU-bound, so 70% is not met on this hardware. Made NFR1 informational on CI (hard floor 200 Mbps for regressions; `STRICT_THROUGHPUT=1` enforces 70% on dedicated HW). Documented the honest status and the path to meet it (GSO batching, multi-core, eBPF). NFR2 latency +0.24 ms PASS.
 - 2026-06-17 — **CI green confirmed**: `verify-linux` passes (M3, M5, NFR2, teardown all PASS; NFR1 ratio 0.37 reported informationally). Both `test` jobs (Linux/Windows) and the `quic`-feature steps pass.
 - 2026-06-17 — **Pipelined data plane**: rewrote the runner from a single serialized loop (one packet in flight) into concurrent tasks — net reader, net writer, device I/O, and crypto — joined by bounded channels, so syscalls overlap with crypto across cores. `Transport`/`TunDevice` trait methods now return `Send` futures. All 19/20 tests pass; clippy/fmt clean. Throughput re-measurement pending the next `verify-linux` run (NFR1 stays informational until confirmed).
