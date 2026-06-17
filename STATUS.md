@@ -7,7 +7,7 @@
 **Build host:** Windows 11 (Rust 1.96.0)
 **Phase 1 status:** ✅ Functionally complete — all milestones verified in CI. **NFR1 caveat:** measured correctly (shaped 1 Gbps link); the pipelined data plane reached **493/956 = 0.52** on shared CI (up from 0.37), still under the 0.70 target on a 2-vCPU runner. Reported informationally; enforceable on dedicated hardware (`STRICT_THROUGHPUT=1`). See [NFR1 note](#nfr1-throughput--an-honest-status).
 **Phase 2 status:** 🟡 In progress — `Transport` trait, QUIC transport, `[transport]` config + CLI selection, padding obfuscation, and **MASQUE/HTTP3 CONNECT-UDP** (lib + in-process e2e) all done (FR1, FR2, FR3, FR5, FR6). Remaining: MASQUE CLI wiring + interop, and connection migration (FR4). See [Phase 2 section](#phase-2--transport--obfuscation).
-**Phase 3 status:** 🟡 Started (M1) — gRPC coordinator contract (`vpn-control-proto`) + in-memory device registry, tunnel-IP allocation, and full-mesh network map (`vpn-coordinator`), verified by an in-process gRPC test. Persistence, OIDC, mTLS, live update streams, and ACL/policy filtering remain. See [Phase 3 section](#phase-3--control-plane).
+**Phase 3 status:** 🟡 In progress — gRPC coordinator contract (`vpn-control-proto`) + device registry, tunnel-IP allocation, network map, and a **tag-based ACL/policy engine** (`vpn-coordinator`), verified by in-process tests. Persistence, OIDC, mTLS, and live update streams remain. See [Phase 3 section](#phase-3--control-plane).
 
 > Note on platform: the PRD scopes the real TUN device to Linux/macOS. On this
 > Windows build host the OS packet path cannot run, so the TUN device sits behind
@@ -34,7 +34,7 @@ Legend: ⬜ Not started · 🟡 In progress/partial · ✅ Done · ⚠️ Blocke
 
 ## Test Results
 
-`CARGO_NET_OFFLINE=false cargo test --workspace` — **34 passed** (default, incl. 6 coordinator); **35** with `--features vpn-cli/quic`; **36** with `--features vpn-cli/masque`
+`CARGO_NET_OFFLINE=false cargo test --workspace` — **39 passed** (default, incl. 11 coordinator); **40** with `--features vpn-cli/quic`; **41** with `--features vpn-cli/masque`
 
 | Suite | Tests | Result | Covers |
 |-------|-------|--------|--------|
@@ -46,7 +46,8 @@ Legend: ⬜ Not started · 🟡 In progress/partial · ✅ Done · ⚠️ Blocke
 | `vpn-transport` (udp) | 1 | ✅ | UDP datagram roundtrip |
 | `vpn-transport` (quic) | 1 | ✅ | QUIC datagram roundtrip (only with `quic` feature) |
 | `loopback` (integration) | 1 | ✅ | full path: handshake → encapsulate → transport → decapsulate → TUN write |
-| `vpn-coordinator` (registry) | 5 | ✅ | IP allocation, idempotent re-register, empty-key reject, map-excludes-self, pool exhaustion |
+| `vpn-coordinator` (registry) | 6 | ✅ | IP allocation, idempotent re-register, empty-key reject, map-excludes-self, pool exhaustion, policy-filtered map |
+| `vpn-coordinator` (policy) | 4 | ✅ | allow-all, directional deny-by-default, `*` wildcard, TOML parse |
 | `vpn-coordinator` (grpc) | 1 | ✅ | in-process gRPC: register two devices → network map returns the peer |
 
 Other checks:
@@ -196,10 +197,11 @@ This confirms the QUIC build-feature wiring and the QUIC MTU clamp on a real dev
 | FR1 Coordinator gRPC service | 🟡 M1 | `vpn-control-proto` defines the `Coordinator` service (`RegisterDevice`, `GetNetworkMap`) via tonic/prost (vendored protoc). `vpn-coordinator` implements it. In-process gRPC test passes. Streaming update push (FR1) deferred |
 | FR3 Key/endpoint distribution | 🟡 M1 | In-memory registry: register public key + endpoint, allocate tunnel IP, return full-mesh network map. Key rotation deferred |
 | FR2 Authentication (OIDC) | ⬜ | deferred |
-| FR4 Policy engine (ACLs) | ⬜ | network map is full-mesh for now; ACL filtering deferred |
+| FR4 Policy engine (ACLs) | ✅ | tag-based allow-rules, deny-by-default, `*` wildcard (`Policy` + `AclRule`); TOML-loadable via `--policy`; network map filtered per policy. **Caveat:** tags are self-declared until auth lands — not yet an authorization boundary |
 | FR5 Persistence (PostgreSQL) | ⬜ | in-memory only for now |
 | mTLS / sessions | ⬜ | plaintext gRPC for now |
 
-**Run it:** `cargo run -p vpn-coordinator -- --listen 0.0.0.0:50051`.
-**Tests:** registry unit tests + an in-process gRPC integration test (no external services needed — `protoc` is vendored via `protoc-bin-vendored`, so it builds on Windows/Linux/CI without a system install).
+**Run it:** `cargo run -p vpn-coordinator -- --listen 0.0.0.0:50051 [--policy policy.example.toml]`.
+**Tests:** registry + policy unit tests + an in-process gRPC integration test (no external services needed — `protoc` is vendored via `protoc-bin-vendored`, so it builds on Windows/Linux/CI without a system install). See [policy.example.toml](policy.example.toml).
 - 2026-06-17 — **Phase 3 started (M1)**: added `vpn-control-proto` (tonic/prost gRPC `Coordinator` contract — RegisterDevice/GetNetworkMap, built with vendored `protoc`) and `vpn-coordinator` (in-memory device registry, tunnel-IP allocation, full-mesh network map + server bin). 6 tests incl. an in-process gRPC integration test; 34 workspace tests, clippy/fmt clean. Persistence/OIDC/mTLS/streaming/ACL remain.
+- 2026-06-17 — **Phase 3 FR4 (ACL/policy engine)**: added a tag-based policy engine (`Policy`/`AclRule`) — deny-by-default allow-rules with `*` wildcard, TOML-loadable via `vpn-coordinator --policy`. Devices carry tags (added to the proto + registry); the network map is now filtered per policy. 5 new tests (39 workspace total), clippy/fmt clean. Caveat: tags are self-declared until OIDC auth lands.

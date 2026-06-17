@@ -10,7 +10,11 @@ use tonic::transport::Server;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use vpn_control_proto::coordinator::coordinator_server::CoordinatorServer;
-use vpn_coordinator::{CoordinatorService, Registry};
+use vpn_coordinator::{CoordinatorService, Policy, Registry};
+
+fn arg_value(flag: &str) -> Option<String> {
+    std::env::args().skip_while(|a| a != flag).nth(1)
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -20,14 +24,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let listen: SocketAddr = std::env::args()
-        .skip_while(|a| a != "--listen")
-        .nth(1)
+    let listen: SocketAddr = arg_value("--listen")
         .unwrap_or_else(|| "0.0.0.0:50051".to_string())
         .parse()?;
 
+    // Access policy: load from --policy <file> (TOML), else allow-all (full mesh).
+    let policy = match arg_value("--policy") {
+        Some(path) => {
+            let text = std::fs::read_to_string(&path)?;
+            let p = Policy::from_toml(&text)?;
+            info!(policy = %path, allow_all = p.allow_all, rules = p.rules.len(), "loaded ACL policy");
+            p
+        }
+        None => {
+            info!("no --policy given; using allow-all (full mesh)");
+            Policy::allow_all()
+        }
+    };
+
     // Tunnel address pool (10.8.0.0/24); host .1 reserved.
-    let registry = Arc::new(Mutex::new(Registry::new(Ipv4Addr::new(10, 8, 0, 0), 24)));
+    let registry = Arc::new(Mutex::new(Registry::with_policy(
+        Ipv4Addr::new(10, 8, 0, 0),
+        24,
+        policy,
+    )));
     let svc = CoordinatorService::new(registry);
 
     info!(%listen, "coordinator listening (in-memory registry)");

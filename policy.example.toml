@@ -1,0 +1,18 @@
+# Example coordinator ACL policy (PRD Phase 3, FR4).
+# Pass to the coordinator with:  vpn-coordinator --policy policy.example.toml
+# Deny-by-default: a device may reach a peer only if some rule permits it.
+# Tags are matched by name; "*" matches any tag.
+#
+# Omit this file (no --policy) for allow-all / full mesh.
+
+# allow_all = true   # uncomment for full mesh (ignores rules below)
+
+# Laptops/phones tagged "dev" may reach gateways tagged "server".
+[[rules]]
+src = ["dev"]
+dst = ["server"]
+
+# Admins may reach everything.
+[[rules]]
+src = ["admin"]
+dst = ["*"]

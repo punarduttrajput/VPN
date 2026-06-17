@@ -2155,9 +2155,11 @@ name = "vpn-coordinator"
 version = "0.1.0"
 dependencies = [
  "prost",
+ "serde",
  "thiserror 1.0.69",
  "tokio",
  "tokio-stream",
+ "toml",
  "tonic",
  "tracing",
  "tracing-subscriber",

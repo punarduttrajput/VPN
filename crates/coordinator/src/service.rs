@@ -31,7 +31,7 @@ impl Coordinator for CoordinatorService {
         let req = request.into_inner();
         let mut reg = self.registry.lock().expect("registry mutex poisoned");
         let ip = reg
-            .register(&req.public_key, &req.name, &req.endpoint)
+            .register(&req.public_key, &req.name, &req.endpoint, &req.tags)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
         Ok(Response::new(RegisterDeviceResponse {
             assigned_cidr: format!("{ip}/32"),
@@ -94,6 +94,7 @@ mod tests {
                 public_key: "AAA".into(),
                 name: "a".into(),
                 endpoint: "1.1.1.1:51820".into(),
+                tags: vec![],
             })
             .await
             .unwrap()
@@ -105,6 +106,7 @@ mod tests {
                 public_key: "BBB".into(),
                 name: "b".into(),
                 endpoint: "2.2.2.2:51820".into(),
+                tags: vec![],
             })
             .await
             .unwrap()

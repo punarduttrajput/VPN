@@ -6,8 +6,10 @@
 //! filtering are later increments.
 #![forbid(unsafe_code)]
 
+pub mod policy;
 pub mod registry;
 pub mod service;
 
+pub use policy::{AclRule, Policy};
 pub use registry::{Device, Registry, RegistryError};
 pub use service::CoordinatorService;

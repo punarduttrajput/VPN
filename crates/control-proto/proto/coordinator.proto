@@ -14,9 +14,10 @@ service Coordinator {
 }
 
 message RegisterDeviceRequest {
-  string public_key = 1; // base64 Curve25519 public key
-  string name = 2;       // human-friendly device label
-  string endpoint = 3;   // reachable UDP endpoint "ip:port" (may be empty)
+  string public_key = 1;      // base64 Curve25519 public key
+  string name = 2;            // human-friendly device label
+  string endpoint = 3;        // reachable UDP endpoint "ip:port" (may be empty)
+  repeated string tags = 4;   // device tags for ACL/policy matching
 }
 
 message RegisterDeviceResponse {

@@ -9,6 +9,8 @@ use std::net::Ipv4Addr;
 
 use thiserror::Error;
 
+use crate::policy::Policy;
+
 /// Errors from registry operations.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum RegistryError {
@@ -31,6 +33,8 @@ pub struct Device {
     pub endpoint: String,
     /// Assigned tunnel address.
     pub tunnel_ip: Ipv4Addr,
+    /// Tags used for ACL/policy matching.
+    pub tags: Vec<String>,
 }
 
 /// Registry of devices and their assigned tunnel addresses.
@@ -40,26 +44,34 @@ pub struct Registry {
     prefix: u8,
     next_host: u32,
     by_key: HashMap<String, Device>,
+    policy: Policy,
 }
 
 impl Registry {
-    /// Create a registry allocating from `base`/`prefix` (host .1 is reserved).
+    /// Create a full-mesh registry allocating from `base`/`prefix` (host .1 reserved).
     pub fn new(base: Ipv4Addr, prefix: u8) -> Self {
+        Self::with_policy(base, prefix, Policy::allow_all())
+    }
+
+    /// Create a registry with an explicit access [`Policy`].
+    pub fn with_policy(base: Ipv4Addr, prefix: u8, policy: Policy) -> Self {
         Self {
             base,
             prefix,
             next_host: 2,
             by_key: HashMap::new(),
+            policy,
         }
     }
 
     /// Register or re-register a device. Re-registering the same public key is
-    /// idempotent: the name/endpoint are refreshed and the existing IP retained.
+    /// idempotent: the name/endpoint/tags are refreshed and the existing IP kept.
     pub fn register(
         &mut self,
         public_key: &str,
         name: &str,
         endpoint: &str,
+        tags: &[String],
     ) -> Result<Ipv4Addr, RegistryError> {
         if public_key.trim().is_empty() {
             return Err(RegistryError::InvalidKey);
@@ -67,6 +79,7 @@ impl Registry {
         if let Some(existing) = self.by_key.get_mut(public_key) {
             existing.name = name.to_string();
             existing.endpoint = endpoint.to_string();
+            existing.tags = tags.to_vec();
             return Ok(existing.tunnel_ip);
         }
         let ip = self.allocate()?;
@@ -77,6 +90,7 @@ impl Registry {
                 name: name.to_string(),
                 endpoint: endpoint.to_string(),
                 tunnel_ip: ip,
+                tags: tags.to_vec(),
             },
         );
         Ok(ip)
@@ -102,12 +116,19 @@ impl Registry {
         Err(RegistryError::PoolExhausted)
     }
 
-    /// Peers the requesting device may reach. Phase 3 M1 is a full mesh: every
-    /// device sees every other. ACL/policy filtering arrives in a later increment.
+    /// Peers the requesting device may reach, filtered by the access [`Policy`]
+    /// (deny-by-default unless the policy is allow-all). The requester's tags are
+    /// taken from its registration (empty if it is not registered).
     pub fn network_map(&self, requester: &str) -> Vec<Device> {
+        let src_tags = self
+            .by_key
+            .get(requester)
+            .map(|d| d.tags.clone())
+            .unwrap_or_default();
         self.by_key
             .values()
             .filter(|d| d.public_key != requester)
+            .filter(|d| self.policy.allows(&src_tags, &d.tags))
             .cloned()
             .collect()
     }
@@ -126,15 +147,19 @@ mod tests {
         Registry::new(Ipv4Addr::new(10, 8, 0, 0), 24)
     }
 
+    fn tags(s: &[&str]) -> Vec<String> {
+        s.iter().map(|t| t.to_string()).collect()
+    }
+
     #[test]
     fn allocates_sequentially_from_host_2() {
         let mut r = registry();
         assert_eq!(
-            r.register("a", "A", "").unwrap(),
+            r.register("a", "A", "", &[]).unwrap(),
             Ipv4Addr::new(10, 8, 0, 2)
         );
         assert_eq!(
-            r.register("b", "B", "").unwrap(),
+            r.register("b", "B", "", &[]).unwrap(),
             Ipv4Addr::new(10, 8, 0, 3)
         );
         assert_eq!(r.device_count(), 2);
@@ -143,8 +168,8 @@ mod tests {
     #[test]
     fn reregister_is_idempotent_and_refreshes_metadata() {
         let mut r = registry();
-        let ip1 = r.register("a", "A", "1.1.1.1:51820").unwrap();
-        let ip2 = r.register("a", "A2", "2.2.2.2:51820").unwrap();
+        let ip1 = r.register("a", "A", "1.1.1.1:51820", &[]).unwrap();
+        let ip2 = r.register("a", "A2", "2.2.2.2:51820", &[]).unwrap();
         assert_eq!(ip1, ip2, "same key keeps its IP");
         assert_eq!(r.device_count(), 1);
         let peers = r.network_map("b");
@@ -155,7 +180,7 @@ mod tests {
     #[test]
     fn rejects_empty_key() {
         assert_eq!(
-            registry().register("", "x", ""),
+            registry().register("", "x", "", &[]),
             Err(RegistryError::InvalidKey)
         );
     }
@@ -163,8 +188,8 @@ mod tests {
     #[test]
     fn network_map_excludes_self() {
         let mut r = registry();
-        r.register("a", "A", "").unwrap();
-        r.register("b", "B", "").unwrap();
+        r.register("a", "A", "", &[]).unwrap();
+        r.register("b", "B", "", &[]).unwrap();
         let map = r.network_map("a");
         assert_eq!(map.len(), 1);
         assert_eq!(map[0].public_key, "b");
@@ -174,7 +199,32 @@ mod tests {
     fn pool_exhaustion_is_reported() {
         // /30 => offsets 1..3; .1 reserved, so only .2 is allocatable before exhaustion.
         let mut r = Registry::new(Ipv4Addr::new(10, 0, 0, 0), 30);
-        assert!(r.register("a", "A", "").is_ok());
-        assert_eq!(r.register("b", "B", ""), Err(RegistryError::PoolExhausted));
+        assert!(r.register("a", "A", "", &[]).is_ok());
+        assert_eq!(
+            r.register("b", "B", "", &[]),
+            Err(RegistryError::PoolExhausted)
+        );
+    }
+
+    #[test]
+    fn network_map_is_filtered_by_policy() {
+        // dev -> server allowed; not the reverse, and dev does not see other dev.
+        let policy = Policy::from_rules(vec![crate::policy::AclRule {
+            src: tags(&["dev"]),
+            dst: tags(&["server"]),
+        }]);
+        let mut r = Registry::with_policy(Ipv4Addr::new(10, 8, 0, 0), 24, policy);
+        r.register("devkey", "laptop", "", &tags(&["dev"])).unwrap();
+        r.register("srvkey", "gateway", "", &tags(&["server"]))
+            .unwrap();
+        r.register("dev2key", "phone", "", &tags(&["dev"])).unwrap();
+
+        // dev sees the server, but not the other dev.
+        let dev_map = r.network_map("devkey");
+        assert_eq!(dev_map.len(), 1);
+        assert_eq!(dev_map[0].public_key, "srvkey");
+
+        // server is not permitted to initiate to dev -> sees nobody.
+        assert!(r.network_map("srvkey").is_empty());
     }
 }
