@@ -9,6 +9,9 @@
 
 use thiserror::Error;
 
+pub mod pad;
+pub use pad::PaddedTransport;
+
 pub mod udp;
 pub use udp::UdpTransport;
 

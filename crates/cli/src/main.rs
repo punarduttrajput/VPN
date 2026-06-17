@@ -103,6 +103,14 @@ async fn up(config_path: &str, iface: &str, mtu: u16) -> Result<()> {
     let peer = config.peer_endpoint()?;
     let shutdown = shutdown_signal();
 
+    let pad_to = if config.transport.padding {
+        let p = config.transport.pad_to.unwrap_or(DEFAULT_PAD_TO);
+        info!(pad_to = p, "transport padding enabled (FR5)");
+        Some(p)
+    } else {
+        None
+    };
+
     info!("starting tunnel event loop (Ctrl-C to stop)");
     match config.transport.mode {
         TransportMode::Udp => {
@@ -110,9 +118,7 @@ async fn up(config_path: &str, iface: &str, mtu: u16) -> Result<()> {
                 .await
                 .with_context(|| format!("binding UDP socket on {bind_addr}"))?;
             info!("transport: udp");
-            vpn_tunnel::run(session, dev, transport, shutdown)
-                .await
-                .context("tunnel event loop")?;
+            drive(session, dev, transport, pad_to, shutdown).await?;
         }
         TransportMode::Quic => {
             #[cfg(feature = "quic")]
@@ -133,18 +139,14 @@ async fn up(config_path: &str, iface: &str, mtu: u16) -> Result<()> {
                         let transport = QuicTransport::accept(ep)
                             .await
                             .context("accepting quic connection")?;
-                        vpn_tunnel::run(session, dev, transport, shutdown)
-                            .await
-                            .context("tunnel event loop")?;
+                        drive(session, dev, transport, pad_to, shutdown).await?;
                     }
                     Some(TransportRole::Client) => {
                         info!("transport: quic (client), connecting to {peer}");
                         let transport = QuicTransport::connect(bind_addr, peer, &server_name)
                             .await
                             .context("connecting quic transport")?;
-                        vpn_tunnel::run(session, dev, transport, shutdown)
-                            .await
-                            .context("tunnel event loop")?;
+                        drive(session, dev, transport, pad_to, shutdown).await?;
                     }
                     None => anyhow::bail!("transport.role (client|server) required for quic"),
                 }
@@ -159,6 +161,37 @@ async fn up(config_path: &str, iface: &str, mtu: u16) -> Result<()> {
         }
     }
     info!("tunnel stopped");
+    Ok(())
+}
+
+/// Default padded datagram size when `padding` is on but `pad_to` is unset.
+const DEFAULT_PAD_TO: u16 = 1280;
+
+/// Run the tunnel, optionally wrapping the transport in size-padding (FR5).
+async fn drive<D, T>(
+    session: Session,
+    device: D,
+    transport: T,
+    pad_to: Option<u16>,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<()>
+where
+    D: vpn_tunnel::device::TunDevice + Send + 'static,
+    T: vpn_transport::Transport + Send + Sync + 'static,
+{
+    match pad_to {
+        Some(p) => vpn_tunnel::run(
+            session,
+            device,
+            vpn_transport::PaddedTransport::new(transport, p as usize),
+            shutdown,
+        )
+        .await
+        .context("tunnel event loop")?,
+        None => vpn_tunnel::run(session, device, transport, shutdown)
+            .await
+            .context("tunnel event loop")?,
+    }
     Ok(())
 }
 

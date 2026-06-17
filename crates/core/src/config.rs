@@ -71,6 +71,13 @@ pub struct TransportConfig {
     /// TLS server name presented/expected for QUIC (defaults to `vpn`).
     #[serde(default)]
     pub server_name: Option<String>,
+    /// Pad datagrams to a uniform size to blunt size-fingerprinting (FR5).
+    /// Both peers must set the same value. Defaults to off.
+    #[serde(default)]
+    pub padding: bool,
+    /// Target padded size in bytes when `padding` is on (defaults to 1280).
+    #[serde(default)]
+    pub pad_to: Option<u16>,
 }
 
 /// Configuration for the remote peer.
@@ -282,5 +289,24 @@ mod tests {
         let toml_str = format!("{}\n[transport]\nmode = \"quic\"\n", valid_toml());
         let cfg: Config = toml::from_str(&toml_str).unwrap();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn parses_padding_options() {
+        let toml_str = format!(
+            "{}\n[transport]\nmode = \"udp\"\npadding = true\npad_to = 1280\n",
+            valid_toml()
+        );
+        let cfg: Config = toml::from_str(&toml_str).unwrap();
+        assert!(cfg.transport.padding);
+        assert_eq!(cfg.transport.pad_to, Some(1280));
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn padding_defaults_off() {
+        let cfg: Config = toml::from_str(&valid_toml()).unwrap();
+        assert!(!cfg.transport.padding);
+        assert_eq!(cfg.transport.pad_to, None);
     }
 }

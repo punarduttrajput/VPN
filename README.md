@@ -70,3 +70,7 @@ server_name = "vpn"  # quic only: TLS SNI (peer identity is via WireGuard)
 QUIC requires building with the feature: `cargo build --features vpn-cli/quic`.
 See [config.quic.example.toml](config.quic.example.toml). Omitting `[transport]`
 keeps plain UDP (Phase 1 behavior).
+
+**Padding (obfuscation, FR5):** add `padding = true` (optionally `pad_to = 1280`)
+to `[transport]` to normalize datagram sizes against fingerprinting. Both peers
+must set the same values; works with either UDP or QUIC.
