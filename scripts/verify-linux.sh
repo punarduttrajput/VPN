@@ -40,6 +40,11 @@ STRICT_THROUGHPUT=${STRICT_THROUGHPUT:-0}
 # Also verify the QUIC transport end-to-end over a real TUN (Phase 2). Off by
 # default (extra build + heavier deps); set TEST_QUIC=1 to enable.
 TEST_QUIC=${TEST_QUIC:-0}
+# Also verify the Phase 3 coordinator-driven mesh end-to-end over a real TUN:
+# a coordinator assigns tunnel IPs and both nodes register + watch, converging
+# on each other. Off by default; set TEST_MESH=1 to enable.
+TEST_MESH=${TEST_MESH:-0}
+COORD_PORT=${COORD_PORT:-50051}
 # ---------------------------------------------------------------------------
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -279,6 +284,51 @@ EOF
   PIDS=()
 fi
 
+# ---- optional: Phase 3 coordinator-driven mesh over real TUN ---------------
+# A coordinator (in ns A) assigns tunnel IPs; both nodes `up-mesh` register and
+# watch, converging on each other. Node A registers first -> 10.8.0.2; node B
+# second -> 10.8.0.3. Reuses the namespaces + veth and the existing configs
+# (their [peer] block is ignored in mesh mode; only private_key/listen_port used).
+if [ "$TEST_MESH" = "1" ]; then
+  info "Phase 3 coordinator mesh over real TUN (TEST_MESH=1)"
+  COORD_BIN="$ROOT/target/release/vpn-coordinator"
+  MESH_A=10.8.0.2          # first registrant
+  MESH_B=10.8.0.3          # second registrant
+  COORD_URL="http://$UL1:$COORD_PORT"
+
+  if [ ! -x "$COORD_BIN" ]; then
+    red "FAIL: coordinator binary not found at $COORD_BIN"; FAIL=$((FAIL+1))
+  else
+    # Coordinator listens in ns A, reachable from both namespaces over the veth.
+    ip netns exec "$NS1" "$COORD_BIN" --listen "0.0.0.0:$COORD_PORT" \
+      >"$WORK/coord.log" 2>&1 & PIDS+=($!)
+    sleep 1
+
+    # Node A registers first (assigned .2), then node B (assigned .3).
+    ip netns exec "$NS1" "$BIN" up-mesh --config "$WORK/a.toml" \
+      --coordinator "$COORD_URL" --endpoint "$UL1:$PORT" --name node-a --iface vpn0 \
+      >"$WORK/mesh-a.log" 2>&1 & PIDS+=($!)
+    sleep 2
+    ip netns exec "$NS2" "$BIN" up-mesh --config "$WORK/b.toml" \
+      --coordinator "$COORD_URL" --endpoint "$UL2:$PORT" --name node-b --iface vpn0 \
+      >"$WORK/mesh-b.log" 2>&1 & PIDS+=($!)
+    sleep 4  # registration + watch convergence + WireGuard handshake
+
+    check "mesh: TUN vpn0 up in node A" \
+      ip netns exec "$NS1" ip link show vpn0 >/dev/null
+    check "mesh: TUN vpn0 up in node B" \
+      ip netns exec "$NS2" ip link show vpn0 >/dev/null
+    check "mesh: ping $MESH_B from A over coordinator-built tunnel" \
+      ip netns exec "$NS1" ping -c 5 -W 2 "$MESH_B" >/dev/null
+    check "mesh: ping $MESH_A from B over coordinator-built tunnel" \
+      ip netns exec "$NS2" ping -c 5 -W 2 "$MESH_A" >/dev/null
+
+    for p in "${PIDS[@]}"; do kill -TERM "$p" 2>/dev/null || true; done
+    sleep 1
+    PIDS=()
+  fi
+fi
+
 # ---- summary --------------------------------------------------------------
 echo
 info "RESULTS: $PASS passed, $FAIL failed"
@@ -286,6 +336,11 @@ if [ "$FAIL" -ne 0 ]; then
   red "Phase 1 Linux verification FAILED"
   echo "----- tunnel A log (tail) -----"; tail -n 30 "$WORK/a.log" 2>/dev/null || true
   echo "----- tunnel B log (tail) -----"; tail -n 30 "$WORK/b.log" 2>/dev/null || true
+  if [ "$TEST_MESH" = "1" ]; then
+    echo "----- coordinator log (tail) -----"; tail -n 30 "$WORK/coord.log" 2>/dev/null || true
+    echo "----- mesh node A log (tail) -----"; tail -n 30 "$WORK/mesh-a.log" 2>/dev/null || true
+    echo "----- mesh node B log (tail) -----"; tail -n 30 "$WORK/mesh-b.log" 2>/dev/null || true
+  fi
   exit 1
 fi
 green "Phase 1 Linux verification PASSED (M3 + M5 + M6)"
