@@ -7,7 +7,7 @@
 **Build host:** Windows 11 (Rust 1.96.0)
 **Phase 1 status:** ✅ Functionally complete — all milestones verified in CI. **NFR1 caveat:** measured correctly (shaped 1 Gbps link); the pipelined data plane reached **493/956 = 0.52** on shared CI (up from 0.37), still under the 0.70 target on a 2-vCPU runner. Reported informationally; enforceable on dedicated hardware (`STRICT_THROUGHPUT=1`). See [NFR1 note](#nfr1-throughput--an-honest-status).
 **Phase 2 status:** 🟡 In progress — `Transport` trait, QUIC transport, `[transport]` config + CLI selection, padding obfuscation, and **MASQUE/HTTP3 CONNECT-UDP** (lib + in-process e2e) all done (FR1, FR2, FR3, FR5, FR6). Remaining: MASQUE CLI wiring + interop, and connection migration (FR4). See [Phase 2 section](#phase-2--transport--obfuscation).
-**Phase 3 status:** 🟡 In progress — gRPC coordinator contract (`vpn-control-proto`) + device registry, tunnel-IP allocation, network map, and a **tag-based ACL/policy engine** (`vpn-coordinator`), verified by in-process tests. Persistence, OIDC, mTLS, and live update streams remain. See [Phase 3 section](#phase-3--control-plane).
+**Phase 3 status:** 🟡 In progress — gRPC coordinator (`vpn-control-proto` + `vpn-coordinator`): device registry, tunnel-IP allocation, network map, **tag-based ACL/policy**, **live `WatchNetworkMap` streaming**, and **client integration** (`vpn-client-core` register/plan/watch), all verified by in-process tests. Persistence, OIDC, and mTLS remain. See [Phase 3 section](#phase-3--control-plane).
 
 > Note on platform: the PRD scopes the real TUN device to Linux/macOS. On this
 > Windows build host the OS packet path cannot run, so the TUN device sits behind
