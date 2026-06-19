@@ -34,7 +34,7 @@ Legend: ⬜ Not started · 🟡 In progress/partial · ✅ Done · ⚠️ Blocke
 
 ## Test Results
 
-`CARGO_NET_OFFLINE=false cargo test --workspace` — **40 passed** (default, incl. 11 coordinator + 1 client-core); **41** with `--features vpn-cli/quic`; **42** with `--features vpn-cli/masque`
+`CARGO_NET_OFFLINE=false cargo test --workspace` — **41 passed** (default, incl. 11 coordinator + 2 client-core); **42** with `--features vpn-cli/quic`; **43** with `--features vpn-cli/masque`
 
 | Suite | Tests | Result | Covers |
 |-------|-------|--------|--------|
@@ -49,7 +49,7 @@ Legend: ⬜ Not started · 🟡 In progress/partial · ✅ Done · ⚠️ Blocke
 | `vpn-coordinator` (registry) | 6 | ✅ | IP allocation, idempotent re-register, empty-key reject, map-excludes-self, pool exhaustion, policy-filtered map |
 | `vpn-coordinator` (policy) | 4 | ✅ | allow-all, directional deny-by-default, `*` wildcard, TOML parse |
 | `vpn-coordinator` (grpc) | 1 | ✅ | in-process gRPC: register two devices → network map returns the peer |
-| `vpn-client-core` (integration) | 1 | ✅ | client registers with an in-process coordinator and builds a TunnelPlan from the live network map |
+| `vpn-client-core` (integration) | 2 | ✅ | builds a TunnelPlan from the map; `watch()` receives a live push when a new peer registers |
 
 Other checks:
 - `cargo clippy --all-targets` → **clean, no warnings**
@@ -195,11 +195,11 @@ This confirms the QUIC build-feature wiring and the QUIC MTU clamp on a real dev
 
 | Item | Status | Notes |
 |------|--------|-------|
-| FR1 Coordinator gRPC service | 🟡 M1 | `vpn-control-proto` defines the `Coordinator` service (`RegisterDevice`, `GetNetworkMap`) via tonic/prost (vendored protoc). `vpn-coordinator` implements it. In-process gRPC test passes. Streaming update push (FR1) deferred |
+| FR1 Coordinator gRPC service | ✅ | `vpn-control-proto` service (`RegisterDevice`, `GetNetworkMap`, **`WatchNetworkMap` server-stream**) via tonic/prost (vendored protoc). `vpn-coordinator` implements it; registration fires a broadcast that pushes a fresh map to every watcher. In-process unary + streaming tests pass |
 | FR3 Key/endpoint distribution | 🟡 M1 | In-memory registry: register public key + endpoint, allocate tunnel IP, return full-mesh network map. Key rotation deferred |
 | FR2 Authentication (OIDC) | ⬜ | deferred |
 | FR4 Policy engine (ACLs) | ✅ | tag-based allow-rules, deny-by-default, `*` wildcard (`Policy` + `AclRule`); TOML-loadable via `--policy`; network map filtered per policy. **Caveat:** tags are self-declared until auth lands — not yet an authorization boundary |
-| FR6 Client integration | 🟡 | `vpn-client-core`: `ControlClient` registers + fetches map → `TunnelPlan` (assigned address + peers). In-process gRPC test. **Remaining:** applying a multi-peer plan to the running data plane (mesh) |
+| FR6 Client integration | 🟡 | `vpn-client-core`: `ControlClient` registers + fetches map → `TunnelPlan`, and **`watch()` consumes live map updates** (`NetworkMapStream`). In-process unary + streaming tests. **Remaining:** applying a multi-peer plan to the running data plane (mesh) |
 | FR5 Persistence (PostgreSQL) | ⬜ | in-memory only for now |
 | mTLS / sessions | ⬜ | plaintext gRPC for now |
 
@@ -208,3 +208,4 @@ This confirms the QUIC build-feature wiring and the QUIC MTU clamp on a real dev
 - 2026-06-17 — **Phase 3 started (M1)**: added `vpn-control-proto` (tonic/prost gRPC `Coordinator` contract — RegisterDevice/GetNetworkMap, built with vendored `protoc`) and `vpn-coordinator` (in-memory device registry, tunnel-IP allocation, full-mesh network map + server bin). 6 tests incl. an in-process gRPC integration test; 34 workspace tests, clippy/fmt clean. Persistence/OIDC/mTLS/streaming/ACL remain.
 - 2026-06-17 — **Phase 3 FR4 (ACL/policy engine)**: added a tag-based policy engine (`Policy`/`AclRule`) — deny-by-default allow-rules with `*` wildcard, TOML-loadable via `vpn-coordinator --policy`. Devices carry tags (added to the proto + registry); the network map is now filtered per policy. 5 new tests (39 workspace total), clippy/fmt clean. Caveat: tags are self-declared until OIDC auth lands.
 - 2026-06-17 — **Phase 3 client integration**: added `vpn-client-core` — `ControlClient` registers with the coordinator over gRPC and builds a `TunnelPlan` (assigned address + peers with endpoints/allowed-IPs) from the network map. In-process integration test (two clients ↔ in-process coordinator). 40 workspace tests, clippy/fmt clean. Remaining: apply a multi-peer plan to the running data plane (mesh).
+- 2026-06-17 — **Phase 3 streaming updates (FR1)**: added `WatchNetworkMap` server-streaming RPC. The coordinator fires a broadcast on every registration; each watcher recomputes and pushes a fresh map. `vpn-client-core` gains `watch()` → `NetworkMapStream`. In-process streaming test: A watches, B registers, A receives the live update. 41 workspace tests, clippy/fmt clean.

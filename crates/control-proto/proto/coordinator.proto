@@ -11,6 +11,9 @@ service Coordinator {
   rpc RegisterDevice(RegisterDeviceRequest) returns (RegisterDeviceResponse);
   // Return the set of peers this device may currently reach.
   rpc GetNetworkMap(NetworkMapRequest) returns (NetworkMapResponse);
+  // Stream the network map: the current map immediately, then a fresh map
+  // whenever the network changes (a device registers / updates).
+  rpc WatchNetworkMap(NetworkMapRequest) returns (stream NetworkMapResponse);
 }
 
 message RegisterDeviceRequest {

@@ -1,7 +1,11 @@
 //! The gRPC [`Coordinator`] service implementation over the [`Registry`].
 
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+use tokio::sync::{broadcast, mpsc};
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 use vpn_control_proto::coordinator::coordinator_server::Coordinator;
 use vpn_control_proto::coordinator::{
@@ -10,15 +14,33 @@ use vpn_control_proto::coordinator::{
 
 use crate::registry::Registry;
 
+/// Compute the current network-map response for a device.
+fn current_map(registry: &Arc<Mutex<Registry>>, public_key: &str) -> NetworkMapResponse {
+    let reg = registry.lock().expect("registry mutex poisoned");
+    let peers = reg
+        .network_map(public_key)
+        .into_iter()
+        .map(|d| PeerInfo {
+            public_key: d.public_key,
+            endpoint: d.endpoint,
+            allowed_ips: vec![format!("{}/32", d.tunnel_ip)],
+        })
+        .collect();
+    NetworkMapResponse { peers }
+}
+
 /// Coordinator gRPC service backed by a shared [`Registry`].
 pub struct CoordinatorService {
     registry: Arc<Mutex<Registry>>,
+    /// Fires after any registry change so watchers can push a fresh map.
+    changes: broadcast::Sender<()>,
 }
 
 impl CoordinatorService {
     /// Build a service over a shared registry.
     pub fn new(registry: Arc<Mutex<Registry>>) -> Self {
-        Self { registry }
+        let (changes, _) = broadcast::channel(16);
+        Self { registry, changes }
     }
 }
 
@@ -29,10 +51,13 @@ impl Coordinator for CoordinatorService {
         request: Request<RegisterDeviceRequest>,
     ) -> Result<Response<RegisterDeviceResponse>, Status> {
         let req = request.into_inner();
-        let mut reg = self.registry.lock().expect("registry mutex poisoned");
-        let ip = reg
-            .register(&req.public_key, &req.name, &req.endpoint, &req.tags)
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let ip = {
+            let mut reg = self.registry.lock().expect("registry mutex poisoned");
+            reg.register(&req.public_key, &req.name, &req.endpoint, &req.tags)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?
+        };
+        // Notify watchers that the network changed (ignored if none are connected).
+        let _ = self.changes.send(());
         Ok(Response::new(RegisterDeviceResponse {
             assigned_cidr: format!("{ip}/32"),
         }))
@@ -43,17 +68,45 @@ impl Coordinator for CoordinatorService {
         request: Request<NetworkMapRequest>,
     ) -> Result<Response<NetworkMapResponse>, Status> {
         let req = request.into_inner();
-        let reg = self.registry.lock().expect("registry mutex poisoned");
-        let peers = reg
-            .network_map(&req.public_key)
-            .into_iter()
-            .map(|d| PeerInfo {
-                public_key: d.public_key,
-                endpoint: d.endpoint,
-                allowed_ips: vec![format!("{}/32", d.tunnel_ip)],
-            })
-            .collect();
-        Ok(Response::new(NetworkMapResponse { peers }))
+        Ok(Response::new(current_map(&self.registry, &req.public_key)))
+    }
+
+    type WatchNetworkMapStream =
+        Pin<Box<dyn Stream<Item = Result<NetworkMapResponse, Status>> + Send>>;
+
+    async fn watch_network_map(
+        &self,
+        request: Request<NetworkMapRequest>,
+    ) -> Result<Response<Self::WatchNetworkMapStream>, Status> {
+        let public_key = request.into_inner().public_key;
+        let registry = self.registry.clone();
+        let mut changes = self.changes.subscribe();
+        let (tx, rx) = mpsc::channel(16);
+
+        tokio::spawn(async move {
+            // Push the current map immediately, then on every change.
+            if tx
+                .send(Ok(current_map(&registry, &public_key)))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            // On each change (or a missed burst) recompute and push; the loop
+            // ends when the broadcast closes (pattern stops matching) or the
+            // client disconnects.
+            while let Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) = changes.recv().await {
+                if tx
+                    .send(Ok(current_map(&registry, &public_key)))
+                    .await
+                    .is_err()
+                {
+                    break; // client disconnected
+                }
+            }
+        });
+
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 }
 

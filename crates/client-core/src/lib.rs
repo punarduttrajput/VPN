@@ -112,6 +112,43 @@ impl ControlClient {
         let peers = self.network_map(public_key).await?;
         Ok(TunnelPlan { address, peers })
     }
+
+    /// Subscribe to live network-map updates: the current map immediately, then
+    /// a fresh peer set whenever the network changes.
+    pub async fn watch(&mut self, public_key: &str) -> Result<NetworkMapStream, Error> {
+        let stream = self
+            .inner
+            .watch_network_map(NetworkMapRequest {
+                public_key: public_key.to_string(),
+            })
+            .await?
+            .into_inner();
+        Ok(NetworkMapStream { inner: stream })
+    }
+}
+
+/// A live stream of network-map updates from the coordinator.
+pub struct NetworkMapStream {
+    inner: tonic::Streaming<vpn_control_proto::coordinator::NetworkMapResponse>,
+}
+
+impl NetworkMapStream {
+    /// Await the next peer set, or `None` when the stream ends.
+    pub async fn next(&mut self) -> Result<Option<Vec<PeerSpec>>, Error> {
+        match self.inner.message().await? {
+            Some(resp) => Ok(Some(
+                resp.peers
+                    .into_iter()
+                    .map(|p| PeerSpec {
+                        public_key: p.public_key,
+                        endpoint: p.endpoint,
+                        allowed_ips: p.allowed_ips,
+                    })
+                    .collect(),
+            )),
+            None => Ok(None),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -166,5 +203,35 @@ mod tests {
         assert_eq!(peers_a[0].public_key, "BBB");
         assert_eq!(peers_a[0].endpoint, "2.2.2.2:51820");
         assert_eq!(peers_a[0].allowed_ips, vec!["10.8.0.3/32".to_string()]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watch_pushes_live_updates_when_peer_joins() {
+        use std::time::Duration;
+
+        let url = start_coordinator().await;
+        let mut a = ControlClient::connect(url.clone()).await.unwrap();
+        let mut b = ControlClient::connect(url).await.unwrap();
+
+        // A registers and starts watching; the initial map has no peers.
+        a.register("AAA", "laptop", "1.1.1.1:51820", &[])
+            .await
+            .unwrap();
+        let mut stream = a.watch("AAA").await.unwrap();
+        let initial = stream.next().await.unwrap().unwrap();
+        assert!(initial.is_empty(), "initial map has no peers");
+
+        // B registers -> the coordinator pushes a fresh map to A's stream.
+        b.register("BBB", "gateway", "2.2.2.2:51820", &[])
+            .await
+            .unwrap();
+        let update = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("watch update timed out")
+            .unwrap()
+            .unwrap();
+        assert_eq!(update.len(), 1);
+        assert_eq!(update[0].public_key, "BBB");
+        assert_eq!(update[0].endpoint, "2.2.2.2:51820");
     }
 }
