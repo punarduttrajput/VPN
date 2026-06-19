@@ -7,8 +7,14 @@
 //! a permissive verifier — the TLS layer here is for transport encryption and
 //! camouflage, not peer identity.
 //!
-//! Deferred to later Phase 2 increments: MASQUE/HTTP3 framing, connection
-//! migration, and padding/timing obfuscation.
+//! Connection migration (FR4): a QUIC connection is keyed by connection IDs, not
+//! by the 4-tuple, so it survives the client's local address changing (Wi-Fi →
+//! cellular, NAT rebind). [`QuicTransport::rebind`] swaps the underlying UDP
+//! socket; the next packet the client sends validates the new path and the server
+//! follows it — the tunnel keeps running without a re-handshake.
+//!
+//! Deferred to later Phase 2 increments: MASQUE/HTTP3 framing and padding/timing
+//! obfuscation.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -34,8 +40,9 @@ pub(crate) fn install_provider() {
 /// A QUIC datagram channel to a single peer.
 pub struct QuicTransport {
     connection: Connection,
-    // Endpoint is kept alive for the duration of the connection.
-    _endpoint: Endpoint,
+    // Owns the local UDP socket; kept for the connection's lifetime and used to
+    // migrate the connection to a new local address (FR4).
+    endpoint: Endpoint,
 }
 
 impl QuicTransport {
@@ -70,7 +77,7 @@ impl QuicTransport {
         let connection = incoming.await.map_err(|e| conn(format!("accept: {e}")))?;
         Ok(Self {
             connection,
-            _endpoint: endpoint,
+            endpoint,
         })
     }
 
@@ -80,6 +87,39 @@ impl QuicTransport {
     /// and starts at a conservative path MTU until discovery raises it).
     pub fn max_datagram_size(&self) -> Option<usize> {
         self.connection.max_datagram_size()
+    }
+
+    /// The connection's current remote address. For a server transport this
+    /// follows the client after a migration (FR4), so it reflects the latest
+    /// validated path.
+    pub fn remote_address(&self) -> SocketAddr {
+        self.connection.remote_address()
+    }
+
+    /// The local address this transport's endpoint is currently bound to
+    /// (changes after [`rebind`](QuicTransport::rebind)).
+    pub fn local_addr(&self) -> Result<SocketAddr, TransportError> {
+        self.endpoint.local_addr().map_err(TransportError::Io)
+    }
+
+    /// Infallible form of [`local_addr`](QuicTransport::local_addr) for use in
+    /// tests and assertions — panics if the OS rejects the query.
+    pub fn local_addr_of_endpoint(&self) -> SocketAddr {
+        self.endpoint.local_addr().expect("endpoint local addr")
+    }
+
+    /// Migrate this (client) connection to a fresh local UDP socket bound at
+    /// `new_local` — QUIC connection migration / roaming (FR4).
+    ///
+    /// The QUIC connection is identified by connection IDs, not the 4-tuple, so
+    /// it survives the local address change: the next datagram the client sends
+    /// goes out the new socket, the server validates the new path, and traffic
+    /// continues without a re-handshake. Call this on the client side after a
+    /// network change; pass `0.0.0.0:0` / `[::]:0` to let the OS pick a port.
+    pub fn rebind(&self, new_local: SocketAddr) -> Result<(), TransportError> {
+        let socket = std::net::UdpSocket::bind(new_local).map_err(TransportError::Io)?;
+        self.endpoint.rebind(socket).map_err(TransportError::Io)?;
+        Ok(())
     }
 
     /// Connect to a QUIC server at `server` from local address `local`.
@@ -107,7 +147,7 @@ impl QuicTransport {
 
         Ok(Self {
             connection,
-            _endpoint: endpoint,
+            endpoint,
         })
     }
 }
@@ -224,5 +264,66 @@ mod tests {
         // Closing the client lets the server's `closed()` resolve and the task end.
         drop(client);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server).await;
+    }
+
+    /// The connection survives the client rebinding to a new local socket
+    /// (QUIC connection migration / roaming, FR4): datagrams still flow after
+    /// the address change, and the server observes the client's new address.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quic_connection_survives_client_migration() {
+        use std::time::Duration;
+
+        let endpoint = QuicTransport::server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = endpoint.local_addr().unwrap();
+
+        // Server: echo every datagram until the client closes, reporting the
+        // remote address it saw on the last datagram.
+        let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let t = QuicTransport::accept(endpoint).await.unwrap();
+            let mut buf = [0u8; 1500];
+            // First datagram (pre-migration).
+            let n = t.recv(&mut buf).await.unwrap();
+            t.send(&buf[..n]).await.unwrap();
+            // Second datagram (post-migration) arrives over the new path.
+            let n = t.recv(&mut buf).await.unwrap();
+            t.send(&buf[..n]).await.unwrap();
+            let _ = addr_tx.send(t.remote_address());
+            t.connection.closed().await;
+        });
+
+        let client = QuicTransport::connect("127.0.0.1:0".parse().unwrap(), server_addr, "vpn")
+            .await
+            .unwrap();
+        let before = client.local_addr_of_endpoint();
+
+        // Pre-migration exchange.
+        client.send(b"before").await.unwrap();
+        let mut buf = [0u8; 1500];
+        let n = client.recv(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"before");
+
+        // Roam: rebind to a fresh local socket. The connection must survive.
+        client.rebind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let after = client.local_addr_of_endpoint();
+        assert_ne!(before, after, "endpoint should be bound to a new local port");
+
+        // Post-migration exchange over the new path.
+        client.send(b"after").await.unwrap();
+        let n = tokio::time::timeout(Duration::from_secs(5), client.recv(&mut buf))
+            .await
+            .expect("post-migration recv timed out")
+            .unwrap();
+        assert_eq!(&buf[..n], b"after", "datagrams flow after migration");
+
+        // The server saw the client's new (migrated) address on the last packet.
+        let seen = tokio::time::timeout(Duration::from_secs(5), addr_rx)
+            .await
+            .expect("server address report timed out")
+            .unwrap();
+        assert_eq!(seen, after, "server followed the client to its new address");
+
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
     }
 }
