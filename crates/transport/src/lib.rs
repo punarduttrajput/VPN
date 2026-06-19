@@ -12,6 +12,9 @@ use std::net::SocketAddr;
 
 use thiserror::Error;
 
+pub mod jitter;
+pub use jitter::JitteredTransport;
+
 pub mod pad;
 pub use pad::PaddedTransport;
 
@@ -49,6 +52,9 @@ pub enum TransportError {
     Setup(String),
 }
 
+/// Maximum datagrams in one `send_batch` call (caps allocation in hot path).
+pub const BATCH_SIZE: usize = 64;
+
 /// A bidirectional datagram channel to a single peer.
 ///
 /// Methods take `&self` so the event loop can `send` and `recv` concurrently
@@ -66,6 +72,29 @@ pub trait Transport: Send + Sync {
         &self,
         buf: &mut [u8],
     ) -> impl std::future::Future<Output = Result<usize, TransportError>> + Send;
+
+    /// Non-blocking receive attempt. Returns `Some(n)` if a datagram was
+    /// immediately available, `None` if the socket would block (EWOULDBLOCK).
+    /// Transports that do not support non-blocking receive always return `None`.
+    fn try_recv(&self, buf: &mut [u8]) -> Result<Option<usize>, TransportError> {
+        let _ = buf;
+        Ok(None)
+    }
+
+    /// Send a batch of datagrams in one call. Implementors may override with
+    /// an efficient multi-message syscall (e.g. `sendmmsg` on Linux).
+    /// Default: sends each datagram sequentially.
+    fn send_batch<'a>(
+        &'a self,
+        datagrams: &'a [Vec<u8>],
+    ) -> impl std::future::Future<Output = Result<(), TransportError>> + Send + 'a {
+        async move {
+            for d in datagrams {
+                self.send(d).await?;
+            }
+            Ok(())
+        }
+    }
 }
 
 /// A multi-peer datagram fabric for the mesh data plane (PRD Phase 3/4).

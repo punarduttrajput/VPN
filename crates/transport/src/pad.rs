@@ -75,6 +75,32 @@ impl<T: Transport> Transport for PaddedTransport<T> {
         out[..m].copy_from_slice(&payload[..m]);
         Ok(m)
     }
+
+    fn try_recv(&self, out: &mut [u8]) -> Result<Option<usize>, TransportError> {
+        let mut buf = vec![0u8; MAX_FRAMED];
+        match self.inner.try_recv(&mut buf)? {
+            None => Ok(None),
+            Some(n) => {
+                let payload = deframe(&buf[..n])?;
+                let m = payload.len().min(out.len());
+                out[..m].copy_from_slice(&payload[..m]);
+                Ok(Some(m))
+            }
+        }
+    }
+
+    fn send_batch<'a>(
+        &'a self,
+        datagrams: &'a [Vec<u8>],
+    ) -> impl std::future::Future<Output = Result<(), TransportError>> + Send + 'a {
+        async move {
+            let framed: Vec<Vec<u8>> = datagrams
+                .iter()
+                .map(|d| frame(d, self.pad_to))
+                .collect();
+            self.inner.send_batch(&framed).await
+        }
+    }
 }
 
 #[cfg(test)]

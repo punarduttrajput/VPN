@@ -21,7 +21,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
-use vpn_transport::Transport;
+use vpn_transport::{Transport, BATCH_SIZE};
 
 use crate::device::TunDevice;
 use crate::session::{Action, Session, MAX_PACKET};
@@ -61,6 +61,9 @@ where
     // ICMP unreachable during the startup race must not kill the data plane).
 
     // --- net reader: transport.recv → inbound_net -------------------------
+    // After the blocking recv, drain any further immediately-available datagrams
+    // via try_recv so a burst of inbound packets is forwarded to the crypto task
+    // in one scheduler timeslice rather than one wake-up per packet.
     {
         let transport = transport.clone();
         tasks.spawn(async move {
@@ -70,6 +73,13 @@ where
                     Ok(n) => {
                         if inbound_net_tx.send(buf[..n].to_vec()).await.is_err() {
                             break; // crypto task gone
+                        }
+                        // Drain any additional packets already in the socket buffer.
+                        let mut extra = vec![0u8; MAX_PACKET];
+                        while let Ok(Some(m)) = transport.try_recv(&mut extra) {
+                            if inbound_net_tx.send(extra[..m].to_vec()).await.is_err() {
+                                return;
+                            }
                         }
                     }
                     Err(e) => {
@@ -81,15 +91,30 @@ where
         });
     }
 
-    // --- net writer: outbound_net → transport.send ------------------------
+    // --- net writer: outbound_net → transport.send_batch ------------------
+    // Drain the channel into a burst (up to BATCH_SIZE) so we hand multiple
+    // datagrams to the transport in a single call — on Linux this becomes a
+    // single sendmmsg syscall, cutting per-packet overhead (NFR1).
     {
         let transport = transport.clone();
         let mut rx = outbound_net_rx;
         tasks.spawn(async move {
-            while let Some(pkt) = rx.recv().await {
-                if let Err(e) = transport.send(&pkt).await {
-                    debug!("transport send error (ignored): {e}");
+            let mut batch: Vec<Vec<u8>> = Vec::with_capacity(BATCH_SIZE);
+            loop {
+                // Wait for at least one packet.
+                let Some(first) = rx.recv().await else { break };
+                batch.push(first);
+                // Drain any additional packets that are already queued.
+                while batch.len() < BATCH_SIZE {
+                    match rx.try_recv() {
+                        Ok(pkt) => batch.push(pkt),
+                        Err(_) => break,
+                    }
                 }
+                if let Err(e) = transport.send_batch(&batch).await {
+                    debug!("transport send_batch error (ignored): {e}");
+                }
+                batch.clear();
             }
         });
     }

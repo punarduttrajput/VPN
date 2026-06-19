@@ -83,6 +83,11 @@ pub struct TransportConfig {
     /// Target padded size in bytes when `padding` is on (defaults to 1280).
     #[serde(default)]
     pub pad_to: Option<u16>,
+    /// Add a random delay of up to this many milliseconds before each outgoing
+    /// send to defeat timing-based traffic fingerprinting (FR5). Defaults to
+    /// off. Both peers configure this independently.
+    #[serde(default)]
+    pub jitter_ms: Option<u16>,
 }
 
 /// Configuration for the remote peer.
@@ -200,6 +205,13 @@ impl Config {
         if self.transport.mode == TransportMode::Quic && self.transport.role.is_none() {
             return Err(Error::ConfigInvalid(
                 "transport.role (client|server) is required when transport.mode = quic".into(),
+            ));
+        }
+
+        if self.transport.jitter_ms == Some(0) {
+            return Err(Error::ConfigInvalid(
+                "transport.jitter_ms must be > 0 when set (omit the field to disable jitter)"
+                    .into(),
             ));
         }
 
@@ -363,6 +375,27 @@ mod tests {
         let cfg: Config = toml::from_str(&valid_toml()).unwrap();
         assert!(!cfg.transport.padding);
         assert_eq!(cfg.transport.pad_to, None);
+    }
+
+    #[test]
+    fn parses_jitter_ms() {
+        let toml_str = format!(
+            "{}\n[transport]\nmode = \"udp\"\njitter_ms = 20\n",
+            valid_toml()
+        );
+        let cfg: Config = toml::from_str(&toml_str).unwrap();
+        assert_eq!(cfg.transport.jitter_ms, Some(20));
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_jitter_ms_zero() {
+        let toml_str = format!(
+            "{}\n[transport]\nmode = \"udp\"\njitter_ms = 0\n",
+            valid_toml()
+        );
+        let cfg: Config = toml::from_str(&toml_str).unwrap();
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

@@ -26,5 +26,8 @@ h3-quinn = { workspace = true, optional = true }
 h3-datagram = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }
