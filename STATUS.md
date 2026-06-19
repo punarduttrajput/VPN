@@ -34,7 +34,7 @@ Legend: ⬜ Not started · 🟡 In progress/partial · ✅ Done · ⚠️ Blocke
 
 ## Test Results
 
-`CARGO_NET_OFFLINE=false cargo test --workspace` — **41 passed** (default, incl. 11 coordinator + 2 client-core); **42** with `--features vpn-cli/quic`; **43** with `--features vpn-cli/masque`; coordinator with `--features sqlite` → **14** (3 persistence tests); client-core with `--features mtls` → **3** (adds the mutual-TLS accept/reject test)
+`CARGO_NET_OFFLINE=false cargo test --workspace` — **45 passed** (default, incl. 11 coordinator + 2 client-core + mesh routing); **42** with `--features vpn-cli/quic`; **43** with `--features vpn-cli/masque`; coordinator with `--features sqlite` → **14** (3 persistence tests); client-core with `--features mtls` → **3** (adds the mutual-TLS accept/reject test)
 
 | Suite | Tests | Result | Covers |
 |-------|-------|--------|--------|
@@ -46,6 +46,8 @@ Legend: ⬜ Not started · 🟡 In progress/partial · ✅ Done · ⚠️ Blocke
 | `vpn-transport` (udp) | 1 | ✅ | UDP datagram roundtrip |
 | `vpn-transport` (quic) | 1 | ✅ | QUIC datagram roundtrip (only with `quic` feature) |
 | `loopback` (integration) | 1 | ✅ | full path: handshake → encapsulate → transport → decapsulate → TUN write |
+| `vpn-tunnel` (mesh) | 2 | ✅ | IPv4 dest parse, route-by-allowed-ips |
+| `mesh` (integration) | 1 | ✅ | A routes packets to B and C by destination IP over real UDP |
 | `vpn-coordinator` (registry) | 6 | ✅ | IP allocation, idempotent re-register, empty-key reject, map-excludes-self, pool exhaustion, policy-filtered map |
 | `vpn-coordinator` (policy) | 4 | ✅ | allow-all, directional deny-by-default, `*` wildcard, TOML parse |
 | `vpn-coordinator` (grpc) | 1 | ✅ | in-process gRPC: register two devices → network map returns the peer |
@@ -199,7 +201,7 @@ This confirms the QUIC build-feature wiring and the QUIC MTU clamp on a real dev
 | FR3 Key/endpoint distribution | 🟡 M1 | In-memory registry: register public key + endpoint, allocate tunnel IP, return full-mesh network map. Key rotation deferred |
 | FR2 Authentication (OIDC) | ⬜ | deferred |
 | FR4 Policy engine (ACLs) | ✅ | tag-based allow-rules, deny-by-default, `*` wildcard (`Policy` + `AclRule`); TOML-loadable via `--policy`; network map filtered per policy. **Caveat:** tags are self-declared until auth lands — not yet an authorization boundary |
-| FR6 Client integration | 🟡 | `vpn-client-core`: `ControlClient` registers + fetches map → `TunnelPlan`, and **`watch()` consumes live map updates** (`NetworkMapStream`). In-process unary + streaming tests. **Remaining:** applying a multi-peer plan to the running data plane (mesh) |
+| FR6 Client integration | ✅ | `vpn-client-core`: register + `plan` + live `watch`. The data plane now has a **multi-peer mesh** (`vpn-tunnel::run_mesh`): one session per peer over one UDP socket, outbound routed by dest-IP against `allowed_ips`, inbound demuxed by source. 3-node in-process routing test. **Remaining:** plumb `TunnelPlan` → `MeshPeer` in the CLI; real-TUN mesh run |
 | FR5 Persistence | ✅ (SQLite) | `Store` trait with write-through; `MemoryStore` default + `SqliteStore` (bundled SQLite, `sqlite` feature) via `--store <path>`. Registry loads on startup, upserts on register. 3 tests incl. survives-restart. PostgreSQL is a further backend behind the same trait |
 | mTLS | ✅ | Mutual TLS on the gRPC channel (`mtls` feature): coordinator presents a server cert + requires CA-signed client certs; `ControlClient::connect_mtls`; `--tls-cert/--tls-key/--tls-ca` on the binary. rcgen test PKI; e2e test accepts valid client, rejects wrong-CA. tonic rustls (ring) |
 | OIDC sessions | ⬜ | deferred (would make ACL tags an auth boundary) |
@@ -212,3 +214,4 @@ This confirms the QUIC build-feature wiring and the QUIC MTU clamp on a real dev
 - 2026-06-17 — **Phase 3 streaming updates (FR1)**: added `WatchNetworkMap` server-streaming RPC. The coordinator fires a broadcast on every registration; each watcher recomputes and pushes a fresh map. `vpn-client-core` gains `watch()` → `NetworkMapStream`. In-process streaming test: A watches, B registers, A receives the live update. 41 workspace tests, clippy/fmt clean.
 - 2026-06-17 — **Phase 3 persistence (FR5)**: added a `Store` trait (write-through) with `MemoryStore` (default) and `SqliteStore` (bundled SQLite, `sqlite` feature). Registry loads devices on startup and upserts on register; `vpn-coordinator --store <path>` enables durability. 3 new tests incl. survives-restart (devices + IPs persist across reopen). CI runs the sqlite feature. Coordinator default 11 tests / 14 with sqlite; clippy/fmt clean. PostgreSQL can slot in behind the same trait later.
 - 2026-06-17 — **Phase 3 mTLS**: mutual TLS on the coordinator gRPC channel (`mtls` feature, tonic rustls/ring). Coordinator presents a server cert and requires CA-signed client certs (`--tls-cert/--tls-key/--tls-ca`); `vpn-client-core::ControlClient::connect_mtls`; rcgen-based test PKI (`vpn_coordinator::pki`). E2e test: valid client identity accepted, wrong-CA client rejected. CI runs the mtls feature. clippy/fmt clean.
+- 2026-06-17 — **Multi-peer mesh data plane**: `vpn-tunnel::run_mesh` holds one `Session` per peer over a single UDP socket — outbound TUN packets routed by destination IP against each peer's `allowed_ips`, inbound datagrams demuxed by source address. Added `Cidr::contains` to vpn-core. 4 new tests incl. a 3-node integration test (A routes to B and C correctly). 45 workspace tests, clippy/fmt clean. This is the shape a `TunnelPlan` becomes; UDP-only for now (QUIC/MASQUE mesh + CLI plan→mesh wiring + real-TUN run remain).

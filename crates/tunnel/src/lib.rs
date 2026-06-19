@@ -3,10 +3,12 @@
 #![cfg_attr(not(unix), allow(dead_code))]
 
 pub mod device;
+pub mod mesh;
 pub mod session;
 
 mod runner;
 
+pub use mesh::{run_mesh, MeshPeer};
 pub use runner::{run, RunHandle};
 
 use thiserror::Error;

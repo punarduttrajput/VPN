@@ -100,6 +100,30 @@ pub struct Cidr {
     pub prefix: u8,
 }
 
+impl Cidr {
+    /// Whether `ip` falls within this CIDR (matching address family + prefix).
+    pub fn contains(&self, ip: std::net::IpAddr) -> bool {
+        use std::net::IpAddr;
+        match (self.addr, ip) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => {
+                if self.prefix == 0 {
+                    return true;
+                }
+                let shift = 32 - u32::from(self.prefix.min(32));
+                (u32::from(net) >> shift) == (u32::from(ip) >> shift)
+            }
+            (IpAddr::V6(net), IpAddr::V6(ip)) => {
+                if self.prefix == 0 {
+                    return true;
+                }
+                let shift = 128 - u32::from(self.prefix.min(128));
+                (u128::from(net) >> shift) == (u128::from(ip) >> shift)
+            }
+            _ => false, // mixed address families never match
+        }
+    }
+}
+
 impl FromStr for Cidr {
     type Err = Error;
 
@@ -228,6 +252,20 @@ mod tests {
         assert_eq!(v4.prefix, 24);
         let v6: Cidr = "fd00::1/64".parse().unwrap();
         assert_eq!(v6.prefix, 64);
+    }
+
+    #[test]
+    fn cidr_contains_matches_within_prefix() {
+        let net: Cidr = "10.8.0.0/24".parse().unwrap();
+        assert!(net.contains("10.8.0.2".parse().unwrap()));
+        assert!(net.contains("10.8.0.254".parse().unwrap()));
+        assert!(!net.contains("10.8.1.1".parse().unwrap()));
+        // host route
+        let host: Cidr = "10.8.0.3/32".parse().unwrap();
+        assert!(host.contains("10.8.0.3".parse().unwrap()));
+        assert!(!host.contains("10.8.0.4".parse().unwrap()));
+        // mixed families never match
+        assert!(!net.contains("fd00::1".parse().unwrap()));
     }
 
     #[test]
