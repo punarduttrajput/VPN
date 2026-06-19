@@ -18,7 +18,7 @@ use tracing_subscriber::EnvFilter;
 use vpn_client_core::{ControlClient, PeerSpec};
 use vpn_core::config::{Cidr, Config, TransportMode};
 use vpn_core::keys::KeyPair;
-use vpn_transport::{UdpMeshTransport, UdpTransport};
+use vpn_transport::{JitteredTransport, UdpMeshTransport, UdpTransport};
 use vpn_tunnel::device::{self, TunConfig};
 use vpn_tunnel::session::Session;
 use vpn_tunnel::{run_mesh, MeshPeer};
@@ -169,6 +169,11 @@ async fn up(config_path: &str, iface: &str, mtu: u16) -> Result<()> {
         None
     };
 
+    let jitter_ms = config.transport.jitter_ms.map(u64::from);
+    if let Some(ms) = jitter_ms {
+        info!(max_ms = ms, "transport timing jitter enabled (FR5)");
+    }
+
     info!("starting tunnel event loop (Ctrl-C to stop)");
     match config.transport.mode {
         TransportMode::Udp => {
@@ -176,7 +181,7 @@ async fn up(config_path: &str, iface: &str, mtu: u16) -> Result<()> {
                 .await
                 .with_context(|| format!("binding UDP socket on {bind_addr}"))?;
             info!("transport: udp");
-            drive(session, dev, transport, pad_to, shutdown).await?;
+            drive(session, dev, transport, pad_to, jitter_ms, shutdown).await?;
         }
         TransportMode::Quic => {
             #[cfg(feature = "quic")]
@@ -197,14 +202,14 @@ async fn up(config_path: &str, iface: &str, mtu: u16) -> Result<()> {
                         let transport = QuicTransport::accept(ep)
                             .await
                             .context("accepting quic connection")?;
-                        drive(session, dev, transport, pad_to, shutdown).await?;
+                        drive(session, dev, transport, pad_to, jitter_ms, shutdown).await?;
                     }
                     Some(TransportRole::Client) => {
                         info!("transport: quic (client), connecting to {peer}");
                         let transport = QuicTransport::connect(bind_addr, peer, &server_name)
                             .await
                             .context("connecting quic transport")?;
-                        drive(session, dev, transport, pad_to, shutdown).await?;
+                        drive(session, dev, transport, pad_to, jitter_ms, shutdown).await?;
                     }
                     None => anyhow::bail!("transport.role (client|server) required for quic"),
                 }
@@ -243,7 +248,7 @@ async fn up(config_path: &str, iface: &str, mtu: u16) -> Result<()> {
                     MasqueTransport::connect(bind_addr, proxy_addr, &authority, peer)
                         .await
                         .context("connecting to masque proxy")?;
-                drive(session, dev, transport, pad_to, shutdown).await?;
+                drive(session, dev, transport, pad_to, jitter_ms, shutdown).await?;
             }
             #[cfg(not(feature = "masque"))]
             {
@@ -422,20 +427,32 @@ fn build_mesh_peers(private_key_b64: &str, peers: &[PeerSpec]) -> Result<Vec<Mes
 /// Default padded datagram size when `padding` is on but `pad_to` is unset.
 const DEFAULT_PAD_TO: u16 = 1280;
 
-/// Run the tunnel, optionally wrapping the transport in size-padding (FR5).
+/// Run the tunnel, optionally wrapping the transport in padding and/or jitter.
 async fn drive<D, T>(
     session: Session,
     device: D,
     transport: T,
     pad_to: Option<u16>,
+    jitter_ms: Option<u64>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()>
 where
     D: vpn_tunnel::device::TunDevice + Send + 'static,
     T: vpn_transport::Transport + Send + Sync + 'static,
 {
-    match pad_to {
-        Some(p) => vpn_tunnel::run(
+    // Layer order (outermost first): jitter → padding → inner transport.
+    // Jitter goes outside padding so the randomly delayed packet is already
+    // fully framed; swapping the order would still work but is less logical.
+    match (pad_to, jitter_ms) {
+        (Some(p), Some(ms)) => vpn_tunnel::run(
+            session,
+            device,
+            JitteredTransport::new(vpn_transport::PaddedTransport::new(transport, p as usize), ms),
+            shutdown,
+        )
+        .await
+        .context("tunnel event loop")?,
+        (Some(p), None) => vpn_tunnel::run(
             session,
             device,
             vpn_transport::PaddedTransport::new(transport, p as usize),
@@ -443,7 +460,15 @@ where
         )
         .await
         .context("tunnel event loop")?,
-        None => vpn_tunnel::run(session, device, transport, shutdown)
+        (None, Some(ms)) => vpn_tunnel::run(
+            session,
+            device,
+            JitteredTransport::new(transport, ms),
+            shutdown,
+        )
+        .await
+        .context("tunnel event loop")?,
+        (None, None) => vpn_tunnel::run(session, device, transport, shutdown)
             .await
             .context("tunnel event loop")?,
     }
