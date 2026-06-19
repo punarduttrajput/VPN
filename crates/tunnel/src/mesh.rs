@@ -10,10 +10,12 @@
 //! peer (public key, endpoint, allowed IPs) maps to one [`MeshPeer`].
 //!
 //! The wire protocol is abstracted behind [`MeshTransport`]: a shared UDP socket
-//! today ([`UdpMeshTransport`](vpn_transport::UdpMeshTransport)), with QUIC/MASQUE
-//! mesh transports able to slot in behind the same trait. A pipelined mesh data
-//! path is a later increment. Routing is verified in-process here; a real-TUN
-//! mesh run is a Linux/Codespaces path (`verify-linux.sh TEST_MESH=1`).
+//! ([`UdpMeshTransport`](vpn_transport::UdpMeshTransport)) or QUIC
+//! ([`QuicMeshTransport`](vpn_transport::QuicMeshTransport), the `quic` feature),
+//! with MASQUE able to slot in behind the same trait. A pipelined mesh data path
+//! is a later increment. Routing is verified in-process here (UDP and QUIC); a
+//! real-TUN mesh run is a Linux/Codespaces path (`verify-linux.sh TEST_MESH=1`,
+//! `MESH_QUIC=1` for QUIC).
 
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;

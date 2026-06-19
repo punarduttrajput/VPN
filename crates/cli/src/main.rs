@@ -259,19 +259,22 @@ async fn up_mesh(
     let iface_cidr: Cidr = address
         .parse()
         .with_context(|| format!("coordinator-assigned address '{address}'"))?;
+    // QUIC datagrams cap below a normal MTU; shrink the inner MTU so encrypted
+    // packets fit (mirrors the point-to-point `up` path).
+    let effective_mtu = match config.transport.mode {
+        TransportMode::Quic => mtu.min(QUIC_TUN_MTU),
+        TransportMode::Udp => mtu,
+    };
     let tun_cfg = TunConfig {
         name: iface.to_string(),
         address: iface_cidr,
-        mtu,
+        mtu: effective_mtu,
     };
     let dev = device::open(&tun_cfg)
         .context("opening TUN device (needs elevated privileges on Linux/macOS)")?;
-    info!(interface = %iface, mtu, "TUN device up");
+    info!(interface = %iface, mtu = effective_mtu, "TUN device up");
 
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", config.listen_port).parse()?;
-    let transport = UdpMeshTransport::bind(bind_addr)
-        .await
-        .with_context(|| format!("binding UDP socket on {bind_addr}"))?;
 
     // Subscribe to live network-map updates and feed converted peer sets into the
     // mesh, so membership converges no matter who registered first.
@@ -303,10 +306,38 @@ async fn up_mesh(
 
     info!("starting mesh data plane (Ctrl-C to stop)");
     // Start with an empty mesh; the watch stream delivers the current peer set
-    // immediately, then updates as the network changes.
-    let result = run_mesh(dev, transport, Vec::new(), rx, shutdown_signal())
-        .await
-        .context("mesh data plane");
+    // immediately, then updates as the network changes. Pick the mesh transport
+    // from the config's transport mode.
+    let result = match config.transport.mode {
+        TransportMode::Udp => {
+            let transport = UdpMeshTransport::bind(bind_addr)
+                .await
+                .with_context(|| format!("binding UDP socket on {bind_addr}"))?;
+            info!("mesh transport: udp");
+            run_mesh(dev, transport, Vec::new(), rx, shutdown_signal())
+                .await
+                .context("mesh data plane")
+        }
+        TransportMode::Quic => {
+            #[cfg(feature = "quic")]
+            {
+                let transport = vpn_transport::QuicMeshTransport::bind(bind_addr)
+                    .await
+                    .with_context(|| format!("binding QUIC mesh endpoint on {bind_addr}"))?;
+                info!("mesh transport: quic");
+                run_mesh(dev, transport, Vec::new(), rx, shutdown_signal())
+                    .await
+                    .context("mesh data plane")
+            }
+            #[cfg(not(feature = "quic"))]
+            {
+                anyhow::bail!(
+                    "config requests transport.mode = quic for the mesh, but this binary \
+                     was built without the `quic` feature (rebuild with --features vpn-cli/quic)"
+                );
+            }
+        }
+    };
     watcher.abort();
     result?;
     info!("tunnel stopped");
