@@ -65,6 +65,14 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo clippy --workspace --all-targets --features vpn-cli/masque -- -D warnings
 
+      # Phase 3: exercise the SQLite-backed coordinator persistence.
+      - name: Test (coordinator sqlite feature)
+        run: cargo test -p vpn-coordinator --features sqlite
+
+      - name: clippy (coordinator sqlite feature)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo clippy -p vpn-coordinator --all-targets --features sqlite -- -D warnings
+
   # Real-device + benchmark verification (M3 / M5 / M6) on a Linux runner.
   verify-linux:
     name: verify-linux (M3/M5/M6)

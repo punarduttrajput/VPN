@@ -9,7 +9,15 @@
 pub mod policy;
 pub mod registry;
 pub mod service;
+pub mod store;
+
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
 
 pub use policy::{AclRule, Policy};
 pub use registry::{Device, Registry, RegistryError};
 pub use service::CoordinatorService;
+pub use store::{MemoryStore, Store, StoreError};
+
+#[cfg(feature = "sqlite")]
+pub use sqlite::SqliteStore;

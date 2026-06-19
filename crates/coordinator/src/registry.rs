@@ -1,8 +1,9 @@
-//! In-memory device registry and tunnel-IP allocator (PRD Phase 3, FR1/FR3).
+//! Device registry and tunnel-IP allocator (PRD Phase 3, FR1/FR3/FR5).
 //!
 //! Holds only control metadata — public keys, endpoints, assigned tunnel IPs —
-//! never user traffic (NFR4). Persistence (PostgreSQL) is a later increment;
-//! this in-memory store is what the M1 coordinator runs on and is fully testable.
+//! never user traffic (NFR4). Devices live in memory for fast lookups and are
+//! written through to a [`Store`] for durability: in-memory by default, or SQLite
+//! (the `sqlite` feature) so the registry survives a restart.
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -10,6 +11,7 @@ use std::net::Ipv4Addr;
 use thiserror::Error;
 
 use crate::policy::Policy;
+use crate::store::{MemoryStore, Store};
 
 /// Errors from registry operations.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -20,6 +22,9 @@ pub enum RegistryError {
     /// No tunnel addresses remain in the pool.
     #[error("tunnel address pool exhausted")]
     PoolExhausted,
+    /// The persistence backend failed.
+    #[error("persistence error: {0}")]
+    Store(String),
 }
 
 /// A registered device.
@@ -38,13 +43,13 @@ pub struct Device {
 }
 
 /// Registry of devices and their assigned tunnel addresses.
-#[derive(Debug)]
 pub struct Registry {
     base: Ipv4Addr,
     prefix: u8,
     next_host: u32,
     by_key: HashMap<String, Device>,
     policy: Policy,
+    store: Box<dyn Store>,
 }
 
 impl Registry {
@@ -53,7 +58,7 @@ impl Registry {
         Self::with_policy(base, prefix, Policy::allow_all())
     }
 
-    /// Create a registry with an explicit access [`Policy`].
+    /// Create an in-memory registry with an explicit access [`Policy`].
     pub fn with_policy(base: Ipv4Addr, prefix: u8, policy: Policy) -> Self {
         Self {
             base,
@@ -61,7 +66,33 @@ impl Registry {
             next_host: 2,
             by_key: HashMap::new(),
             policy,
+            store: Box::new(MemoryStore),
         }
+    }
+
+    /// Create a registry backed by a durable [`Store`], loading any persisted
+    /// devices into memory at startup.
+    pub fn with_store(
+        base: Ipv4Addr,
+        prefix: u8,
+        policy: Policy,
+        store: Box<dyn Store>,
+    ) -> Result<Self, RegistryError> {
+        let mut by_key = HashMap::new();
+        for d in store
+            .load_all()
+            .map_err(|e| RegistryError::Store(e.to_string()))?
+        {
+            by_key.insert(d.public_key.clone(), d);
+        }
+        Ok(Self {
+            base,
+            prefix,
+            next_host: 2,
+            by_key,
+            policy,
+            store,
+        })
     }
 
     /// Register or re-register a device. Re-registering the same public key is
@@ -76,24 +107,30 @@ impl Registry {
         if public_key.trim().is_empty() {
             return Err(RegistryError::InvalidKey);
         }
-        if let Some(existing) = self.by_key.get_mut(public_key) {
+        // Build (or refresh) the device, then write through to the store. The
+        // device is cloned out so the `&mut self.by_key` borrow ends before the
+        // `self.store` borrow.
+        let device = if let Some(existing) = self.by_key.get_mut(public_key) {
             existing.name = name.to_string();
             existing.endpoint = endpoint.to_string();
             existing.tags = tags.to_vec();
-            return Ok(existing.tunnel_ip);
-        }
-        let ip = self.allocate()?;
-        self.by_key.insert(
-            public_key.to_string(),
-            Device {
+            existing.clone()
+        } else {
+            let ip = self.allocate()?;
+            let device = Device {
                 public_key: public_key.to_string(),
                 name: name.to_string(),
                 endpoint: endpoint.to_string(),
                 tunnel_ip: ip,
                 tags: tags.to_vec(),
-            },
-        );
-        Ok(ip)
+            };
+            self.by_key.insert(public_key.to_string(), device.clone());
+            device
+        };
+        self.store
+            .upsert(&device)
+            .map_err(|e| RegistryError::Store(e.to_string()))?;
+        Ok(device.tunnel_ip)
     }
 
     /// Allocate the next free host address in the pool (excludes network,
@@ -226,5 +263,53 @@ mod tests {
 
         // server is not permitted to initiate to dev -> sees nobody.
         assert!(r.network_map("srvkey").is_empty());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn registry_persists_devices_across_restart() {
+        use crate::sqlite::SqliteStore;
+
+        let path = std::env::temp_dir().join(format!("vpn-reg-test-{}.db", std::process::id()));
+        let path = path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        // First "run": register two devices through a SQLite-backed registry.
+        {
+            let store = SqliteStore::open(&path).unwrap();
+            let mut r = Registry::with_store(
+                Ipv4Addr::new(10, 8, 0, 0),
+                24,
+                Policy::allow_all(),
+                Box::new(store),
+            )
+            .unwrap();
+            assert_eq!(
+                r.register("AAA", "a", "1.1.1.1:51820", &[]).unwrap(),
+                Ipv4Addr::new(10, 8, 0, 2)
+            );
+            assert_eq!(
+                r.register("BBB", "b", "2.2.2.2:51820", &[]).unwrap(),
+                Ipv4Addr::new(10, 8, 0, 3)
+            );
+        }
+
+        // "Restart": a fresh registry over the same store keeps devices + IPs.
+        let store = SqliteStore::open(&path).unwrap();
+        let mut r = Registry::with_store(
+            Ipv4Addr::new(10, 8, 0, 0),
+            24,
+            Policy::allow_all(),
+            Box::new(store),
+        )
+        .unwrap();
+        assert_eq!(r.device_count(), 2);
+        // Re-registering keeps the persisted address (idempotent across restart).
+        assert_eq!(
+            r.register("AAA", "a", "1.1.1.1:51820", &[]).unwrap(),
+            Ipv4Addr::new(10, 8, 0, 2)
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

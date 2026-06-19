@@ -43,14 +43,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Tunnel address pool (10.8.0.0/24); host .1 reserved.
-    let registry = Arc::new(Mutex::new(Registry::with_policy(
-        Ipv4Addr::new(10, 8, 0, 0),
-        24,
-        policy,
-    )));
+    let base = Ipv4Addr::new(10, 8, 0, 0);
+
+    // Persistence: --store <path> uses SQLite (sqlite feature), else in-memory.
+    #[cfg(feature = "sqlite")]
+    let registry = match arg_value("--store") {
+        Some(path) => {
+            let store = vpn_coordinator::SqliteStore::open(&path)?;
+            let reg = Registry::with_store(base, 24, policy, Box::new(store))?;
+            info!(store = %path, devices = reg.device_count(), "using SQLite persistence");
+            reg
+        }
+        None => {
+            info!("no --store given; using in-memory registry");
+            Registry::with_policy(base, 24, policy)
+        }
+    };
+    #[cfg(not(feature = "sqlite"))]
+    let registry = Registry::with_policy(base, 24, policy);
+
+    let registry = Arc::new(Mutex::new(registry));
     let svc = CoordinatorService::new(registry);
 
-    info!(%listen, "coordinator listening (in-memory registry)");
+    info!(%listen, "coordinator listening");
     Server::builder()
         .add_service(CoordinatorServer::new(svc))
         .serve(listen)

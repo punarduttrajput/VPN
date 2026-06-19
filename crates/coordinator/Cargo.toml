@@ -9,6 +9,11 @@ authors.workspace = true
 name = "vpn-coordinator"
 path = "src/main.rs"
 
+[features]
+default = []
+# Durable device persistence via bundled SQLite (no system library needed).
+sqlite = ["dep:rusqlite", "dep:serde_json"]
+
 [dependencies]
 vpn-control-proto = { path = "../control-proto" }
 tonic.workspace = true
@@ -20,6 +25,8 @@ tracing-subscriber.workspace = true
 serde.workspace = true
 toml.workspace = true
 tokio-stream = "0.1"
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+serde_json = { version = "1", optional = true }
 
 [dev-dependencies]
 tokio-stream = { version = "0.1", features = ["net"] }
