@@ -14,6 +14,9 @@ pub mod store;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
+#[cfg(feature = "mtls")]
+pub mod pki;
+
 pub use policy::{AclRule, Policy};
 pub use registry::{Device, Registry, RegistryError};
 pub use service::CoordinatorService;

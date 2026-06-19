@@ -21,6 +21,7 @@ A Rust, WireGuard-based point-to-point tunnel. This is Phase 1 of the
 - `masque` — MASQUE CONNECT-UDP over HTTP/3 (RFC 9298): `MasqueTransport` client + `MasqueProxy` relay. Test with `cargo test --workspace --features vpn-cli/masque`.
 - `real-tun` (on `vpn-tunnel`) — the real OS TUN device (Linux/macOS).
 - `sqlite` (on `vpn-coordinator`) — durable device persistence via bundled SQLite (`--store <path>`).
+- `mtls` (on `vpn-coordinator` / `vpn-client-core`) — mutual TLS on the gRPC channel (`--tls-cert/--tls-key/--tls-ca`; `ControlClient::connect_mtls`).
 
 ## Build & test
 

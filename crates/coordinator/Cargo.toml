@@ -13,6 +13,8 @@ path = "src/main.rs"
 default = []
 # Durable device persistence via bundled SQLite (no system library needed).
 sqlite = ["dep:rusqlite", "dep:serde_json"]
+# Mutual TLS on the gRPC channel (tonic rustls + rcgen test PKI).
+mtls = ["tonic/tls", "dep:rcgen", "dep:rustls"]
 
 [dependencies]
 vpn-control-proto = { path = "../control-proto" }
@@ -27,6 +29,8 @@ toml.workspace = true
 tokio-stream = "0.1"
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 serde_json = { version = "1", optional = true }
+rcgen = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio-stream = { version = "0.1", features = ["net"] }

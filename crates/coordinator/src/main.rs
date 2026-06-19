@@ -65,8 +65,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let registry = Arc::new(Mutex::new(registry));
     let svc = CoordinatorService::new(registry);
 
+    #[cfg_attr(not(feature = "mtls"), allow(unused_mut))]
+    let mut builder = Server::builder();
+
+    // mTLS: enable when --tls-cert/--tls-key/--tls-ca are all provided.
+    #[cfg(feature = "mtls")]
+    if let (Some(cert), Some(key), Some(ca)) = (
+        arg_value("--tls-cert"),
+        arg_value("--tls-key"),
+        arg_value("--tls-ca"),
+    ) {
+        vpn_coordinator::pki::install_crypto_provider();
+        let identity = tonic::transport::Identity::from_pem(
+            std::fs::read_to_string(&cert)?,
+            std::fs::read_to_string(&key)?,
+        );
+        let ca_root = tonic::transport::Certificate::from_pem(std::fs::read_to_string(&ca)?);
+        let tls = tonic::transport::ServerTlsConfig::new()
+            .identity(identity)
+            .client_ca_root(ca_root);
+        builder = builder.tls_config(tls)?;
+        info!("mutual TLS enabled (client certificates required)");
+    }
+
     info!(%listen, "coordinator listening");
-    Server::builder()
+    builder
         .add_service(CoordinatorServer::new(svc))
         .serve(listen)
         .await?;

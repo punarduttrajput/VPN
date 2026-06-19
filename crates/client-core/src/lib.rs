@@ -59,6 +59,35 @@ impl ControlClient {
         Ok(Self { inner })
     }
 
+    /// Connect over mutual TLS: trust `ca_pem`, present the client identity
+    /// (`client_cert_pem` / `client_key_pem`), and verify the server against
+    /// `domain` (its certificate SAN). Endpoint should be `https://…`.
+    #[cfg(feature = "mtls")]
+    pub async fn connect_mtls(
+        endpoint: impl Into<String>,
+        ca_pem: &str,
+        client_cert_pem: &str,
+        client_key_pem: &str,
+        domain: &str,
+    ) -> Result<Self, Error> {
+        use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
+        // tonic builds rustls configs that need a process-default provider.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let tls = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(ca_pem))
+            .identity(Identity::from_pem(client_cert_pem, client_key_pem))
+            .domain_name(domain.to_string());
+        let channel = Channel::from_shared(endpoint.into())
+            .map_err(|e| Error::Rpc(tonic::Status::invalid_argument(e.to_string())))?
+            .tls_config(tls)?
+            .connect()
+            .await?;
+        Ok(Self {
+            inner: CoordinatorClient::new(channel),
+        })
+    }
+
     /// Register (or re-register) this device; returns the assigned tunnel CIDR.
     pub async fn register(
         &mut self,
@@ -233,5 +262,62 @@ mod tests {
         assert_eq!(update.len(), 1);
         assert_eq!(update[0].public_key, "BBB");
         assert_eq!(update[0].endpoint, "2.2.2.2:51820");
+    }
+
+    #[cfg(feature = "mtls")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mtls_accepts_valid_client_and_rejects_wrong_ca() {
+        use vpn_coordinator::pki;
+
+        let pki = pki::generate().unwrap();
+
+        // Coordinator requiring client certs signed by the CA.
+        let registry = Arc::new(Mutex::new(Registry::new(Ipv4Addr::new(10, 8, 0, 0), 24)));
+        let svc = CoordinatorService::new(registry);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tls = pki::server_tls_config(&pki);
+        tokio::spawn(async move {
+            Server::builder()
+                .tls_config(tls)
+                .unwrap()
+                .add_service(CoordinatorServer::new(svc))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let url = format!("https://{addr}");
+
+        // Correct CA + client identity: registration succeeds.
+        let mut ok = ControlClient::connect_mtls(
+            url.clone(),
+            &pki.ca_pem,
+            &pki.client_cert_pem,
+            &pki.client_key_pem,
+            "localhost",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ok.register("AAA", "a", "1.1.1.1:51820", &[]).await.unwrap(),
+            "10.8.0.2/32"
+        );
+
+        // Trusting the wrong CA: the server cert can't be verified -> failure
+        // (whether at connect or on the first RPC).
+        let other = pki::generate().unwrap();
+        let bad_ok = match ControlClient::connect_mtls(
+            url,
+            &other.ca_pem,
+            &pki.client_cert_pem,
+            &pki.client_key_pem,
+            "localhost",
+        )
+        .await
+        {
+            Ok(mut c) => c.register("BBB", "b", "2.2.2.2:51820", &[]).await.is_ok(),
+            Err(_) => false,
+        };
+        assert!(!bad_ok, "client trusting the wrong CA must not succeed");
     }
 }

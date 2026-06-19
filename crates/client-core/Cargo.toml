@@ -5,13 +5,19 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+# Mutual TLS for the coordinator channel (tonic rustls).
+mtls = ["tonic/tls", "dep:rustls"]
+
 [dependencies]
 vpn-control-proto = { path = "../control-proto" }
 tonic.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+rustls = { workspace = true, optional = true }
 
 [dev-dependencies]
-vpn-coordinator = { path = "../coordinator" }
+vpn-coordinator = { path = "../coordinator", features = ["mtls"] }
 tokio-stream = { version = "0.1", features = ["net"] }

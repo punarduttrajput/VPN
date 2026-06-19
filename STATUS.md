@@ -7,7 +7,7 @@
 **Build host:** Windows 11 (Rust 1.96.0)
 **Phase 1 status:** ✅ Functionally complete — all milestones verified in CI. **NFR1 caveat:** measured correctly (shaped 1 Gbps link); the pipelined data plane reached **493/956 = 0.52** on shared CI (up from 0.37), still under the 0.70 target on a 2-vCPU runner. Reported informationally; enforceable on dedicated hardware (`STRICT_THROUGHPUT=1`). See [NFR1 note](#nfr1-throughput--an-honest-status).
 **Phase 2 status:** 🟡 In progress — `Transport` trait, QUIC transport, `[transport]` config + CLI selection, padding obfuscation, and **MASQUE/HTTP3 CONNECT-UDP** (lib + in-process e2e) all done (FR1, FR2, FR3, FR5, FR6). Remaining: MASQUE CLI wiring + interop, and connection migration (FR4). See [Phase 2 section](#phase-2--transport--obfuscation).
-**Phase 3 status:** 🟡 In progress — gRPC coordinator (`vpn-control-proto` + `vpn-coordinator`): device registry, tunnel-IP allocation, network map, **tag-based ACL/policy**, **live `WatchNetworkMap` streaming**, and **client integration** (`vpn-client-core` register/plan/watch), **SQLite persistence** (write-through `Store`), all verified by in-process tests. OIDC auth and mTLS remain. See [Phase 3 section](#phase-3--control-plane).
+**Phase 3 status:** 🟡 In progress — gRPC coordinator (`vpn-control-proto` + `vpn-coordinator`): device registry, tunnel-IP allocation, network map, **tag-based ACL/policy**, **live `WatchNetworkMap` streaming**, and **client integration** (`vpn-client-core` register/plan/watch), **SQLite persistence** (write-through `Store`), and **mutual TLS** on the gRPC channel — all verified by in-process tests. OIDC auth remains. See [Phase 3 section](#phase-3--control-plane).
 
 > Note on platform: the PRD scopes the real TUN device to Linux/macOS. On this
 > Windows build host the OS packet path cannot run, so the TUN device sits behind
@@ -34,7 +34,7 @@ Legend: ⬜ Not started · 🟡 In progress/partial · ✅ Done · ⚠️ Blocke
 
 ## Test Results
 
-`CARGO_NET_OFFLINE=false cargo test --workspace` — **41 passed** (default, incl. 11 coordinator + 2 client-core); **42** with `--features vpn-cli/quic`; **43** with `--features vpn-cli/masque`; coordinator with `--features sqlite` → **14** (adds 3 persistence tests)
+`CARGO_NET_OFFLINE=false cargo test --workspace` — **41 passed** (default, incl. 11 coordinator + 2 client-core); **42** with `--features vpn-cli/quic`; **43** with `--features vpn-cli/masque`; coordinator with `--features sqlite` → **14** (3 persistence tests); client-core with `--features mtls` → **3** (adds the mutual-TLS accept/reject test)
 
 | Suite | Tests | Result | Covers |
 |-------|-------|--------|--------|
@@ -201,7 +201,8 @@ This confirms the QUIC build-feature wiring and the QUIC MTU clamp on a real dev
 | FR4 Policy engine (ACLs) | ✅ | tag-based allow-rules, deny-by-default, `*` wildcard (`Policy` + `AclRule`); TOML-loadable via `--policy`; network map filtered per policy. **Caveat:** tags are self-declared until auth lands — not yet an authorization boundary |
 | FR6 Client integration | 🟡 | `vpn-client-core`: `ControlClient` registers + fetches map → `TunnelPlan`, and **`watch()` consumes live map updates** (`NetworkMapStream`). In-process unary + streaming tests. **Remaining:** applying a multi-peer plan to the running data plane (mesh) |
 | FR5 Persistence | ✅ (SQLite) | `Store` trait with write-through; `MemoryStore` default + `SqliteStore` (bundled SQLite, `sqlite` feature) via `--store <path>`. Registry loads on startup, upserts on register. 3 tests incl. survives-restart. PostgreSQL is a further backend behind the same trait |
-| mTLS / sessions | ⬜ | plaintext gRPC for now |
+| mTLS | ✅ | Mutual TLS on the gRPC channel (`mtls` feature): coordinator presents a server cert + requires CA-signed client certs; `ControlClient::connect_mtls`; `--tls-cert/--tls-key/--tls-ca` on the binary. rcgen test PKI; e2e test accepts valid client, rejects wrong-CA. tonic rustls (ring) |
+| OIDC sessions | ⬜ | deferred (would make ACL tags an auth boundary) |
 
 **Run it:** `cargo run -p vpn-coordinator [--features sqlite] -- --listen 0.0.0.0:50051 [--policy policy.example.toml] [--store coord.db]`.
 **Tests:** registry + policy unit tests + an in-process gRPC integration test (no external services needed — `protoc` is vendored via `protoc-bin-vendored`, so it builds on Windows/Linux/CI without a system install). See [policy.example.toml](policy.example.toml).
@@ -210,3 +211,4 @@ This confirms the QUIC build-feature wiring and the QUIC MTU clamp on a real dev
 - 2026-06-17 — **Phase 3 client integration**: added `vpn-client-core` — `ControlClient` registers with the coordinator over gRPC and builds a `TunnelPlan` (assigned address + peers with endpoints/allowed-IPs) from the network map. In-process integration test (two clients ↔ in-process coordinator). 40 workspace tests, clippy/fmt clean. Remaining: apply a multi-peer plan to the running data plane (mesh).
 - 2026-06-17 — **Phase 3 streaming updates (FR1)**: added `WatchNetworkMap` server-streaming RPC. The coordinator fires a broadcast on every registration; each watcher recomputes and pushes a fresh map. `vpn-client-core` gains `watch()` → `NetworkMapStream`. In-process streaming test: A watches, B registers, A receives the live update. 41 workspace tests, clippy/fmt clean.
 - 2026-06-17 — **Phase 3 persistence (FR5)**: added a `Store` trait (write-through) with `MemoryStore` (default) and `SqliteStore` (bundled SQLite, `sqlite` feature). Registry loads devices on startup and upserts on register; `vpn-coordinator --store <path>` enables durability. 3 new tests incl. survives-restart (devices + IPs persist across reopen). CI runs the sqlite feature. Coordinator default 11 tests / 14 with sqlite; clippy/fmt clean. PostgreSQL can slot in behind the same trait later.
+- 2026-06-17 — **Phase 3 mTLS**: mutual TLS on the coordinator gRPC channel (`mtls` feature, tonic rustls/ring). Coordinator presents a server cert and requires CA-signed client certs (`--tls-cert/--tls-key/--tls-ca`); `vpn-client-core::ControlClient::connect_mtls`; rcgen-based test PKI (`vpn_coordinator::pki`). E2e test: valid client identity accepted, wrong-CA client rejected. CI runs the mtls feature. clippy/fmt clean.
