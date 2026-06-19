@@ -65,9 +65,14 @@ enum Command {
         /// Human-readable device name registered with the coordinator.
         #[arg(long, default_value = "vpn-node")]
         name: String,
-        /// Policy tag for this device (repeatable). Self-declared until auth lands.
+        /// Policy tag for this device (repeatable). Ignored when the coordinator
+        /// runs with OIDC auth — tags then come from the verified token.
         #[arg(long = "tag")]
         tags: Vec<String>,
+        /// Path to a file holding an OIDC bearer token (JWT) for the coordinator.
+        /// Read from a file rather than a flag to keep it out of the process list.
+        #[arg(long)]
+        token_file: Option<String>,
         /// Interface name to request for the TUN device.
         #[arg(long, default_value = "vpn0")]
         iface: String,
@@ -100,6 +105,7 @@ fn main() -> Result<()> {
             endpoint,
             name,
             tags,
+            token_file,
             iface,
             mtu,
         } => tokio::runtime::Builder::new_multi_thread()
@@ -111,6 +117,7 @@ fn main() -> Result<()> {
                 &endpoint,
                 &name,
                 &tags,
+                token_file.as_deref(),
                 &iface,
                 mtu,
             )),
@@ -218,12 +225,14 @@ async fn up(config_path: &str, iface: &str, mtu: u16) -> Result<()> {
 
 /// Phase 3 FR6: register with the coordinator, turn the returned network map into
 /// a multi-peer mesh, and run it until interrupted.
+#[allow(clippy::too_many_arguments)]
 async fn up_mesh(
     config_path: &str,
     coordinator: &str,
     endpoint: &str,
     name: &str,
     tags: &[String],
+    token_file: Option<&str>,
     iface: &str,
     mtu: u16,
 ) -> Result<()> {
@@ -236,6 +245,12 @@ async fn up_mesh(
     let mut client = ControlClient::connect(coordinator.to_string())
         .await
         .with_context(|| format!("connecting to coordinator at {coordinator}"))?;
+    if let Some(path) = token_file {
+        let token = std::fs::read_to_string(path)
+            .with_context(|| format!("reading OIDC token from '{path}'"))?;
+        client = client.with_token(token.trim().to_string());
+        info!("attaching OIDC bearer token to coordinator requests");
+    }
     let address = client
         .register(&public_key, name, endpoint, tags)
         .await

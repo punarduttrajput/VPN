@@ -15,6 +15,10 @@ default = []
 sqlite = ["dep:rusqlite", "dep:serde_json"]
 # Mutual TLS on the gRPC channel (tonic rustls + rcgen test PKI).
 mtls = ["tonic/tls", "dep:rcgen", "dep:rustls"]
+# OIDC bearer-token authentication: verify JWTs (RS256/ES256) against a JWKS so
+# device tags become a verified authorization boundary. Offline JWT verify via
+# in-tree `ring` (no external IdP needed to test).
+oidc = ["dep:ring", "dep:base64", "dep:serde_json"]
 
 [dependencies]
 vpn-control-proto = { path = "../control-proto" }
@@ -31,6 +35,8 @@ rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 serde_json = { version = "1", optional = true }
 rcgen = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
+ring = { version = "0.17", optional = true }
+base64 = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio-stream = { version = "0.1", features = ["net"] }

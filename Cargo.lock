@@ -2283,8 +2283,10 @@ dependencies = [
 name = "vpn-coordinator"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "prost",
  "rcgen",
+ "ring 0.17.14",
  "rusqlite",
  "rustls",
  "serde",

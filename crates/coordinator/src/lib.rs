@@ -1,9 +1,9 @@
 //! Control-plane coordinator (PRD Phase 3): an in-memory device [`Registry`]
 //! and the gRPC [`CoordinatorService`] over it.
 //!
-//! M1 scope: device registration, tunnel-IP allocation, and a full-mesh network
-//! map. Persistence, OIDC auth, mTLS, live update streams, and ACL/policy
-//! filtering are later increments.
+//! Covers device registration, tunnel-IP allocation, full-mesh network map with
+//! ACL/policy filtering, live `WatchNetworkMap` streaming, SQLite persistence
+//! (`sqlite`), mutual TLS (`mtls`), and OIDC bearer-token auth (`oidc`).
 #![forbid(unsafe_code)]
 
 pub mod policy;
@@ -17,10 +17,16 @@ pub mod sqlite;
 #[cfg(feature = "mtls")]
 pub mod pki;
 
+#[cfg(feature = "oidc")]
+pub mod auth;
+
 pub use policy::{AclRule, Policy};
 pub use registry::{Device, Registry, RegistryError};
-pub use service::CoordinatorService;
+pub use service::{CoordinatorService, VerifiedClaims};
 pub use store::{MemoryStore, Store, StoreError};
 
 #[cfg(feature = "sqlite")]
 pub use sqlite::SqliteStore;
+
+#[cfg(feature = "oidc")]
+pub use auth::{AuthError, Jwks, OidcVerifier};

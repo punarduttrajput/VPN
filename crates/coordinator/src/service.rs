@@ -29,19 +29,93 @@ fn current_map(registry: &Arc<Mutex<Registry>>, public_key: &str) -> NetworkMapR
     NetworkMapResponse { peers }
 }
 
+/// An authenticated caller identity derived from a verified bearer token.
+///
+/// Produced by the OIDC verifier (the `oidc` feature). `tags` here are
+/// *authorized* tags — sourced from a signed claim, not self-declared in the
+/// request — so the policy engine can treat them as an authorization boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedClaims {
+    /// The token subject (`sub`) — the authenticated principal.
+    pub subject: String,
+    /// Tags the principal is authorized to carry.
+    pub tags: Vec<String>,
+}
+
 /// Coordinator gRPC service backed by a shared [`Registry`].
 pub struct CoordinatorService {
     registry: Arc<Mutex<Registry>>,
     /// Fires after any registry change so watchers can push a fresh map.
     changes: broadcast::Sender<()>,
+    /// When set (the `oidc` feature + a configured verifier), every RPC requires
+    /// a valid bearer token and registration tags come from the token.
+    #[cfg(feature = "oidc")]
+    verifier: Option<std::sync::Arc<crate::auth::OidcVerifier>>,
 }
 
 impl CoordinatorService {
-    /// Build a service over a shared registry.
+    /// Build a service over a shared registry (no authentication).
     pub fn new(registry: Arc<Mutex<Registry>>) -> Self {
         let (changes, _) = broadcast::channel(16);
-        Self { registry, changes }
+        Self {
+            registry,
+            changes,
+            #[cfg(feature = "oidc")]
+            verifier: None,
+        }
     }
+
+    /// Build a service that requires OIDC bearer tokens on every RPC.
+    #[cfg(feature = "oidc")]
+    pub fn with_auth(
+        registry: Arc<Mutex<Registry>>,
+        verifier: std::sync::Arc<crate::auth::OidcVerifier>,
+    ) -> Self {
+        let (changes, _) = broadcast::channel(16);
+        Self {
+            registry,
+            changes,
+            verifier: Some(verifier),
+        }
+    }
+
+    /// Authenticate a request. Returns the verified claims when auth is enabled,
+    /// or `None` when it is not (open mode / feature off). Errors map to
+    /// `unauthenticated` so the client sees a clear rejection.
+    #[cfg(feature = "oidc")]
+    #[allow(clippy::result_large_err)] // tonic::Status is the trait-wide error type
+    fn authenticate<T>(&self, request: &Request<T>) -> Result<Option<VerifiedClaims>, Status> {
+        let Some(verifier) = &self.verifier else {
+            return Ok(None);
+        };
+        let token = bearer_token(request.metadata())?;
+        let claims = verifier
+            .verify(token)
+            .map_err(|e| Status::unauthenticated(format!("token rejected: {e}")))?;
+        Ok(Some(claims))
+    }
+
+    /// No-auth build: every request passes with no verified identity.
+    #[cfg(not(feature = "oidc"))]
+    #[allow(clippy::result_large_err)] // tonic::Status is the trait-wide error type
+    fn authenticate<T>(&self, _request: &Request<T>) -> Result<Option<VerifiedClaims>, Status> {
+        Ok(None)
+    }
+}
+
+/// Extract the `authorization: Bearer <token>` value from request metadata.
+#[cfg(feature = "oidc")]
+#[allow(clippy::result_large_err)] // tonic::Status is the trait-wide error type
+fn bearer_token(meta: &tonic::metadata::MetadataMap) -> Result<&str, Status> {
+    let header = meta
+        .get("authorization")
+        .ok_or_else(|| Status::unauthenticated("missing authorization metadata"))?
+        .to_str()
+        .map_err(|_| Status::unauthenticated("authorization metadata is not valid ASCII"))?;
+    header
+        .strip_prefix("Bearer ")
+        .or_else(|| header.strip_prefix("bearer "))
+        .ok_or_else(|| Status::unauthenticated("authorization must be a Bearer token"))
 }
 
 #[tonic::async_trait]
@@ -50,10 +124,17 @@ impl Coordinator for CoordinatorService {
         &self,
         request: Request<RegisterDeviceRequest>,
     ) -> Result<Response<RegisterDeviceResponse>, Status> {
+        let claims = self.authenticate(&request)?;
         let req = request.into_inner();
+        // When authenticated, tags come from the verified token (an authorization
+        // boundary); otherwise they are the self-declared request tags.
+        let tags: &[String] = match &claims {
+            Some(c) => &c.tags,
+            None => &req.tags,
+        };
         let ip = {
             let mut reg = self.registry.lock().expect("registry mutex poisoned");
-            reg.register(&req.public_key, &req.name, &req.endpoint, &req.tags)
+            reg.register(&req.public_key, &req.name, &req.endpoint, tags)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?
         };
         // Notify watchers that the network changed (ignored if none are connected).
@@ -67,6 +148,7 @@ impl Coordinator for CoordinatorService {
         &self,
         request: Request<NetworkMapRequest>,
     ) -> Result<Response<NetworkMapResponse>, Status> {
+        self.authenticate(&request)?;
         let req = request.into_inner();
         Ok(Response::new(current_map(&self.registry, &req.public_key)))
     }
@@ -78,6 +160,7 @@ impl Coordinator for CoordinatorService {
         &self,
         request: Request<NetworkMapRequest>,
     ) -> Result<Response<Self::WatchNetworkMapStream>, Status> {
+        self.authenticate(&request)?;
         let public_key = request.into_inner().public_key;
         let registry = self.registry.clone();
         let mut changes = self.changes.subscribe();
@@ -177,5 +260,73 @@ mod tests {
         assert_eq!(map.peers[0].public_key, "BBB");
         assert_eq!(map.peers[0].endpoint, "2.2.2.2:51820");
         assert_eq!(map.peers[0].allowed_ips, vec!["10.8.0.3/32".to_string()]);
+    }
+
+    /// End-to-end with OIDC on: an unauthenticated register is rejected, a
+    /// register with a valid token succeeds, and the device's tags come from the
+    /// verified token claim (not the self-declared request field).
+    #[cfg(feature = "oidc")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oidc_rejects_unauthenticated_and_uses_token_tags() {
+        use crate::auth::testsign::TestSigner;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tonic::Request;
+
+        let signer = TestSigner::new("k1");
+        let verifier =
+            std::sync::Arc::new(signer.verifier("https://idp.example", "vpn-coordinator"));
+        let registry = Arc::new(Mutex::new(Registry::new(Ipv4Addr::new(10, 8, 0, 0), 24)));
+        let svc = CoordinatorService::with_auth(registry.clone(), verifier);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(CoordinatorServer::new(svc))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let mut client = CoordinatorClient::connect(format!("http://{addr}"))
+            .await
+            .unwrap();
+
+        // No token -> unauthenticated.
+        let no_token = client
+            .register_device(RegisterDeviceRequest {
+                public_key: "AAA".into(),
+                name: "a".into(),
+                endpoint: "1.1.1.1:51820".into(),
+                tags: vec!["admin".into()],
+            })
+            .await;
+        assert_eq!(no_token.unwrap_err().code(), tonic::Code::Unauthenticated);
+
+        // Valid token whose claim grants tag "dev"; the request *claims* "admin"
+        // (self-declared) but that must be ignored in favor of the token.
+        let exp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let token = signer.sign(&format!(
+            r#"{{"iss":"https://idp.example","aud":"vpn-coordinator","sub":"alice","exp":{exp},"tags":["dev"]}}"#
+        ));
+        let mut req = Request::new(RegisterDeviceRequest {
+            public_key: "AAA".into(),
+            name: "a".into(),
+            endpoint: "1.1.1.1:51820".into(),
+            tags: vec!["admin".into()],
+        });
+        req.metadata_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+        let resp = client.register_device(req).await.unwrap().into_inner();
+        assert_eq!(resp.assigned_cidr, "10.8.0.2/32");
+
+        // The persisted device carries the *token* tags, not the request tags.
+        let tags = registry.lock().unwrap().network_map("other")[0]
+            .tags
+            .clone();
+        assert_eq!(tags, vec!["dev".to_string()]);
     }
 }
