@@ -23,6 +23,11 @@ pub mod quic;
 #[cfg(feature = "quic")]
 pub use quic::QuicTransport;
 
+#[cfg(feature = "quic")]
+pub mod quic_mesh;
+#[cfg(feature = "quic")]
+pub use quic_mesh::QuicMeshTransport;
+
 #[cfg(feature = "masque")]
 pub mod masque;
 #[cfg(feature = "masque")]

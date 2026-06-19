@@ -45,6 +45,9 @@ TEST_QUIC=${TEST_QUIC:-0}
 # on each other. Off by default; set TEST_MESH=1 to enable.
 TEST_MESH=${TEST_MESH:-0}
 COORD_PORT=${COORD_PORT:-50051}
+# Carry the mesh over QUIC instead of UDP (requires the quic build feature).
+# Only meaningful together with TEST_MESH=1.
+MESH_QUIC=${MESH_QUIC:-0}
 # ---------------------------------------------------------------------------
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -80,7 +83,10 @@ for tool in ip tc iperf3 ping awk; do
 done
 
 BUILD_FEATURES="vpn-tunnel/real-tun"
-[ "$TEST_QUIC" = "1" ] && BUILD_FEATURES="vpn-cli/quic vpn-tunnel/real-tun"
+# QUIC is needed for the QUIC point-to-point test and/or a QUIC-carried mesh.
+if [ "$TEST_QUIC" = "1" ] || { [ "$TEST_MESH" = "1" ] && [ "$MESH_QUIC" = "1" ]; }; then
+  BUILD_FEATURES="vpn-cli/quic vpn-tunnel/real-tun"
+fi
 info "Building workspace (release) with features: $BUILD_FEATURES"
 ( cd "$ROOT" && CARGO_NET_OFFLINE=false cargo build --release --features "$BUILD_FEATURES" )
 [ -x "$BIN" ] || { red "binary not found at $BIN"; exit 2; }
@@ -290,11 +296,41 @@ fi
 # second -> 10.8.0.3. Reuses the namespaces + veth and the existing configs
 # (their [peer] block is ignored in mesh mode; only private_key/listen_port used).
 if [ "$TEST_MESH" = "1" ]; then
-  info "Phase 3 coordinator mesh over real TUN (TEST_MESH=1)"
+  MESH_KIND="udp"; [ "$MESH_QUIC" = "1" ] && MESH_KIND="quic"
+  info "Phase 3 coordinator mesh over real TUN (TEST_MESH=1, transport=$MESH_KIND)"
   COORD_BIN="$ROOT/target/release/vpn-coordinator"
   MESH_A=10.8.0.2          # first registrant
   MESH_B=10.8.0.3          # second registrant
   COORD_URL="http://$UL1:$COORD_PORT"
+
+  # Pick the mesh configs. UDP reuses the point-to-point configs (the [peer]
+  # block is ignored in mesh mode). QUIC needs a [transport] block; the mesh
+  # both dials and accepts, so `role` is irrelevant — a dummy value just
+  # satisfies the point-to-point validator (up-mesh ignores it).
+  MESH_A_CFG="$WORK/a.toml"; MESH_B_CFG="$WORK/b.toml"
+  if [ "$MESH_QUIC" = "1" ]; then
+    MESH_A_CFG="$WORK/a-mesh-quic.toml"; MESH_B_CFG="$WORK/b-mesh-quic.toml"
+    for pair in "$MESH_A_CFG:$A_PRIV:$B_PUB:$UL2:$TUN1" "$MESH_B_CFG:$B_PRIV:$A_PUB:$UL1:$TUN2"; do
+      IFS=: read -r f priv peerpub peerul tun <<EOF
+$pair
+EOF
+      cat > "$f" <<CFG
+private_key = "$priv"
+listen_port = $PORT
+interface_address = "$tun/24"
+
+[peer]
+public_key = "$peerpub"
+endpoint = "$peerul:$PORT"
+allowed_ips = ["10.8.0.0/24"]
+
+[transport]
+mode = "quic"
+role = "client"
+server_name = "vpn"
+CFG
+    done
+  fi
 
   if [ ! -x "$COORD_BIN" ]; then
     red "FAIL: coordinator binary not found at $COORD_BIN"; FAIL=$((FAIL+1))
@@ -305,14 +341,14 @@ if [ "$TEST_MESH" = "1" ]; then
     sleep 1
 
     # Node A registers first (assigned .2), then node B (assigned .3).
-    ip netns exec "$NS1" "$BIN" up-mesh --config "$WORK/a.toml" \
+    ip netns exec "$NS1" "$BIN" up-mesh --config "$MESH_A_CFG" \
       --coordinator "$COORD_URL" --endpoint "$UL1:$PORT" --name node-a --iface vpn0 \
       >"$WORK/mesh-a.log" 2>&1 & PIDS+=($!)
     sleep 2
-    ip netns exec "$NS2" "$BIN" up-mesh --config "$WORK/b.toml" \
+    ip netns exec "$NS2" "$BIN" up-mesh --config "$MESH_B_CFG" \
       --coordinator "$COORD_URL" --endpoint "$UL2:$PORT" --name node-b --iface vpn0 \
       >"$WORK/mesh-b.log" 2>&1 & PIDS+=($!)
-    sleep 4  # registration + watch convergence + WireGuard handshake
+    sleep 5  # registration + watch convergence + (QUIC +) WireGuard handshake
 
     check "mesh: TUN vpn0 up in node A" \
       ip netns exec "$NS1" ip link show vpn0 >/dev/null
