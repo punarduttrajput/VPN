@@ -139,10 +139,10 @@ async fn up(config_path: &str, iface: &str, mtu: u16) -> Result<()> {
     let session = Session::from_base64(&config.private_key, &config.peer.public_key)
         .context("building wireguard session")?;
 
-    // QUIC datagrams cap below a normal MTU; shrink the inner MTU so encrypted
-    // packets (inner + 32 B WireGuard overhead) fit inside a QUIC datagram.
+    // QUIC and MASQUE (HTTP/3 over QUIC) both need a reduced MTU; shrink the
+    // inner MTU so encrypted packets fit inside a QUIC datagram.
     let effective_mtu = match config.transport.mode {
-        TransportMode::Quic => mtu.min(QUIC_TUN_MTU),
+        TransportMode::Quic | TransportMode::Masque => mtu.min(QUIC_TUN_MTU),
         TransportMode::Udp => mtu,
     };
 
@@ -217,6 +217,42 @@ async fn up(config_path: &str, iface: &str, mtu: u16) -> Result<()> {
                 );
             }
         }
+        TransportMode::Masque => {
+            #[cfg(feature = "masque")]
+            {
+                use vpn_transport::MasqueTransport;
+                let proxy_addr: SocketAddr = config
+                    .transport
+                    .masque_proxy
+                    .as_deref()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "transport.masque_proxy is required when transport.mode = masque"
+                        )
+                    })?
+                    .parse()
+                    .context("parsing transport.masque_proxy")?;
+                let authority = config
+                    .transport
+                    .server_name
+                    .as_deref()
+                    .unwrap_or("vpn")
+                    .to_string();
+                info!("transport: masque, proxy={proxy_addr}");
+                let transport =
+                    MasqueTransport::connect(bind_addr, proxy_addr, &authority, peer)
+                        .await
+                        .context("connecting to masque proxy")?;
+                drive(session, dev, transport, pad_to, shutdown).await?;
+            }
+            #[cfg(not(feature = "masque"))]
+            {
+                anyhow::bail!(
+                    "config requests transport.mode = masque, but this binary was built \
+                     without the `masque` feature (rebuild with --features vpn-cli/masque)"
+                );
+            }
+        }
     }
     info!("tunnel stopped");
     Ok(())
@@ -259,10 +295,9 @@ async fn up_mesh(
     let iface_cidr: Cidr = address
         .parse()
         .with_context(|| format!("coordinator-assigned address '{address}'"))?;
-    // QUIC datagrams cap below a normal MTU; shrink the inner MTU so encrypted
-    // packets fit (mirrors the point-to-point `up` path).
+    // QUIC and MASQUE (HTTP/3 over QUIC) both need a reduced MTU (mirrors `up`).
     let effective_mtu = match config.transport.mode {
-        TransportMode::Quic => mtu.min(QUIC_TUN_MTU),
+        TransportMode::Quic | TransportMode::Masque => mtu.min(QUIC_TUN_MTU),
         TransportMode::Udp => mtu,
     };
     let tun_cfg = TunConfig {
@@ -336,6 +371,12 @@ async fn up_mesh(
                      was built without the `quic` feature (rebuild with --features vpn-cli/quic)"
                 );
             }
+        }
+        TransportMode::Masque => {
+            anyhow::bail!(
+                "transport.mode = masque is not supported in mesh mode — MASQUE is \
+                 point-to-point (one proxy per peer); use udp or quic for the mesh"
+            );
         }
     };
     watcher.abort();

@@ -45,8 +45,10 @@ pub enum TransportMode {
     /// Plain UDP (Phase 1 behavior).
     #[default]
     Udp,
-    /// QUIC datagrams (Phase 2).
+    /// QUIC datagrams (Phase 2, FR2).
     Quic,
+    /// MASQUE / HTTP3 CONNECT-UDP relay (Phase 2, FR3).
+    Masque,
 }
 
 /// QUIC endpoint role for a point-to-point link: one peer accepts, one connects.
@@ -62,15 +64,18 @@ pub enum TransportRole {
 /// The `[transport]` config block.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct TransportConfig {
-    /// `udp` (default) or `quic`.
+    /// `udp` (default), `quic`, or `masque`.
     #[serde(default)]
     pub mode: TransportMode,
     /// Required for `quic`: this endpoint's role (`client` or `server`).
     #[serde(default)]
     pub role: Option<TransportRole>,
-    /// TLS server name presented/expected for QUIC (defaults to `vpn`).
+    /// TLS server name for QUIC / MASQUE (defaults to `vpn`).
     #[serde(default)]
     pub server_name: Option<String>,
+    /// Required for `masque`: the MASQUE proxy's socket address (`ip:port`).
+    #[serde(default)]
+    pub masque_proxy: Option<String>,
     /// Pad datagrams to a uniform size to blunt size-fingerprinting (FR5).
     /// Both peers must set the same value. Defaults to off.
     #[serde(default)]
@@ -196,6 +201,18 @@ impl Config {
             return Err(Error::ConfigInvalid(
                 "transport.role (client|server) is required when transport.mode = quic".into(),
             ));
+        }
+
+        // MASQUE requires a proxy address that parses as a valid socket address.
+        if self.transport.mode == TransportMode::Masque {
+            let proxy = self.transport.masque_proxy.as_deref().ok_or_else(|| {
+                Error::ConfigInvalid(
+                    "transport.masque_proxy is required when transport.mode = masque".into(),
+                )
+            })?;
+            proxy.parse::<SocketAddr>().map_err(|e| {
+                Error::ConfigInvalid(format!("transport.masque_proxy '{proxy}': {e}"))
+            })?;
         }
 
         Ok(())
@@ -346,5 +363,38 @@ mod tests {
         let cfg: Config = toml::from_str(&valid_toml()).unwrap();
         assert!(!cfg.transport.padding);
         assert_eq!(cfg.transport.pad_to, None);
+    }
+
+    #[test]
+    fn parses_masque_transport_block() {
+        let toml_str = format!(
+            "{}\n[transport]\nmode = \"masque\"\nmasque_proxy = \"203.0.113.1:443\"\nserver_name = \"vpn\"\n",
+            valid_toml()
+        );
+        let cfg: Config = toml::from_str(&toml_str).unwrap();
+        assert_eq!(cfg.transport.mode, TransportMode::Masque);
+        assert_eq!(
+            cfg.transport.masque_proxy.as_deref(),
+            Some("203.0.113.1:443")
+        );
+        assert_eq!(cfg.transport.server_name.as_deref(), Some("vpn"));
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_masque_without_proxy() {
+        let toml_str = format!("{}\n[transport]\nmode = \"masque\"\n", valid_toml());
+        let cfg: Config = toml::from_str(&toml_str).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_masque_with_bad_proxy_addr() {
+        let toml_str = format!(
+            "{}\n[transport]\nmode = \"masque\"\nmasque_proxy = \"not-an-addr\"\n",
+            valid_toml()
+        );
+        let cfg: Config = toml::from_str(&toml_str).unwrap();
+        assert!(cfg.validate().is_err());
     }
 }
