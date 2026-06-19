@@ -63,6 +63,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let registry = Registry::with_policy(base, 24, policy);
 
     let registry = Arc::new(Mutex::new(registry));
+
+    // OIDC auth: enable when --oidc-issuer/--oidc-audience/--oidc-jwks are all
+    // provided. Tokens are then required on every RPC and device tags come from
+    // the verified claim instead of the (self-declared) request.
+    #[cfg(feature = "oidc")]
+    let svc = match (
+        arg_value("--oidc-issuer"),
+        arg_value("--oidc-audience"),
+        arg_value("--oidc-jwks"),
+    ) {
+        (Some(issuer), Some(audience), Some(jwks_path)) => {
+            let jwks_doc = std::fs::read_to_string(&jwks_path)?;
+            let jwks = vpn_coordinator::Jwks::from_json(&jwks_doc)?;
+            let verifier = Arc::new(vpn_coordinator::OidcVerifier::new(&issuer, &audience, jwks));
+            info!(%issuer, %audience, jwks = %jwks_path, "OIDC authentication enabled");
+            CoordinatorService::with_auth(registry, verifier)
+        }
+        (None, None, None) => {
+            info!("no --oidc-* flags; authentication disabled (tags are self-declared)");
+            CoordinatorService::new(registry)
+        }
+        _ => return Err("OIDC requires --oidc-issuer, --oidc-audience, and --oidc-jwks".into()),
+    };
+    #[cfg(not(feature = "oidc"))]
     let svc = CoordinatorService::new(registry);
 
     #[cfg_attr(not(feature = "mtls"), allow(unused_mut))]

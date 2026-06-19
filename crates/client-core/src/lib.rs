@@ -50,13 +50,35 @@ pub struct TunnelPlan {
 /// A client connection to the coordinator.
 pub struct ControlClient {
     inner: CoordinatorClient<Channel>,
+    /// Optional OIDC bearer token attached to every RPC (`authorization` header).
+    token: Option<String>,
 }
 
 impl ControlClient {
     /// Connect to the coordinator at `endpoint` (e.g. `http://10.0.0.1:50051`).
     pub async fn connect(endpoint: impl Into<String>) -> Result<Self, Error> {
         let inner = CoordinatorClient::connect(endpoint.into()).await?;
-        Ok(Self { inner })
+        Ok(Self { inner, token: None })
+    }
+
+    /// Attach an OIDC bearer token sent as `authorization: Bearer <token>` on
+    /// every request (required when the coordinator runs with OIDC auth on).
+    pub fn with_token(mut self, token: impl Into<String>) -> Self {
+        self.token = Some(token.into());
+        self
+    }
+
+    /// Wrap a message in a request, attaching the bearer token if one is set.
+    fn request<T>(&self, message: T) -> tonic::Request<T> {
+        let mut req = tonic::Request::new(message);
+        if let Some(token) = &self.token {
+            // A valid token is ASCII; a malformed one simply isn't attached and
+            // the server will reject the unauthenticated call with a clear error.
+            if let Ok(value) = format!("Bearer {token}").parse() {
+                req.metadata_mut().insert("authorization", value);
+            }
+        }
+        req
     }
 
     /// Connect over mutual TLS: trust `ca_pem`, present the client identity
@@ -85,6 +107,7 @@ impl ControlClient {
             .await?;
         Ok(Self {
             inner: CoordinatorClient::new(channel),
+            token: None,
         })
     }
 
@@ -96,28 +119,22 @@ impl ControlClient {
         endpoint: &str,
         tags: &[String],
     ) -> Result<String, Error> {
-        let resp = self
-            .inner
-            .register_device(RegisterDeviceRequest {
-                public_key: public_key.to_string(),
-                name: name.to_string(),
-                endpoint: endpoint.to_string(),
-                tags: tags.to_vec(),
-            })
-            .await?
-            .into_inner();
+        let req = self.request(RegisterDeviceRequest {
+            public_key: public_key.to_string(),
+            name: name.to_string(),
+            endpoint: endpoint.to_string(),
+            tags: tags.to_vec(),
+        });
+        let resp = self.inner.register_device(req).await?.into_inner();
         Ok(resp.assigned_cidr)
     }
 
     /// Fetch the peers this device may currently reach.
     pub async fn network_map(&mut self, public_key: &str) -> Result<Vec<PeerSpec>, Error> {
-        let resp = self
-            .inner
-            .get_network_map(NetworkMapRequest {
-                public_key: public_key.to_string(),
-            })
-            .await?
-            .into_inner();
+        let req = self.request(NetworkMapRequest {
+            public_key: public_key.to_string(),
+        });
+        let resp = self.inner.get_network_map(req).await?.into_inner();
         Ok(resp
             .peers
             .into_iter()
@@ -145,13 +162,10 @@ impl ControlClient {
     /// Subscribe to live network-map updates: the current map immediately, then
     /// a fresh peer set whenever the network changes.
     pub async fn watch(&mut self, public_key: &str) -> Result<NetworkMapStream, Error> {
-        let stream = self
-            .inner
-            .watch_network_map(NetworkMapRequest {
-                public_key: public_key.to_string(),
-            })
-            .await?
-            .into_inner();
+        let req = self.request(NetworkMapRequest {
+            public_key: public_key.to_string(),
+        });
+        let stream = self.inner.watch_network_map(req).await?.into_inner();
         Ok(NetworkMapStream { inner: stream })
     }
 }

@@ -81,6 +81,14 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo clippy -p vpn-coordinator -p vpn-client-core --all-targets --features vpn-coordinator/mtls,vpn-client-core/mtls -- -D warnings
 
+      # Phase 3 FR2: exercise OIDC bearer-token authentication on the coordinator.
+      - name: Test (coordinator oidc feature)
+        run: cargo test -p vpn-coordinator --features oidc
+
+      - name: clippy (coordinator oidc feature)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo clippy -p vpn-coordinator --all-targets --features oidc -- -D warnings
+
   # Real-device + benchmark verification (M3 / M5 / M6) on a Linux runner.
   verify-linux:
     name: verify-linux (M3/M5/M6)
