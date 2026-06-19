@@ -2,25 +2,26 @@
 //! data plane).
 //!
 //! Phase 1's [`run`](crate::run) is point-to-point. `run_mesh` holds several
-//! [`Session`]s — one per peer — over a single UDP socket, routing:
+//! [`Session`]s — one per peer — over a [`MeshTransport`], routing:
 //!   * **outbound** TUN packets by destination IP against each peer's `allowed_ips`,
 //!   * **inbound** datagrams to the peer they came from (by source address).
 //!
 //! This is the shape a [`TunnelPlan`](../../vpn_client_core) becomes: each plan
 //! peer (public key, endpoint, allowed IPs) maps to one [`MeshPeer`].
 //!
-//! Scope: UDP transport only (the point-to-point [`Transport`](vpn_transport)
-//! trait does not model multi-peer demux); QUIC/MASQUE mesh and a pipelined mesh
-//! data path are later increments. Routing is verified in-process here; a
-//! real-TUN mesh run is a Linux/Codespaces follow-up.
+//! The wire protocol is abstracted behind [`MeshTransport`]: a shared UDP socket
+//! today ([`UdpMeshTransport`](vpn_transport::UdpMeshTransport)), with QUIC/MASQUE
+//! mesh transports able to slot in behind the same trait. A pipelined mesh data
+//! path is a later increment. Routing is verified in-process here; a real-TUN
+//! mesh run is a Linux/Codespaces path (`verify-linux.sh TEST_MESH=1`).
 
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
-use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use vpn_core::config::Cidr;
+use vpn_transport::MeshTransport;
 
 use crate::device::TunDevice;
 use crate::session::{Action, Session, MAX_PACKET};
@@ -60,10 +61,14 @@ fn peer_for_dest(peers: &[MeshPeer], ip: IpAddr) -> Option<usize> {
 }
 
 /// Kick off a fresh handshake to every peer in `peers`.
-async fn handshake_all(socket: &UdpSocket, peers: &mut [MeshPeer], out: &mut [u8]) -> Result<()> {
+async fn handshake_all<M: MeshTransport>(
+    transport: &M,
+    peers: &mut [MeshPeer],
+    out: &mut [u8],
+) -> Result<()> {
     for peer in peers {
         if let Action::SendToPeer(pkt) = peer.session.start_handshake(out)? {
-            socket.send_to(pkt, peer.endpoint).await?;
+            transport.send_to(peer.endpoint, pkt).await?;
         }
     }
     Ok(())
@@ -71,26 +76,33 @@ async fn handshake_all(socket: &UdpSocket, peers: &mut [MeshPeer], out: &mut [u8
 
 /// Run the mesh data plane until `shutdown` resolves.
 ///
+/// The mesh is carried over any [`MeshTransport`] — a shared UDP socket today,
+/// a QUIC endpoint multiplexing connections later — so this loop is independent
+/// of the wire protocol. Outbound TUN packets are routed by destination IP to a
+/// peer's session and sent via `transport`; inbound datagrams are demuxed to the
+/// peer they came from (by source address).
+///
 /// `updates` carries replacement peer sets (e.g. from the coordinator's
 /// `WatchNetworkMap` stream): each received set replaces the live mesh and
 /// re-handshakes, so membership changes take effect without restarting the
 /// process. When the sender is dropped the data plane keeps running with its
 /// current peers. Pass a never-sending receiver for a static mesh.
-pub async fn run_mesh<D, S>(
+pub async fn run_mesh<D, M, S>(
     mut device: D,
-    socket: UdpSocket,
+    transport: M,
     mut peers: Vec<MeshPeer>,
     mut updates: mpsc::Receiver<Vec<MeshPeer>>,
     shutdown: S,
 ) -> Result<()>
 where
     D: TunDevice,
+    M: MeshTransport,
     S: std::future::Future<Output = ()>,
 {
     let mut out = vec![0u8; MAX_PACKET];
 
     // Kick off a handshake to every peer we start with.
-    handshake_all(&socket, &mut peers, &mut out).await?;
+    handshake_all(&transport, &mut peers, &mut out).await?;
 
     let mut tun_buf = vec![0u8; MAX_PACKET];
     let mut net_buf = vec![0u8; MAX_PACKET];
@@ -113,7 +125,7 @@ where
                     Some(next) => {
                         info!(peers = next.len(), "applying updated network map");
                         peers = next;
-                        handshake_all(&socket, &mut peers, &mut out).await?;
+                        handshake_all(&transport, &mut peers, &mut out).await?;
                     }
                     // Sender dropped: stop polling this branch, keep current peers.
                     None => updates_open = false,
@@ -127,7 +139,7 @@ where
                     Some(idx) => {
                         let peer = &mut peers[idx];
                         if let Action::SendToPeer(pkt) = peer.session.encapsulate(&tun_buf[..n], &mut out)? {
-                            socket.send_to(pkt, peer.endpoint).await?;
+                            transport.send_to(peer.endpoint, pkt).await?;
                         }
                     }
                     None => debug!("no peer route for outbound packet; dropping"),
@@ -135,13 +147,13 @@ where
             }
 
             // Inbound: datagram -> demux by source -> decrypt -> TUN.
-            recv = socket.recv_from(&mut net_buf) => {
+            recv = transport.recv_from(&mut net_buf) => {
                 let (n, src) = recv?;
                 match peers.iter().position(|p| p.endpoint == src) {
                     Some(idx) => {
                         match peers[idx].session.decapsulate(&net_buf[..n], &mut out)? {
                             Action::WriteToTun(pkt, _ip) => device.write_packet(pkt).await?,
-                            Action::SendToPeer(pkt) => { socket.send_to(pkt, src).await?; }
+                            Action::SendToPeer(pkt) => { transport.send_to(src, pkt).await?; }
                             Action::Done => {}
                         }
                     }
@@ -153,7 +165,7 @@ where
             _ = timer.tick() => {
                 for peer in &mut peers {
                     match peer.session.update_timers(&mut out) {
-                        Ok(Action::SendToPeer(pkt)) => { socket.send_to(pkt, peer.endpoint).await?; }
+                        Ok(Action::SendToPeer(pkt)) => { transport.send_to(peer.endpoint, pkt).await?; }
                         Ok(_) => {}
                         Err(e) => warn!("timer update error: {e}"),
                     }

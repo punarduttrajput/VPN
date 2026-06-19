@@ -1,11 +1,14 @@
 //! Pluggable transport layer for the VPN data plane (PRD Phase 2, FR1).
 //!
 //! The tunnel event loop moves opaque, already-encrypted datagrams; *how* those
-//! datagrams cross the network is abstracted behind [`Transport`]. Phase 1's
-//! plain UDP becomes one implementation ([`UdpTransport`]); QUIC ([`quic`]) adds
-//! roaming and DPI-evasion. MASQUE/HTTP3, connection migration, and padding are
-//! later Phase 2 increments.
+//! datagrams cross the network is abstracted behind [`Transport`] (point-to-point)
+//! and [`MeshTransport`] (multi-peer, for Phase 3/4's mesh data plane). Phase 1's
+//! plain UDP becomes one implementation ([`UdpTransport`] / [`UdpMeshTransport`]);
+//! QUIC ([`quic`]) adds roaming and DPI-evasion. MASQUE/HTTP3, connection
+//! migration, and padding are later Phase 2 increments.
 #![forbid(unsafe_code)]
+
+use std::net::SocketAddr;
 
 use thiserror::Error;
 
@@ -13,7 +16,7 @@ pub mod pad;
 pub use pad::PaddedTransport;
 
 pub mod udp;
-pub use udp::UdpTransport;
+pub use udp::{UdpMeshTransport, UdpTransport};
 
 #[cfg(feature = "quic")]
 pub mod quic;
@@ -58,4 +61,30 @@ pub trait Transport: Send + Sync {
         &self,
         buf: &mut [u8],
     ) -> impl std::future::Future<Output = Result<usize, TransportError>> + Send;
+}
+
+/// A multi-peer datagram fabric for the mesh data plane (PRD Phase 3/4).
+///
+/// Unlike [`Transport`] (a single peer), a `MeshTransport` carries datagrams to
+/// and from *many* peers over one local resource (a shared UDP socket, or a QUIC
+/// endpoint multiplexing several connections). Peers are addressed by their
+/// reachable [`SocketAddr`]; `recv_from` reports which peer a datagram came from
+/// so the mesh runner can route it to that peer's crypto session.
+///
+/// Methods take `&self` so the mesh loop can send and receive concurrently, and
+/// return `Send` futures so they can be driven from spawned tasks.
+pub trait MeshTransport: Send + Sync {
+    /// Send one datagram to the peer reachable at `dst`.
+    fn send_to(
+        &self,
+        dst: SocketAddr,
+        datagram: &[u8],
+    ) -> impl std::future::Future<Output = Result<(), TransportError>> + Send;
+
+    /// Receive one datagram into `buf`, returning its length and the address of
+    /// the peer it came from.
+    fn recv_from(
+        &self,
+        buf: &mut [u8],
+    ) -> impl std::future::Future<Output = Result<(usize, SocketAddr), TransportError>> + Send;
 }
