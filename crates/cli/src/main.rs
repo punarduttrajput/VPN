@@ -11,7 +11,6 @@ use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -19,7 +18,7 @@ use tracing_subscriber::EnvFilter;
 use vpn_client_core::{ControlClient, PeerSpec};
 use vpn_core::config::{Cidr, Config, TransportMode};
 use vpn_core::keys::KeyPair;
-use vpn_transport::UdpTransport;
+use vpn_transport::{UdpMeshTransport, UdpTransport};
 use vpn_tunnel::device::{self, TunConfig};
 use vpn_tunnel::session::Session;
 use vpn_tunnel::{run_mesh, MeshPeer};
@@ -270,7 +269,7 @@ async fn up_mesh(
     info!(interface = %iface, mtu, "TUN device up");
 
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", config.listen_port).parse()?;
-    let socket = UdpSocket::bind(bind_addr)
+    let transport = UdpMeshTransport::bind(bind_addr)
         .await
         .with_context(|| format!("binding UDP socket on {bind_addr}"))?;
 
@@ -305,7 +304,7 @@ async fn up_mesh(
     info!("starting mesh data plane (Ctrl-C to stop)");
     // Start with an empty mesh; the watch stream delivers the current peer set
     // immediately, then updates as the network changes.
-    let result = run_mesh(dev, socket, Vec::new(), rx, shutdown_signal())
+    let result = run_mesh(dev, transport, Vec::new(), rx, shutdown_signal())
         .await
         .context("mesh data plane");
     watcher.abort();

@@ -8,6 +8,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::oneshot;
 use vpn_core::config::Cidr;
 use vpn_core::keys::KeyPair;
+use vpn_transport::UdpMeshTransport;
 use vpn_tunnel::device::mock::MockTun;
 use vpn_tunnel::session::Session;
 use vpn_tunnel::{run_mesh, MeshPeer};
@@ -83,21 +84,39 @@ async fn mesh_routes_packets_to_the_right_peer() {
     let (upd_c_tx, upd_c_rx) = tokio::sync::mpsc::channel(1);
 
     let ja = tokio::spawn(async move {
-        run_mesh(tun_a, sock_a, a_peers, upd_a_rx, async {
-            stop_a_rx.await.ok();
-        })
+        run_mesh(
+            tun_a,
+            UdpMeshTransport::from_socket(sock_a),
+            a_peers,
+            upd_a_rx,
+            async {
+                stop_a_rx.await.ok();
+            },
+        )
         .await
     });
     let jb = tokio::spawn(async move {
-        run_mesh(tun_b, sock_b, b_peers, upd_b_rx, async {
-            stop_b_rx.await.ok();
-        })
+        run_mesh(
+            tun_b,
+            UdpMeshTransport::from_socket(sock_b),
+            b_peers,
+            upd_b_rx,
+            async {
+                stop_b_rx.await.ok();
+            },
+        )
         .await
     });
     let jc = tokio::spawn(async move {
-        run_mesh(tun_c, sock_c, c_peers, upd_c_rx, async {
-            stop_c_rx.await.ok();
-        })
+        run_mesh(
+            tun_c,
+            UdpMeshTransport::from_socket(sock_c),
+            c_peers,
+            upd_c_rx,
+            async {
+                stop_c_rx.await.ok();
+            },
+        )
         .await
     });
 
@@ -166,15 +185,27 @@ async fn mesh_applies_peers_from_a_live_update() {
 
     // A starts with NO peers.
     let ja = tokio::spawn(async move {
-        run_mesh(tun_a, sock_a, Vec::new(), upd_a_rx, async {
-            stop_a_rx.await.ok();
-        })
+        run_mesh(
+            tun_a,
+            UdpMeshTransport::from_socket(sock_a),
+            Vec::new(),
+            upd_a_rx,
+            async {
+                stop_a_rx.await.ok();
+            },
+        )
         .await
     });
     let jb = tokio::spawn(async move {
-        run_mesh(tun_b, sock_b, b_peers, upd_b_rx, async {
-            stop_b_rx.await.ok();
-        })
+        run_mesh(
+            tun_b,
+            UdpMeshTransport::from_socket(sock_b),
+            b_peers,
+            upd_b_rx,
+            async {
+                stop_b_rx.await.ok();
+            },
+        )
         .await
     });
 
