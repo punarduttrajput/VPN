@@ -55,6 +55,15 @@ pub fn public_from_base64(s: &str) -> Result<PublicKey> {
     Ok(PublicKey::from(decode_key(s)?))
 }
 
+/// Derive the base64 public key corresponding to a base64 private key.
+///
+/// Used when registering with the coordinator: a config carries only the private
+/// key, but the control plane identifies a device by its public key.
+pub fn public_base64_from_private(private_b64: &str) -> Result<String> {
+    let secret = private_from_base64(private_b64)?;
+    Ok(B64.encode(PublicKey::from(&secret).as_bytes()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,5 +105,12 @@ mod tests {
     #[test]
     fn rejects_non_base64() {
         assert!(decode_key("not valid base64!!!").is_err());
+    }
+
+    #[test]
+    fn public_base64_from_private_matches_keypair() {
+        let kp = KeyPair::generate();
+        let derived = public_base64_from_private(&kp.private_base64()).unwrap();
+        assert_eq!(derived, kp.public_base64());
     }
 }

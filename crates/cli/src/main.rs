@@ -11,14 +11,18 @@ use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+use vpn_client_core::{ControlClient, PeerSpec};
 use vpn_core::config::{Cidr, Config, TransportMode};
 use vpn_core::keys::KeyPair;
 use vpn_transport::UdpTransport;
 use vpn_tunnel::device::{self, TunConfig};
 use vpn_tunnel::session::Session;
+use vpn_tunnel::{run_mesh, MeshPeer};
 
 #[derive(Parser)]
 #[command(name = "vpn", version, about = "Next-gen VPN — Phase 1 MVP tunnel")]
@@ -36,6 +40,34 @@ enum Command {
         /// Path to the TOML config file.
         #[arg(short, long)]
         config: String,
+        /// Interface name to request for the TUN device.
+        #[arg(long, default_value = "vpn0")]
+        iface: String,
+        /// MTU for the TUN device.
+        #[arg(long, default_value_t = 1420)]
+        mtu: u16,
+    },
+    /// Join a coordinator-managed mesh: register, fetch the network map, and run
+    /// a multi-peer data plane against every peer the coordinator returns.
+    ///
+    /// The `[peer]` block in the config is ignored in this mode — peers come from
+    /// the coordinator. Only `private_key` and `listen_port` are used from it.
+    UpMesh {
+        /// Path to the TOML config file (supplies `private_key` + `listen_port`).
+        #[arg(short, long)]
+        config: String,
+        /// Coordinator gRPC URL, e.g. `http://10.0.0.1:50051`.
+        #[arg(long)]
+        coordinator: String,
+        /// This device's reachable endpoint (`ip:port`) advertised to peers.
+        #[arg(long)]
+        endpoint: String,
+        /// Human-readable device name registered with the coordinator.
+        #[arg(long, default_value = "vpn-node")]
+        name: String,
+        /// Policy tag for this device (repeatable). Self-declared until auth lands.
+        #[arg(long = "tag")]
+        tags: Vec<String>,
         /// Interface name to request for the TUN device.
         #[arg(long, default_value = "vpn0")]
         iface: String,
@@ -62,6 +94,26 @@ fn main() -> Result<()> {
             .enable_all()
             .build()?
             .block_on(up(&config, &iface, mtu)),
+        Command::UpMesh {
+            config,
+            coordinator,
+            endpoint,
+            name,
+            tags,
+            iface,
+            mtu,
+        } => tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(up_mesh(
+                &config,
+                &coordinator,
+                &endpoint,
+                &name,
+                &tags,
+                &iface,
+                mtu,
+            )),
     }
 }
 
@@ -164,6 +216,123 @@ async fn up(config_path: &str, iface: &str, mtu: u16) -> Result<()> {
     Ok(())
 }
 
+/// Phase 3 FR6: register with the coordinator, turn the returned network map into
+/// a multi-peer mesh, and run it until interrupted.
+async fn up_mesh(
+    config_path: &str,
+    coordinator: &str,
+    endpoint: &str,
+    name: &str,
+    tags: &[String],
+    iface: &str,
+    mtu: u16,
+) -> Result<()> {
+    let config = Config::load(config_path)
+        .with_context(|| format!("loading config from '{config_path}'"))?;
+    let public_key = vpn_core::keys::public_base64_from_private(&config.private_key)
+        .context("deriving public key from config private_key")?;
+
+    info!(coordinator, "registering with coordinator");
+    let mut client = ControlClient::connect(coordinator.to_string())
+        .await
+        .with_context(|| format!("connecting to coordinator at {coordinator}"))?;
+    let address = client
+        .register(&public_key, name, endpoint, tags)
+        .await
+        .context("registering with coordinator")?;
+    info!(%address, "registered; coordinator assigned tunnel address");
+
+    let iface_cidr: Cidr = address
+        .parse()
+        .with_context(|| format!("coordinator-assigned address '{address}'"))?;
+    let tun_cfg = TunConfig {
+        name: iface.to_string(),
+        address: iface_cidr,
+        mtu,
+    };
+    let dev = device::open(&tun_cfg)
+        .context("opening TUN device (needs elevated privileges on Linux/macOS)")?;
+    info!(interface = %iface, mtu, "TUN device up");
+
+    let bind_addr: SocketAddr = format!("0.0.0.0:{}", config.listen_port).parse()?;
+    let socket = UdpSocket::bind(bind_addr)
+        .await
+        .with_context(|| format!("binding UDP socket on {bind_addr}"))?;
+
+    // Subscribe to live network-map updates and feed converted peer sets into the
+    // mesh, so membership converges no matter who registered first.
+    let mut stream = client
+        .watch(&public_key)
+        .await
+        .context("subscribing to network-map updates")?;
+    let (tx, rx) = mpsc::channel::<Vec<MeshPeer>>(8);
+    let priv_b64 = config.private_key.clone();
+    let watcher = tokio::spawn(async move {
+        loop {
+            match stream.next().await {
+                Ok(Some(specs)) => match build_mesh_peers(&priv_b64, &specs) {
+                    Ok(peers) => {
+                        if tx.send(peers).await.is_err() {
+                            break; // data plane stopped
+                        }
+                    }
+                    Err(e) => tracing::warn!("ignoring unusable network map: {e:#}"),
+                },
+                Ok(None) => break, // stream ended
+                Err(e) => {
+                    tracing::warn!("network-map stream error: {e}");
+                    break;
+                }
+            }
+        }
+    });
+
+    info!("starting mesh data plane (Ctrl-C to stop)");
+    // Start with an empty mesh; the watch stream delivers the current peer set
+    // immediately, then updates as the network changes.
+    let result = run_mesh(dev, socket, Vec::new(), rx, shutdown_signal())
+        .await
+        .context("mesh data plane");
+    watcher.abort();
+    result?;
+    info!("tunnel stopped");
+    Ok(())
+}
+
+/// Turn the coordinator's peer list into mesh sessions keyed by our private key.
+///
+/// Each peer gets its own [`Session`] (with a distinct local index) over the one
+/// shared UDP socket; outbound packets are routed to a peer by its `allowed_ips`.
+fn build_mesh_peers(private_key_b64: &str, peers: &[PeerSpec]) -> Result<Vec<MeshPeer>> {
+    let priv_bytes = vpn_core::keys::decode_key(private_key_b64).context("decoding private key")?;
+    peers
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let pub_bytes = vpn_core::keys::decode_key(&p.public_key)
+                .with_context(|| format!("decoding peer public key '{}'", p.public_key))?;
+            let endpoint: SocketAddr = p
+                .endpoint
+                .parse()
+                .with_context(|| format!("parsing peer endpoint '{}'", p.endpoint))?;
+            let allowed_ips = p
+                .allowed_ips
+                .iter()
+                .map(|c| c.parse::<Cidr>())
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .with_context(|| format!("parsing allowed_ips for peer '{}'", p.public_key))?;
+            // Local session indices must be distinct per peer; +1 keeps them non-zero.
+            let session = Session::from_bytes(priv_bytes, pub_bytes, (i as u32) + 1)
+                .with_context(|| format!("building session for peer '{}'", p.public_key))?;
+            Ok(MeshPeer {
+                session,
+                endpoint,
+                allowed_ips,
+            })
+        })
+        .collect()
+}
+
 /// Default padded datagram size when `padding` is on but `pad_to` is unset.
 const DEFAULT_PAD_TO: u16 = 1280;
 
@@ -220,5 +389,70 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn peer(public_key: &str, endpoint: &str, allowed: &[&str]) -> PeerSpec {
+        PeerSpec {
+            public_key: public_key.to_string(),
+            endpoint: endpoint.to_string(),
+            allowed_ips: allowed.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn builds_one_mesh_peer_per_plan_peer() {
+        let me = KeyPair::generate();
+        let b = KeyPair::generate();
+        let c = KeyPair::generate();
+
+        let peers = build_mesh_peers(
+            &me.private_base64(),
+            &[
+                peer(&b.public_base64(), "2.2.2.2:51820", &["10.8.0.3/32"]),
+                peer(&c.public_base64(), "3.3.3.3:51820", &["10.8.0.4/32"]),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].endpoint, "2.2.2.2:51820".parse().unwrap());
+        assert_eq!(peers[0].allowed_ips, vec!["10.8.0.3/32".parse().unwrap()]);
+        assert_eq!(peers[1].endpoint, "3.3.3.3:51820".parse().unwrap());
+        assert_eq!(peers[1].allowed_ips, vec!["10.8.0.4/32".parse().unwrap()]);
+    }
+
+    #[test]
+    fn empty_plan_yields_no_peers() {
+        let me = KeyPair::generate();
+        assert!(build_mesh_peers(&me.private_base64(), &[])
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn rejects_malformed_peer_endpoint() {
+        let me = KeyPair::generate();
+        let b = KeyPair::generate();
+        let err = build_mesh_peers(
+            &me.private_base64(),
+            &[peer(&b.public_base64(), "not-a-socket", &["10.8.0.3/32"])],
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_allowed_ip() {
+        let me = KeyPair::generate();
+        let b = KeyPair::generate();
+        let err = build_mesh_peers(
+            &me.private_base64(),
+            &[peer(&b.public_base64(), "2.2.2.2:51820", &["not-a-cidr"])],
+        );
+        assert!(err.is_err());
     }
 }

@@ -20,6 +20,7 @@ masque = ["vpn-tunnel/masque"]
 vpn-core = { path = "../core" }
 vpn-tunnel = { path = "../tunnel" }
 vpn-transport = { path = "../transport" }
+vpn-client-core = { path = "../client-core" }
 clap.workspace = true
 tokio.workspace = true
 tracing.workspace = true

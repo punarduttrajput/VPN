@@ -2249,6 +2249,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "vpn-client-core",
  "vpn-core",
  "vpn-transport",
  "vpn-tunnel",

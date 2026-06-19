@@ -18,6 +18,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use vpn_core::config::Cidr;
 
@@ -58,11 +59,28 @@ fn peer_for_dest(peers: &[MeshPeer], ip: IpAddr) -> Option<usize> {
         .position(|p| p.allowed_ips.iter().any(|c| c.contains(ip)))
 }
 
+/// Kick off a fresh handshake to every peer in `peers`.
+async fn handshake_all(socket: &UdpSocket, peers: &mut [MeshPeer], out: &mut [u8]) -> Result<()> {
+    for peer in peers {
+        if let Action::SendToPeer(pkt) = peer.session.start_handshake(out)? {
+            socket.send_to(pkt, peer.endpoint).await?;
+        }
+    }
+    Ok(())
+}
+
 /// Run the mesh data plane until `shutdown` resolves.
+///
+/// `updates` carries replacement peer sets (e.g. from the coordinator's
+/// `WatchNetworkMap` stream): each received set replaces the live mesh and
+/// re-handshakes, so membership changes take effect without restarting the
+/// process. When the sender is dropped the data plane keeps running with its
+/// current peers. Pass a never-sending receiver for a static mesh.
 pub async fn run_mesh<D, S>(
     mut device: D,
     socket: UdpSocket,
     mut peers: Vec<MeshPeer>,
+    mut updates: mpsc::Receiver<Vec<MeshPeer>>,
     shutdown: S,
 ) -> Result<()>
 where
@@ -71,16 +89,13 @@ where
 {
     let mut out = vec![0u8; MAX_PACKET];
 
-    // Kick off a handshake to every peer.
-    for peer in &mut peers {
-        if let Action::SendToPeer(pkt) = peer.session.start_handshake(&mut out)? {
-            socket.send_to(pkt, peer.endpoint).await?;
-        }
-    }
+    // Kick off a handshake to every peer we start with.
+    handshake_all(&socket, &mut peers, &mut out).await?;
 
     let mut tun_buf = vec![0u8; MAX_PACKET];
     let mut net_buf = vec![0u8; MAX_PACKET];
     let mut timer = tokio::time::interval(Duration::from_millis(250));
+    let mut updates_open = true;
     tokio::pin!(shutdown);
 
     info!(peers = peers.len(), "mesh data plane running");
@@ -90,6 +105,19 @@ where
             _ = &mut shutdown => {
                 info!("shutdown requested; tearing down mesh");
                 return Ok(());
+            }
+
+            // Live reconfiguration: a new peer set replaces the current mesh.
+            new = updates.recv(), if updates_open => {
+                match new {
+                    Some(next) => {
+                        info!(peers = next.len(), "applying updated network map");
+                        peers = next;
+                        handshake_all(&socket, &mut peers, &mut out).await?;
+                    }
+                    // Sender dropped: stop polling this branch, keep current peers.
+                    None => updates_open = false,
+                }
             }
 
             // Outbound: TUN -> route by dest IP -> encrypt -> peer.
