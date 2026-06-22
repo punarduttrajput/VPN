@@ -16,9 +16,13 @@
 //! [`MasqueMeshTransport`] is the multi-peer counterpart used by the mesh data
 //! plane: one CONNECT-UDP session per peer through a single proxy.
 //!
-//! Scope: verified in-process (client ↔ proxy ↔ UDP echo, and a MASQUE mesh node
-//! reaching a UDP peer through the proxy). Interop with third-party MASQUE proxies
-//! (capsule protocol, full path conformance) is not yet verified.
+//! RFC 9298/9297 conformance: the request/response carry `Capsule-Protocol: ?1`
+//! (RFC 9297 §3.4), the client accepts any 2xx as success, and the proxy parses
+//! the well-known path template (IPv4/IPv6 literals, bracketed or bare). Scope:
+//! verified in-process (client ↔ proxy ↔ UDP echo, and a MASQUE mesh node
+//! reaching a UDP peer through the proxy). Interop against a *third-party* MASQUE
+//! proxy (full capsule handling on the stream, percent-encoded hostnames) still
+//! needs a live proxy to confirm.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -117,7 +121,9 @@ impl MasqueTransport {
             .await
             .map_err(conn_err)?;
 
-        // Extended CONNECT-UDP request (RFC 9298 well-known template).
+        // Extended CONNECT-UDP request (RFC 9298 well-known template). The
+        // `capsule-protocol: ?1` header (RFC 9297 §3.4) signals capsule-protocol
+        // support on the request stream — third-party proxies expect it.
         let path = format!("/.well-known/masque/udp/{}/{}/", target.ip(), target.port());
         let uri: http::Uri = format!("https://{authority}{path}")
             .parse()
@@ -125,13 +131,15 @@ impl MasqueTransport {
         let mut req = http::Request::builder()
             .method(http::Method::CONNECT)
             .uri(uri)
+            .header("capsule-protocol", "?1")
             .body(())
             .map_err(setup)?;
         req.extensions_mut().insert(h3::ext::Protocol::CONNECT_UDP);
 
         let mut req_stream = send_request.send_request(req).await.map_err(conn_err)?;
         let resp = req_stream.recv_response().await.map_err(conn_err)?;
-        if resp.status() != http::StatusCode::OK {
+        // RFC 9298: any 2xx response means the CONNECT-UDP session is established.
+        if !resp.status().is_success() {
             return Err(conn_err(format!("masque proxy refused: {}", resp.status())));
         }
         let stream_id = req_stream.id();
@@ -197,11 +205,20 @@ impl Transport for MasqueTransport {
 
 /// Parse the target UDP endpoint from an RFC 9298 CONNECT-UDP path template,
 /// `/.well-known/masque/udp/{target_host}/{target_port}/`.
+///
+/// `target_host` is an IP literal here (our targets are always coordinator-
+/// assigned addresses, not names). IPv6 colons are valid path characters and
+/// parse directly; an optional bracketed form (`[2001:db8::1]`) is also accepted
+/// for robustness against clients that bracket the literal.
 fn parse_connect_udp_target(path: &str) -> Option<SocketAddr> {
     let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     // Find the "udp" marker; host and port are the next two segments.
     let i = segs.iter().position(|s| *s == "udp")?;
     let host = segs.get(i + 1)?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
     let port: u16 = segs.get(i + 2)?.parse().ok()?;
     let ip: std::net::IpAddr = host.parse().ok()?;
     Some(SocketAddr::new(ip, port))
@@ -289,6 +306,7 @@ async fn relay_connection(
         .send_response(
             http::Response::builder()
                 .status(200)
+                .header("capsule-protocol", "?1")
                 .body(())
                 .map_err(setup)?,
         )
@@ -460,9 +478,27 @@ mod tests {
             parse_connect_udp_target("/.well-known/masque/udp/127.0.0.1/443"),
             Some("127.0.0.1:443".parse().unwrap())
         );
+        // IPv6 literal (colons are valid path characters), bare and bracketed.
+        assert_eq!(
+            parse_connect_udp_target("/.well-known/masque/udp/2001:db8::42/443/"),
+            Some("[2001:db8::42]:443".parse().unwrap())
+        );
+        assert_eq!(
+            parse_connect_udp_target("/.well-known/masque/udp/[2001:db8::1]/51820/"),
+            Some("[2001:db8::1]:51820".parse().unwrap())
+        );
+        // Rejections: not the template, bad host, oversized port, missing port.
         assert_eq!(parse_connect_udp_target("/nope"), None);
         assert_eq!(
             parse_connect_udp_target("/.well-known/masque/udp/bad/x/"),
+            None
+        );
+        assert_eq!(
+            parse_connect_udp_target("/.well-known/masque/udp/10.0.0.5/99999/"),
+            None
+        );
+        assert_eq!(
+            parse_connect_udp_target("/.well-known/masque/udp/10.0.0.5/"),
             None
         );
     }
