@@ -114,6 +114,7 @@ impl MeshTransport for UdpMeshTransport {
 /// actually sent. Does not block: on `EAGAIN`/`EWOULDBLOCK` returns `Ok(0)`.
 /// The caller is responsible for sending remaining datagrams.
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code)] // raw sendmmsg(2) FFI; see SAFETY notes below
 fn sendmmsg_once(
     socket: &UdpSocket,
     peer: SocketAddr,
@@ -175,6 +176,7 @@ fn sendmmsg_once(
 
 /// Convert a [`SocketAddr`] to a `sockaddr_storage` + length pair.
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code)] // sockaddr_storage transmute for the syscall; see SAFETY notes
 fn sockaddr_of(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
     // SAFETY: zeroing a sockaddr_storage is always valid.
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };

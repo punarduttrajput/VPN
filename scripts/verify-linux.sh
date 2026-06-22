@@ -78,7 +78,24 @@ trap cleanup EXIT
 
 # ---- preflight ------------------------------------------------------------
 [ "$(id -u)" -eq 0 ] || { red "must run as root (sudo)"; exit 2; }
-for tool in ip tc iperf3 ping awk; do
+
+# rustup is a per-user install: cargo lives in the invoking user's ~/.cargo/bin
+# (which sudo's secure_path strips from root's PATH) and resolves its toolchain
+# via that user's ~/.rustup. So `sudo ./scripts/verify-linux.sh` would otherwise
+# fail with "cargo: command not found" or "no default toolchain". Recover both
+# from $SUDO_USER unless the caller already pointed us elsewhere.
+if [ -n "${SUDO_USER:-}" ]; then
+  user_home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+  : "${CARGO_HOME:=$user_home/.cargo}"
+  : "${RUSTUP_HOME:=$user_home/.rustup}"
+  export CARGO_HOME RUSTUP_HOME
+  case ":$PATH:" in
+    *":$CARGO_HOME/bin:"*) ;;
+    *) export PATH="$CARGO_HOME/bin:$PATH" ;;
+  esac
+fi
+
+for tool in cargo ip tc iperf3 ping awk; do
   command -v "$tool" >/dev/null || { red "missing required tool: $tool"; exit 2; }
 done
 
