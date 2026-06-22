@@ -4,7 +4,7 @@
 **Started:** 2026-06-16
 **Last updated:** 2026-06-22
 **Build host:** Windows 11 (Rust 1.96.0) — offline cargo; see the environment note in [CLAUDE.md](CLAUDE.md) for constraints that may not apply on other machines.
-**Phase 1 status:** ✅ Functionally complete — all milestones verified in CI **and now on a real Linux kernel locally** (WSL2, 2026-06-22: `verify-linux.sh` 8/8 PASS). **NFR1 update:** the long-standing 0.52 was a *shared-runner artifact* — on WSL2 the pipelined data plane measures **293/312 = 0.94 ratio**, comfortably clearing the 0.70 target (the tunnel adds only ~6% overhead). Caveat: that host is itself CPU/NIC-bound (~312 Mbps baseline, not a true 1 Gbps link), so the *ratio* NFR is met but absolute line-rate on dedicated hardware is still unconfirmed. See [NFR1 note](#nfr1-throughput--an-honest-status).
+**Phase 1 status:** ✅ Functionally complete — all milestones verified in CI **and now on a real Linux kernel locally** (WSL2, 2026-06-22: `verify-linux.sh` 8/8 PASS). **NFR1 update:** the long-standing 0.52 was a *shared-runner artifact* — on WSL2 the pipelined data plane **passes the strict hard gate** (`STRICT_THROUGHPUT=1` → 9/9 PASS, ratio **0.76–0.94** across runs, ≥ 0.70). Caveat: that host is itself CPU/NIC-bound (~312 Mbps baseline, not a true 1 Gbps link) and noisy, so the *ratio* NFR is met but absolute line-rate on dedicated hardware is still unconfirmed. See [NFR1 note](#nfr1-throughput--an-honest-status).
 **Phase 2 status:** ✅ Functionally complete — `Transport`/`MeshTransport` traits, QUIC transport + connection migration (FR4), `[transport]` config + CLI selection, padding + timing-jitter obfuscation (FR5), UDP batch I/O (NFR1), and **MASQUE/HTTP3 CONNECT-UDP** (FR3) — point-to-point *and* a multi-peer **MASQUE mesh** (multi-session proxy + `MasqueMeshTransport`), all wired into the CLI and verified in-process. Remaining: third-party MASQUE proxy interop. See [Phase 2 section](#phase-2--transport--obfuscation).
 **Phase 3 status:** ✅ Functionally complete (control plane) — gRPC coordinator (`vpn-control-proto` + `vpn-coordinator`): device registry, tunnel-IP allocation, network map, **tag-based ACL/policy**, **live `WatchNetworkMap` streaming**, **client integration** (`vpn-client-core` register/plan/watch), **SQLite persistence** (write-through `Store`), **mutual TLS**, and **OIDC bearer-token auth** (`oidc`: JWT RS256/ES256 verified against a JWKS; tags become a verified authorization boundary) — all verified by in-process tests. The **CLI joins a coordinator-managed mesh** (`vpn up-mesh`): register → watch → live-reconfiguring multi-peer data plane (real-TUN mesh is an opt-in CI path) and can carry a bearer token (`--token-file`). The mesh runs over **UDP, QUIC, or MASQUE** (`UdpMeshTransport`/`QuicMeshTransport`/`MasqueMeshTransport`, selected by `[transport] mode`), with **crypto-demux + endpoint roaming** so relayed/NAT'd peers route and reply correctly. See [Phase 3 section](#phase-3--control-plane).
 **Phase 5 status:** 🟡 In progress (M1) — shared client core: `vpn-client-core::VpnClient` is a connection state machine (Disconnected→Connecting→Connected/Failed, Reconnecting) over `ControlClient`, exposing `connect`/`disconnect`/`status`/`address`/`peers`/`subscribe` (FR1 API) with an FFI-friendly type surface (plain enums/records) ready for a `uniffi` annotation layer, and a `tokio::broadcast` event stream (`ClientEvent`). In-process tests cover the state transitions and peer loading. Remaining: `uniffi` bindings (blocked — crate unavailable in this offline build), native shells (iOS/Android/Tauri), data-plane bring-up per platform, and reliability features (kill-switch/always-on/reconnect). See [Phase 5 section](#phase-5--clients).
@@ -26,7 +26,7 @@
 | M3 | TUN I/O — create/configure/teardown | ✅ Done | Verified in CI: real `vpn0` up in both namespaces + clean SIGTERM teardown (FR1) on a Linux runner |
 | M4 | Crypto session — boringtun handshake | ✅ Done | `handshake_and_packet_roundtrip` test passes |
 | M5 | End-to-end — event loop, packet across tunnel | ✅ Done | `loopback` in-proc test + real `ping` across the tunnel (both directions) verified in CI |
-| M6 | Benchmark — iperf3 throughput/latency | ✅ NFR2 ✅, NFR1 ratio met (0.94) locally | NFR2 latency PASS (CI + WSL2). NFR1: shared CI shows **0.52** (runner artifact), but a real Linux kernel (WSL2, 2026-06-22) measures **293/312 = 0.94 ≥ 0.70** — confirming the data plane, not the cipher/pipeline, was never the issue. Absolute 1 Gbps line-rate on dedicated HW still pending (`STRICT_THROUGHPUT=1`). See [NFR1 note](#nfr1-throughput--an-honest-status) |
+| M6 | Benchmark — iperf3 throughput/latency | ✅ NFR2 ✅, NFR1 ratio met (0.94) locally | NFR2 latency PASS (CI + WSL2). NFR1: shared CI shows **0.52** (runner artifact), but a real Linux kernel (WSL2, 2026-06-22) measures **293/312 = 0.94 ≥ 0.70** — confirming the data plane, not the cipher/pipeline, was never the issue. A `STRICT_THROUGHPUT=1` run passes the hard gate (9/9). Absolute 1 Gbps line-rate on dedicated HW still pending. See [NFR1 note](#nfr1-throughput--an-honest-status) |
 
 Legend: ⬜ Not started · 🟡 In progress/partial · ✅ Done · ⚠️ Blocked/Deferred
 
@@ -98,16 +98,23 @@ Measured on CI with the underlay shaped to a realistic 1 Gbps link
 |---|---|---|---|
 | Shared CI (2-vCPU) — single serialized loop (old) | 956 | 356 | 0.37 |
 | Shared CI (2-vCPU) — pipelined data plane | 956 | 493 | 0.52 |
-| **Real Linux kernel (WSL2, 2026-06-22)** | **312** | **293** | **0.94** ✅ |
+| **Real Linux kernel (WSL2, 2026-06-22), run A** | 312 | 293 | **0.94** ✅ |
+| **Real Linux kernel (WSL2, 2026-06-22), run B (`STRICT_THROUGHPUT=1`)** | 319 | 242 | **0.76** ✅ |
 | NFR1 target | — | — | 0.70 |
 
-**The NFR1 ratio is met (0.94) on a real Linux kernel.** The earlier 0.52 was a
-*shared-runner artifact*, not a data-plane limit: on a 2-vCPU GitHub runner the
-high 956 Mbps baseline outruns a single userspace tunnel, depressing the ratio.
-On WSL2 the tunnel tracks the underlay closely (293/312) — **only ~6% overhead** —
-which is what NFR1 actually measures. This confirms the long-standing hypothesis
-that the data plane (not the cipher or the loop structure) was never the problem;
-the shared runner was.
+**The NFR1 ratio passes the strict hard gate on a real Linux kernel** — a
+`STRICT_THROUGHPUT=1` run reports **9/9 PASS** including `tunnel throughput
+>= 0.70 x link`. The earlier 0.52 was a *shared-runner artifact*, not a data-plane
+limit: on a 2-vCPU GitHub runner the high 956 Mbps baseline outruns a single
+userspace tunnel, depressing the ratio. On WSL2 the tunnel tracks the underlay
+closely — which is what NFR1 actually measures. This confirms the long-standing
+hypothesis that the data plane (not the cipher or the loop structure) was never
+the problem; the shared runner was.
+
+The observed ratio **varies run-to-run (0.76–0.94)** because the WSL2 host is
+CPU-bound and noisy; both ends of that range clear 0.70, but the margin is not
+large — so the honest claim is "the ratio gate passes on real Linux," not a fixed
+0.94.
 
 Honest caveat: the WSL2 host is itself CPU/NIC-bound (~312 Mbps baseline, well
 below a true 1 Gbps link), so the 1000 Mbit `tc` shaping wasn't the binding
@@ -156,7 +163,7 @@ To enforce the 70% gate on dedicated/representative hardware:
 - 2026-06-16 — **CI green: `verify-linux` 8/8 PASS** on Linux runner — M3 (TUN up + SIGTERM teardown), M5 (ping both directions), M6 (latency +0.23 ms; throughput floor 414 Mbps). **Phase 1 complete.** Sole follow-up: NFR1 strict throughput ratio on real 1 Gbps hardware (`STRICT_THROUGHPUT=1`).
 - 2026-06-17 — **NFR1 closed**: verify-linux now shapes the underlay to a 1 Gbps LAN with `tc netem rate` and enforces the 70% ratio as a hard gate (escape hatch `SHAPE=0`). The runner's per-packet 64 KB allocation and the per-packet `Mutex` were both removed (the event loop now owns the session in a single task).
 - 2026-06-17 — **Phase 2 started**: new `vpn-transport` crate — `Transport` trait + `UdpTransport` (default, wired through runner/CLI/tests) + `QuicTransport` (quinn datagrams, ring-backed rustls, behind `quic` feature) with an in-process datagram-roundtrip test. Runner is now transport-generic. CI also runs the `quic` feature.
-- 2026-06-22 — **Real Linux data plane verified locally + NFR1 ratio met.** Ran the real-TUN path on an actual Linux kernel (WSL2 Ubuntu 22.04, kernel 6.18) — `verify-linux.sh` **8/8 PASS**: M3 (real `vpn0` up + clean SIGTERM teardown), M5 (ping across the encrypted tunnel), M6/NFR1 **ratio 0.94** (293/312 Mbps; ≥ 0.70 target — the 0.52 on shared CI was a runner artifact), M6/NFR2 latency +0.56 ms. Two cross-platform bugs surfaced by finally compiling on Linux, both fixed: (1) `vpn-transport` declared `#![forbid(unsafe_code)]` while its `#[cfg(target_os="linux")]` `sendmmsg(2)` path uses `unsafe` — never compiled on the Windows host; switched to `#![deny(unsafe_code)]` + localized `#[allow(unsafe_code)]` on the two FFI helpers (unsafe surface unchanged). (2) `verify-linux.sh` died with `cargo: command not found` under `sudo` (rustup is a per-user install; secure_path strips `~/.cargo/bin` and root has no `RUSTUP_HOME`) — preflight now recovers `$SUDO_USER`'s `CARGO_HOME`/`RUSTUP_HOME`/PATH and checks for `cargo`. Caveat: WSL2 baseline is ~312 Mbps (CPU/NIC-bound), so absolute 1 Gbps line-rate on dedicated HW is still open. (Env note: this build host is online with working WSL2 — not the offline-Windows host the older notes assume.)
+- 2026-06-22 — **Real Linux data plane verified locally + NFR1 ratio met.** Ran the real-TUN path on an actual Linux kernel (WSL2 Ubuntu 22.04, kernel 6.18) — `verify-linux.sh` **8/8 PASS**: M3 (real `vpn0` up + clean SIGTERM teardown), M5 (ping across the encrypted tunnel), M6/NFR1 **ratio 0.94** (293/312 Mbps; ≥ 0.70 target — the 0.52 on shared CI was a runner artifact), M6/NFR2 latency +0.56 ms. A follow-up `STRICT_THROUGHPUT=1` run flips NFR1 from informational to a hard gate: **9/9 PASS** (ratio 0.76 that run; observed 0.76–0.94 across runs, the WSL2 host being CPU-bound/noisy). Two cross-platform bugs surfaced by finally compiling on Linux, both fixed: (1) `vpn-transport` declared `#![forbid(unsafe_code)]` while its `#[cfg(target_os="linux")]` `sendmmsg(2)` path uses `unsafe` — never compiled on the Windows host; switched to `#![deny(unsafe_code)]` + localized `#[allow(unsafe_code)]` on the two FFI helpers (unsafe surface unchanged). (2) `verify-linux.sh` died with `cargo: command not found` under `sudo` (rustup is a per-user install; secure_path strips `~/.cargo/bin` and root has no `RUSTUP_HOME`) — preflight now recovers `$SUDO_USER`'s `CARGO_HOME`/`RUSTUP_HOME`/PATH and checks for `cargo`. Caveat: WSL2 baseline is ~312 Mbps (CPU/NIC-bound), so absolute 1 Gbps line-rate on dedicated HW is still open. (Env note: this build host is online with working WSL2 — not the offline-Windows host the older notes assume.)
 
 ---
 
