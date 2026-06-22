@@ -51,32 +51,27 @@ impl Transport for UdpTransport {
         }
     }
 
-    fn send_batch<'a>(
-        &'a self,
-        datagrams: &'a [Vec<u8>],
-    ) -> impl std::future::Future<Output = Result<(), TransportError>> + Send + 'a {
-        async move {
-            if datagrams.is_empty() {
-                return Ok(());
+    async fn send_batch(&self, datagrams: &[Vec<u8>]) -> Result<(), TransportError> {
+        if datagrams.is_empty() {
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let sent =
+                sendmmsg_once(&self.socket, self.peer, datagrams).map_err(TransportError::Io)?;
+            // Fall back to sequential async sends for anything not sent
+            // (e.g. partial send or EAGAIN on first attempt).
+            for d in &datagrams[sent..] {
+                self.send(d).await?;
             }
-            #[cfg(target_os = "linux")]
-            {
-                let sent = sendmmsg_once(&self.socket, self.peer, datagrams)
-                    .map_err(TransportError::Io)?;
-                // Fall back to sequential async sends for anything not sent
-                // (e.g. partial send or EAGAIN on first attempt).
-                for d in &datagrams[sent..] {
-                    self.send(d).await?;
-                }
-                return Ok(());
+            return Ok(());
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            for d in datagrams {
+                self.send(d).await?;
             }
-            #[cfg(not(target_os = "linux"))]
-            {
-                for d in datagrams {
-                    self.send(d).await?;
-                }
-                Ok(())
-            }
+            Ok(())
         }
     }
 }
@@ -185,16 +180,14 @@ fn sockaddr_of(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let len = match addr {
         SocketAddr::V4(v4) => {
-            let sin: &mut libc::sockaddr_in =
-                unsafe { &mut *(&mut storage as *mut _ as *mut _) };
+            let sin: &mut libc::sockaddr_in = unsafe { &mut *(&mut storage as *mut _ as *mut _) };
             sin.sin_family = libc::AF_INET as libc::sa_family_t;
             sin.sin_port = v4.port().to_be();
             sin.sin_addr.s_addr = u32::from(*v4.ip()).to_be();
             std::mem::size_of::<libc::sockaddr_in>()
         }
         SocketAddr::V6(v6) => {
-            let sin6: &mut libc::sockaddr_in6 =
-                unsafe { &mut *(&mut storage as *mut _ as *mut _) };
+            let sin6: &mut libc::sockaddr_in6 = unsafe { &mut *(&mut storage as *mut _ as *mut _) };
             sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
             sin6.sin6_port = v6.port().to_be();
             sin6.sin6_addr.s6_addr = v6.ip().octets();
