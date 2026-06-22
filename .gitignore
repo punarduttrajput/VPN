@@ -5,6 +5,10 @@
 # Cargo (keep Cargo.lock for the workspace; it has binaries)
 # (Cargo.lock is intentionally committed for reproducible binary builds)
 
+# Generated uniffi bindings (reproducible artifact; see bindings/README.md)
+/crates/client-core/bindings/swift/
+/crates/client-core/bindings/kotlin/
+
 # Editor / OS
 .DS_Store
 *.swp

@@ -8,10 +8,21 @@
 //!   (Phase 5): a connection state machine over [`ControlClient`] with a peer
 //!   view and an event subscription. The OS data-plane bring-up (TUN +
 //!   `run_mesh`) is supplied by each platform shell.
-#![forbid(unsafe_code)]
+//!
+//! The `uniffi` feature adds an FFI layer ([`ffi`]) that exposes the facade to
+//! Swift/Kotlin; uniffi's generated scaffolding is `extern "C"` glue, so the
+//! crate-wide `unsafe` ban is lifted only for that build (normal builds keep
+//! `#![forbid(unsafe_code)]`).
+#![cfg_attr(not(feature = "uniffi"), forbid(unsafe_code))]
 
 pub mod client;
 pub use client::{ClientEvent, ClientIdentity, ConnectionState, PeerPath, PeerStatus, VpnClient};
+
+#[cfg(feature = "uniffi")]
+pub mod ffi;
+
+#[cfg(feature = "uniffi")]
+uniffi::setup_scaffolding!();
 
 use thiserror::Error;
 use tonic::transport::Channel;
@@ -19,7 +30,11 @@ use vpn_control_proto::coordinator::coordinator_client::CoordinatorClient;
 use vpn_control_proto::coordinator::{NetworkMapRequest, RegisterDeviceRequest};
 
 /// Errors talking to the coordinator.
+///
+/// Exposed to FFI as a flat error (variant name + `Display` message), since the
+/// wrapped tonic types aren't themselves FFI-representable.
 #[derive(Debug, Error)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Error), uniffi(flat_error))]
 pub enum Error {
     /// Failed to establish the gRPC channel.
     #[error("control transport error: {0}")]
@@ -31,6 +46,7 @@ pub enum Error {
 
 /// One peer the device may reach, as derived from the network map.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PeerSpec {
     /// Peer's base64 public key.
     pub public_key: String,
