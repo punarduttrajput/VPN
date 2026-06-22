@@ -253,6 +253,106 @@ async fn mesh_routes_via_relay_with_mismatched_source() {
     );
 }
 
+/// Endpoint roaming: a node that starts with a *wrong* (blackhole) endpoint for
+/// a peer can still reach it, by learning the peer's real address from an
+/// authenticated inbound packet. A (the initiator) has B's correct address, but
+/// B's endpoint for A points at a dead port. A's handshake reaches B; only after
+/// B roams A's endpoint to the observed source can B's response get back to A and
+/// the handshake complete — then A delivers data to B. Without roaming, B's reply
+/// vanishes into the blackhole and the tunnel never comes up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn mesh_roams_peer_endpoint_to_observed_source() {
+    let (a, b) = (KeyPair::generate(), KeyPair::generate());
+
+    let sock_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sock_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = sock_b.local_addr().unwrap();
+
+    // A "sink": a bound socket that silently drains. We point B's endpoint for A
+    // here so B's packets to A go nowhere useful (but, unlike a dead port, don't
+    // trigger an ICMP unreachable that would reset the sender's socket). B can
+    // only actually reach A after roaming to A's real source.
+    let sink = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sink_addr = sink.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        while sink.recv_from(&mut buf).await.is_ok() {}
+    });
+
+    // A initiates and knows B's real address; B's endpoint for A is the sink.
+    let a_peers = vec![MeshPeer {
+        session: Session::from_bytes(a.private.to_bytes(), b.public.to_bytes(), 1).unwrap(),
+        endpoint: addr_b,
+        allowed_ips: vec![cidr("10.8.0.2/32")],
+    }];
+    let b_peers = vec![MeshPeer {
+        session: Session::from_bytes(b.private.to_bytes(), a.public.to_bytes(), 1).unwrap(),
+        endpoint: sink_addr,
+        allowed_ips: vec![cidr("10.8.0.1/32")],
+    }];
+
+    let tun_a = MockTun::default();
+    let tun_b = MockTun::default();
+    let inject_a = tun_a.to_runner.clone();
+    let recv_b = tun_b.from_runner.clone();
+
+    let (stop_a_tx, stop_a_rx) = oneshot::channel();
+    let (stop_b_tx, stop_b_rx) = oneshot::channel();
+    let (_ua_tx, ua_rx) = tokio::sync::mpsc::channel(1);
+    let (_ub_tx, ub_rx) = tokio::sync::mpsc::channel(1);
+
+    let ja = tokio::spawn(async move {
+        run_mesh(
+            tun_a,
+            UdpMeshTransport::from_socket(sock_a),
+            a_peers,
+            ua_rx,
+            async {
+                stop_a_rx.await.ok();
+            },
+        )
+        .await
+    });
+    let jb = tokio::spawn(async move {
+        run_mesh(
+            tun_b,
+            UdpMeshTransport::from_socket(sock_b),
+            b_peers,
+            ub_rx,
+            async {
+                stop_b_rx.await.ok();
+            },
+        )
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(500)).await; // B initiates -> A roams
+
+    // A injects a packet for B; it can only arrive if A roamed B's endpoint away
+    // from the blackhole to B's real address.
+    let to_b = ipv4([10, 8, 0, 2]);
+    inject_a.lock().unwrap().push_back(to_b.clone());
+
+    let mut b_pkt = None;
+    for _ in 0..80 {
+        b_pkt = b_pkt.or_else(|| recv_b.lock().unwrap().first().cloned());
+        if b_pkt.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let _ = stop_a_tx.send(());
+    let _ = stop_b_tx.send(());
+    let _ = ja.await;
+    let _ = jb.await;
+
+    assert_eq!(
+        b_pkt.expect("A should reach B only after roaming off the blackhole endpoint"),
+        to_b
+    );
+}
+
 /// A starts with an EMPTY mesh and learns about B only via a live update on the
 /// channel (the shape of a coordinator `WatchNetworkMap` push). Once applied, a
 /// packet for B's tunnel IP routes correctly — proving dynamic reconfiguration.
