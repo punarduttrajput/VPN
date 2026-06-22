@@ -191,8 +191,21 @@ impl Transport for MasqueTransport {
     }
 }
 
-/// A MASQUE proxy that accepts one CONNECT-UDP session and relays its datagrams
-/// to a target UDP endpoint (e.g. the WireGuard server).
+/// Parse the target UDP endpoint from an RFC 9298 CONNECT-UDP path template,
+/// `/.well-known/masque/udp/{target_host}/{target_port}/`.
+fn parse_connect_udp_target(path: &str) -> Option<SocketAddr> {
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    // Find the "udp" marker; host and port are the next two segments.
+    let i = segs.iter().position(|s| *s == "udp")?;
+    let host = segs.get(i + 1)?;
+    let port: u16 = segs.get(i + 2)?.parse().ok()?;
+    let ip: std::net::IpAddr = host.parse().ok()?;
+    Some(SocketAddr::new(ip, port))
+}
+
+/// A MASQUE proxy that terminates HTTP/3 CONNECT-UDP sessions and relays each to
+/// the UDP target named in its request. Handles many concurrent sessions, one
+/// per QUIC connection — which is what a mesh node needs (one session per peer).
 pub struct MasqueProxy {
     endpoint: Endpoint,
 }
@@ -210,7 +223,26 @@ impl MasqueProxy {
         self.endpoint.local_addr().map_err(TransportError::Io)
     }
 
-    /// Accept one CONNECT-UDP session and relay its datagrams to `target`.
+    /// Accept connections forever, relaying each CONNECT-UDP session to the
+    /// target named in its request path. One session per connection.
+    pub async fn serve(&self) -> Result<(), TransportError> {
+        while let Some(incoming) = self.endpoint.accept().await {
+            tokio::spawn(async move {
+                match incoming.await {
+                    Ok(conn) => {
+                        if let Err(e) = relay_connection(conn, None).await {
+                            tracing::debug!("masque session ended: {e}");
+                        }
+                    }
+                    Err(e) => tracing::debug!("masque accept failed: {e}"),
+                }
+            });
+        }
+        Ok(())
+    }
+
+    /// Accept one CONNECT-UDP session and relay it to `target` (ignoring the
+    /// request path). Retained for the point-to-point path and tests.
     pub async fn serve_one(&self, target: SocketAddr) -> Result<(), TransportError> {
         let incoming = self
             .endpoint
@@ -218,66 +250,82 @@ impl MasqueProxy {
             .await
             .ok_or_else(|| conn_err("endpoint closed before a connection arrived"))?;
         let conn = incoming.await.map_err(conn_err)?;
-        let h3c = h3_quinn::Connection::new(conn);
-        let mut h3conn = h3::server::builder()
-            .enable_datagram(true)
-            .enable_extended_connect(true)
-            .build::<h3_quinn::Connection, Bytes>(h3c)
-            .await
-            .map_err(conn_err)?;
-
-        let resolver = h3conn
-            .accept()
-            .await
-            .map_err(conn_err)?
-            .ok_or_else(|| conn_err("no request on connection"))?;
-        let (_req, mut req_stream) = resolver.resolve_request().await.map_err(conn_err)?;
-        req_stream
-            .send_response(
-                http::Response::builder()
-                    .status(200)
-                    .body(())
-                    .map_err(setup)?,
-            )
-            .await
-            .map_err(conn_err)?;
-        let stream_id = req_stream.id();
-
-        let mut sender = h3conn.get_datagram_sender(stream_id);
-        let mut reader = h3conn.get_datagram_reader();
-
-        let udp = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
-            .await
-            .map_err(TransportError::Io)?;
-        udp.connect(target).await.map_err(TransportError::Io)?;
-        let udp = Arc::new(udp);
-
-        // HTTP datagram -> UDP (to target).
-        let udp_tx = udp.clone();
-        tokio::spawn(async move {
-            while let Ok(dg) = reader.read_datagram().await {
-                if let Some(p) = strip_ctx(dg.into_payload()) {
-                    let _ = udp_tx.send(&p).await;
-                }
-            }
-        });
-        // UDP (from target) -> HTTP datagram.
-        let udp_rx = udp.clone();
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 65535];
-            while let Ok(n) = udp_rx.recv(&mut buf).await {
-                if sender.send_datagram(frame_ctx(&buf[..n])).is_err() {
-                    break;
-                }
-            }
-        });
-
-        // Drive the connection (keep the request stream open) until it closes;
-        // ignore any further requests on this session.
-        let _req = req_stream;
-        while let Ok(Some(_)) = h3conn.accept().await {}
-        Ok(())
+        relay_connection(conn, Some(target)).await
     }
+}
+
+/// Relay a single CONNECT-UDP session on `conn`. The target is `target_override`
+/// when given (point-to-point), else parsed from the request path (mesh proxy).
+async fn relay_connection(
+    conn: quinn::Connection,
+    target_override: Option<SocketAddr>,
+) -> Result<(), TransportError> {
+    let h3c = h3_quinn::Connection::new(conn);
+    let mut h3conn = h3::server::builder()
+        .enable_datagram(true)
+        .enable_extended_connect(true)
+        .build::<h3_quinn::Connection, Bytes>(h3c)
+        .await
+        .map_err(conn_err)?;
+
+    let resolver = h3conn
+        .accept()
+        .await
+        .map_err(conn_err)?
+        .ok_or_else(|| conn_err("no request on connection"))?;
+    let (req, mut req_stream) = resolver.resolve_request().await.map_err(conn_err)?;
+
+    let target = match target_override {
+        Some(t) => t,
+        None => parse_connect_udp_target(req.uri().path())
+            .ok_or_else(|| conn_err(format!("bad CONNECT-UDP path: {}", req.uri().path())))?,
+    };
+
+    req_stream
+        .send_response(
+            http::Response::builder()
+                .status(200)
+                .body(())
+                .map_err(setup)?,
+        )
+        .await
+        .map_err(conn_err)?;
+    let stream_id = req_stream.id();
+
+    let mut sender = h3conn.get_datagram_sender(stream_id);
+    let mut reader = h3conn.get_datagram_reader();
+
+    let udp = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+        .await
+        .map_err(TransportError::Io)?;
+    udp.connect(target).await.map_err(TransportError::Io)?;
+    let udp = Arc::new(udp);
+
+    // HTTP datagram -> UDP (to target).
+    let udp_tx = udp.clone();
+    tokio::spawn(async move {
+        while let Ok(dg) = reader.read_datagram().await {
+            if let Some(p) = strip_ctx(dg.into_payload()) {
+                let _ = udp_tx.send(&p).await;
+            }
+        }
+    });
+    // UDP (from target) -> HTTP datagram.
+    let udp_rx = udp.clone();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        while let Ok(n) = udp_rx.recv(&mut buf).await {
+            if sender.send_datagram(frame_ctx(&buf[..n])).is_err() {
+                break;
+            }
+        }
+    });
+
+    // Drive the connection (keep the request stream open) until it closes;
+    // ignore any further requests on this session.
+    let _req = req_stream;
+    while let Ok(Some(_)) = h3conn.accept().await {}
+    Ok(())
 }
 
 #[cfg(test)]
@@ -316,5 +364,79 @@ mod tests {
             .expect("masque roundtrip timed out")
             .unwrap();
         assert_eq!(&out[..n], b"masque-hello");
+    }
+
+    #[test]
+    fn parses_connect_udp_target_from_path() {
+        assert_eq!(
+            parse_connect_udp_target("/.well-known/masque/udp/10.0.0.5/51820/"),
+            Some("10.0.0.5:51820".parse().unwrap())
+        );
+        // Without a trailing slash.
+        assert_eq!(
+            parse_connect_udp_target("/.well-known/masque/udp/127.0.0.1/443"),
+            Some("127.0.0.1:443".parse().unwrap())
+        );
+        assert_eq!(parse_connect_udp_target("/nope"), None);
+        assert_eq!(
+            parse_connect_udp_target("/.well-known/masque/udp/bad/x/"),
+            None
+        );
+    }
+
+    /// One proxy, two concurrent CONNECT-UDP sessions to *different* targets,
+    /// each routed by its request path (the multi-session mesh shape).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn masque_proxy_serves_multiple_targets() {
+        // Two distinct echo "peers".
+        async fn echo(tag: u8) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+            let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = s.local_addr().unwrap();
+            let h = tokio::spawn(async move {
+                let mut b = [0u8; 2048];
+                while let Ok((n, from)) = s.recv_from(&mut b).await {
+                    // Echo with the peer tag prepended so we can tell them apart.
+                    let mut reply = vec![tag];
+                    reply.extend_from_slice(&b[..n]);
+                    let _ = s.send_to(&reply, from).await;
+                }
+            });
+            (addr, h)
+        }
+        let (t1, _h1) = echo(1).await;
+        let (t2, _h2) = echo(2).await;
+
+        let proxy = MasqueProxy::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = proxy.serve().await;
+        });
+
+        // Two clients through the *same* proxy, each targeting a different peer.
+        let c1 = MasqueTransport::connect("127.0.0.1:0".parse().unwrap(), proxy_addr, "vpn", t1)
+            .await
+            .unwrap();
+        let c2 = MasqueTransport::connect("127.0.0.1:0".parse().unwrap(), proxy_addr, "vpn", t2)
+            .await
+            .unwrap();
+
+        c1.send(b"to-one").await.unwrap();
+        c2.send(b"to-two").await.unwrap();
+
+        let mut b1 = [0u8; 64];
+        let n1 = tokio::time::timeout(Duration::from_secs(8), c1.recv(&mut b1))
+            .await
+            .expect("c1 timed out")
+            .unwrap();
+        let mut b2 = [0u8; 64];
+        let n2 = tokio::time::timeout(Duration::from_secs(8), c2.recv(&mut b2))
+            .await
+            .expect("c2 timed out")
+            .unwrap();
+
+        // Each client reached its own target (tag 1 / tag 2), proving the proxy
+        // routed by request path, not a single fixed target.
+        assert_eq!(&b1[..n1], b"\x01to-one");
+        assert_eq!(&b2[..n2], b"\x02to-two");
     }
 }
