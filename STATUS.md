@@ -1,10 +1,9 @@
-# Phase 1 Implementation Status
+# Implementation Status
 
-**Phase:** 1 of 6 — MVP Encrypted Tunnel
-**Spec:** [PRD/phase-1-mvp-tunnel.md](PRD/phase-1-mvp-tunnel.md)
+**Roadmap:** 6 phases — see [PRD/](PRD/). **Agent context:** [CLAUDE.md](CLAUDE.md).
 **Started:** 2026-06-16
-**Last updated:** 2026-06-17
-**Build host:** Windows 11 (Rust 1.96.0)
+**Last updated:** 2026-06-22
+**Build host:** Windows 11 (Rust 1.96.0) — offline cargo; see the environment note in [CLAUDE.md](CLAUDE.md) for constraints that may not apply on other machines.
 **Phase 1 status:** ✅ Functionally complete — all milestones verified in CI. **NFR1 caveat:** measured correctly (shaped 1 Gbps link); the pipelined data plane reached **493/956 = 0.52** on shared CI (up from 0.37), still under the 0.70 target on a 2-vCPU runner. Reported informationally; enforceable on dedicated hardware (`STRICT_THROUGHPUT=1`). See [NFR1 note](#nfr1-throughput--an-honest-status).
 **Phase 2 status:** ✅ Functionally complete — `Transport`/`MeshTransport` traits, QUIC transport + connection migration (FR4), `[transport]` config + CLI selection, padding + timing-jitter obfuscation (FR5), UDP batch I/O (NFR1), and **MASQUE/HTTP3 CONNECT-UDP** (FR3) — point-to-point *and* a multi-peer **MASQUE mesh** (multi-session proxy + `MasqueMeshTransport`), all wired into the CLI and verified in-process. Remaining: third-party MASQUE proxy interop. See [Phase 2 section](#phase-2--transport--obfuscation).
 **Phase 3 status:** ✅ Functionally complete (control plane) — gRPC coordinator (`vpn-control-proto` + `vpn-coordinator`): device registry, tunnel-IP allocation, network map, **tag-based ACL/policy**, **live `WatchNetworkMap` streaming**, **client integration** (`vpn-client-core` register/plan/watch), **SQLite persistence** (write-through `Store`), **mutual TLS**, and **OIDC bearer-token auth** (`oidc`: JWT RS256/ES256 verified against a JWKS; tags become a verified authorization boundary) — all verified by in-process tests. The **CLI joins a coordinator-managed mesh** (`vpn up-mesh`): register → watch → live-reconfiguring multi-peer data plane (real-TUN mesh is an opt-in CI path) and can carry a bearer token (`--token-file`). The mesh runs over **UDP, QUIC, or MASQUE** (`UdpMeshTransport`/`QuicMeshTransport`/`MasqueMeshTransport`, selected by `[transport] mode`), with **crypto-demux + endpoint roaming** so relayed/NAT'd peers route and reply correctly. See [Phase 3 section](#phase-3--control-plane).
