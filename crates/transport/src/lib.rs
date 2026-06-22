@@ -6,7 +6,12 @@
 //! plain UDP becomes one implementation ([`UdpTransport`] / [`UdpMeshTransport`]);
 //! QUIC ([`quic`]) adds roaming and DPI-evasion. MASQUE/HTTP3, connection
 //! migration, and padding are later Phase 2 increments.
-#![forbid(unsafe_code)]
+//!
+//! `unsafe` is denied crate-wide; the only exceptions are the two Linux-only
+//! `sendmmsg(2)` FFI helpers in [`udp`], each annotated `#[allow(unsafe_code)]`
+//! with a `// SAFETY:` justification. (`deny`, not `forbid`, so those localized
+//! allows are permitted; everything else still fails to compile on `unsafe`.)
+#![deny(unsafe_code)]
 
 use std::net::SocketAddr;
 
