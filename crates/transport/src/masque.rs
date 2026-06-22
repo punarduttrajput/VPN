@@ -13,10 +13,14 @@
 //! the h3 datagram handles live in spawned tasks that exchange bytes with the
 //! transport over channels.
 //!
-//! Scope: verified in-process (client ↔ proxy ↔ UDP echo). Interop with
-//! third-party MASQUE proxies (capsule protocol, full path conformance) is not
-//! yet verified.
+//! [`MasqueMeshTransport`] is the multi-peer counterpart used by the mesh data
+//! plane: one CONNECT-UDP session per peer through a single proxy.
+//!
+//! Scope: verified in-process (client ↔ proxy ↔ UDP echo, and a MASQUE mesh node
+//! reaching a UDP peer through the proxy). Interop with third-party MASQUE proxies
+//! (capsule protocol, full path conformance) is not yet verified.
 
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
@@ -28,7 +32,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
 
 use crate::quic::{install_provider, SkipServerVerification};
-use crate::{Transport, TransportError};
+use crate::{MeshTransport, Transport, TransportError};
 
 const CHANNEL_CAP: usize = 1024;
 
@@ -328,6 +332,85 @@ async fn relay_connection(
     Ok(())
 }
 
+/// Multi-peer MASQUE transport for the mesh: one CONNECT-UDP session per peer,
+/// all through a single proxy. `send_to(dst)` opens (lazily) and uses the session
+/// whose target is `dst`; inbound datagrams from every session are merged and
+/// tagged with that session's target.
+///
+/// A node using this never listens on a plain UDP endpoint — all its peer traffic
+/// is tunnelled out through the proxy. Peers see that traffic arriving from the
+/// proxy and (thanks to the mesh's crypto-demux + endpoint roaming) attribute it
+/// to the right peer and reply along the proxy path. Each target peer must itself
+/// be reachable as a UDP endpoint by the proxy.
+pub struct MasqueMeshTransport {
+    proxy: SocketAddr,
+    authority: String,
+    sessions: Mutex<HashMap<SocketAddr, Arc<MasqueTransport>>>,
+    inbound_tx: mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>,
+    inbound_rx: Mutex<mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>>,
+}
+
+impl MasqueMeshTransport {
+    /// Create a mesh transport that tunnels every peer through `proxy`,
+    /// presenting `authority` as the HTTP/3 `:authority` (also the TLS name).
+    pub fn new(proxy: SocketAddr, authority: impl Into<String>) -> Self {
+        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+        Self {
+            proxy,
+            authority: authority.into(),
+            sessions: Mutex::new(HashMap::new()),
+            inbound_tx,
+            inbound_rx: Mutex::new(inbound_rx),
+        }
+    }
+
+    /// Get the CONNECT-UDP session to `dst`, opening it (and its reader) if new.
+    async fn session_for(&self, dst: SocketAddr) -> Result<Arc<MasqueTransport>, TransportError> {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(s) = sessions.get(&dst) {
+            return Ok(s.clone());
+        }
+        let local: SocketAddr = (Ipv4Addr::UNSPECIFIED, 0).into();
+        let session =
+            Arc::new(MasqueTransport::connect(local, self.proxy, &self.authority, dst).await?);
+
+        // Pump this session's inbound datagrams into the shared channel, tagged
+        // with the peer's target address.
+        let reader = session.clone();
+        let inbound_tx = self.inbound_tx.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+            // Ends when the session errors (closed) or the mesh transport drops.
+            while let Ok(n) = reader.recv(&mut buf).await {
+                if inbound_tx.send((dst, buf[..n].to_vec())).is_err() {
+                    break;
+                }
+            }
+        });
+
+        sessions.insert(dst, session.clone());
+        Ok(session)
+    }
+}
+
+impl MeshTransport for MasqueMeshTransport {
+    async fn send_to(&self, dst: SocketAddr, datagram: &[u8]) -> Result<(), TransportError> {
+        let session = self.session_for(dst).await?;
+        session.send(datagram).await
+    }
+
+    async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr), TransportError> {
+        let mut rx = self.inbound_rx.lock().await;
+        let (src, data) = rx
+            .recv()
+            .await
+            .ok_or_else(|| conn_err("masque mesh transport closed"))?;
+        let n = data.len().min(buf.len());
+        buf[..n].copy_from_slice(&data[..n]);
+        Ok((n, src))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,5 +521,56 @@ mod tests {
         // routed by request path, not a single fixed target.
         assert_eq!(&b1[..n1], b"\x01to-one");
         assert_eq!(&b2[..n2], b"\x02to-two");
+    }
+
+    /// `MasqueMeshTransport` reaches two different peers through one proxy and
+    /// tags each inbound datagram with the peer it came from.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn masque_mesh_reaches_multiple_peers() {
+        async fn echo(tag: u8) -> SocketAddr {
+            let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = s.local_addr().unwrap();
+            tokio::spawn(async move {
+                let mut b = [0u8; 2048];
+                while let Ok((n, from)) = s.recv_from(&mut b).await {
+                    let mut reply = vec![tag];
+                    reply.extend_from_slice(&b[..n]);
+                    let _ = s.send_to(&reply, from).await;
+                }
+            });
+            addr
+        }
+        let p1 = echo(1).await;
+        let p2 = echo(2).await;
+
+        let proxy = MasqueProxy::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = proxy.serve().await;
+        });
+
+        let mesh = MasqueMeshTransport::new(proxy_addr, "vpn");
+        mesh.send_to(p1, b"hi-1").await.unwrap();
+        mesh.send_to(p2, b"hi-2").await.unwrap();
+
+        // Collect two inbound datagrams; each should be tagged with its peer.
+        let mut got: std::collections::HashMap<SocketAddr, Vec<u8>> = HashMap::new();
+        let mut buf = [0u8; 64];
+        for _ in 0..2 {
+            let (n, src) = tokio::time::timeout(Duration::from_secs(8), mesh.recv_from(&mut buf))
+                .await
+                .expect("masque mesh recv timed out")
+                .unwrap();
+            got.insert(src, buf[..n].to_vec());
+        }
+
+        assert_eq!(
+            got.get(&p1).map(|v| v.as_slice()),
+            Some(b"\x01hi-1".as_ref())
+        );
+        assert_eq!(
+            got.get(&p2).map(|v| v.as_slice()),
+            Some(b"\x02hi-2".as_ref())
+        );
     }
 }

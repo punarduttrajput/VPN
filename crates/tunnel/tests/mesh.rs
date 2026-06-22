@@ -353,6 +353,112 @@ async fn mesh_roams_peer_endpoint_to_observed_source() {
     );
 }
 
+/// Capstone: a node whose data plane runs over **MASQUE** (every peer tunnelled
+/// through an HTTP/3 proxy) reaches a normal UDP mesh peer end-to-end. Exercises
+/// the whole stack at once — `MasqueMeshTransport` + the multi-session proxy +
+/// crypto-demux + endpoint roaming. M initiates over MASQUE; X (plain UDP) sees
+/// the traffic arrive from the proxy, attributes it to M by decryption, roams M's
+/// endpoint to the proxy path, and the tunnel comes up so M's packet reaches X.
+#[cfg(feature = "masque")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn masque_mesh_node_reaches_udp_peer() {
+    use vpn_transport::{MasqueMeshTransport, MasqueProxy};
+
+    let (m, x) = (KeyPair::generate(), KeyPair::generate());
+
+    // X is a normal UDP mesh node.
+    let sock_x = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr_x = sock_x.local_addr().unwrap();
+
+    // Sink: X's (wrong) endpoint for M, until X roams to the proxy path.
+    let sink = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sink_addr = sink.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut b = [0u8; 2048];
+        while sink.recv_from(&mut b).await.is_ok() {}
+    });
+
+    // MASQUE proxy M tunnels through.
+    let proxy = MasqueProxy::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = proxy.serve().await;
+    });
+
+    // X (tunnel 10.8.0.1) peers with M (tunnel 10.8.0.2). M reaches X at addr_x
+    // via the proxy; X must roam to learn M's path.
+    let x_peers = vec![MeshPeer {
+        session: Session::from_bytes(x.private.to_bytes(), m.public.to_bytes(), 1).unwrap(),
+        endpoint: sink_addr,
+        allowed_ips: vec![cidr("10.8.0.2/32")],
+    }];
+    let m_peers = vec![MeshPeer {
+        session: Session::from_bytes(m.private.to_bytes(), x.public.to_bytes(), 1).unwrap(),
+        endpoint: addr_x,
+        allowed_ips: vec![cidr("10.8.0.1/32")],
+    }];
+
+    let tun_x = MockTun::default();
+    let tun_m = MockTun::default();
+    let recv_x = tun_x.from_runner.clone();
+    let inject_m = tun_m.to_runner.clone();
+
+    let (stop_x_tx, stop_x_rx) = oneshot::channel();
+    let (stop_m_tx, stop_m_rx) = oneshot::channel();
+    let (_ux_tx, ux_rx) = tokio::sync::mpsc::channel(1);
+    let (_um_tx, um_rx) = tokio::sync::mpsc::channel(1);
+
+    let jx = tokio::spawn(async move {
+        run_mesh(
+            tun_x,
+            UdpMeshTransport::from_socket(sock_x),
+            x_peers,
+            ux_rx,
+            async {
+                stop_x_rx.await.ok();
+            },
+        )
+        .await
+    });
+    let jm = tokio::spawn(async move {
+        run_mesh(
+            tun_m,
+            MasqueMeshTransport::new(proxy_addr, "vpn"),
+            m_peers,
+            um_rx,
+            async {
+                stop_m_rx.await.ok();
+            },
+        )
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(1200)).await; // MASQUE + WG handshake
+
+    // M sends a packet to X's tunnel IP; it must traverse MASQUE -> proxy -> X.
+    let to_x = ipv4([10, 8, 0, 1]);
+    inject_m.lock().unwrap().push_back(to_x.clone());
+
+    let mut x_pkt = None;
+    for _ in 0..100 {
+        x_pkt = x_pkt.or_else(|| recv_x.lock().unwrap().first().cloned());
+        if x_pkt.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let _ = stop_x_tx.send(());
+    let _ = stop_m_tx.send(());
+    let _ = jx.await;
+    let _ = jm.await;
+
+    assert_eq!(
+        x_pkt.expect("X should receive M's packet over the MASQUE mesh path"),
+        to_x
+    );
+}
+
 /// A starts with an EMPTY mesh and learns about B only via a live update on the
 /// channel (the shape of a coordinator `WatchNetworkMap` push). Once applied, a
 /// packet for B's tunnel IP routes correctly — proving dynamic reconfiguration.
