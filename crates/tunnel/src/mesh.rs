@@ -163,25 +163,29 @@ where
                 let (n, src) = recv?;
                 let mut routed = false;
                 for peer in &mut peers {
-                    match peer.session.decapsulate(&net_buf[..n], &mut out) {
-                        Ok(Action::WriteToTun(pkt, _ip)) => {
-                            device.write_packet(pkt).await?;
-                            routed = true;
-                            break;
-                        }
-                        // Handshake response / cookie: reply to this peer's endpoint.
-                        Ok(Action::SendToPeer(pkt)) => {
-                            transport.send_to(peer.endpoint, pkt).await?;
-                            routed = true;
-                            break;
-                        }
-                        Ok(Action::Done) => {
-                            routed = true;
-                            break;
-                        }
+                    let action = match peer.session.decapsulate(&net_buf[..n], &mut out) {
+                        Ok(a) => a,
                         // Not this peer's datagram — try the next session.
                         Err(_) => continue,
+                    };
+                    // Endpoint roaming: the datagram authenticated against this
+                    // peer's session, so `src` is the peer's current reachable
+                    // path. Trust it for future sends (the peer is behind a NAT
+                    // that rewrote its port, or reached us via a relay/proxy).
+                    // Safe because we only roam on a packet that decrypts —
+                    // an attacker cannot forge one.
+                    if peer.endpoint != src {
+                        debug!(old = %peer.endpoint, new = %src, "peer endpoint roamed");
+                        peer.endpoint = src;
                     }
+                    match action {
+                        Action::WriteToTun(pkt, _ip) => device.write_packet(pkt).await?,
+                        // Handshake response / cookie: reply along the roamed path.
+                        Action::SendToPeer(pkt) => transport.send_to(peer.endpoint, pkt).await?,
+                        Action::Done => {}
+                    }
+                    routed = true;
+                    break;
                 }
                 if !routed {
                     debug!(%src, "no peer session accepted inbound datagram; dropping");
