@@ -89,17 +89,9 @@ impl<T: Transport> Transport for PaddedTransport<T> {
         }
     }
 
-    fn send_batch<'a>(
-        &'a self,
-        datagrams: &'a [Vec<u8>],
-    ) -> impl std::future::Future<Output = Result<(), TransportError>> + Send + 'a {
-        async move {
-            let framed: Vec<Vec<u8>> = datagrams
-                .iter()
-                .map(|d| frame(d, self.pad_to))
-                .collect();
-            self.inner.send_batch(&framed).await
-        }
+    async fn send_batch(&self, datagrams: &[Vec<u8>]) -> Result<(), TransportError> {
+        let framed: Vec<Vec<u8>> = datagrams.iter().map(|d| frame(d, self.pad_to)).collect();
+        self.inner.send_batch(&framed).await
     }
 }
 

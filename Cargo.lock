@@ -2321,6 +2321,7 @@ dependencies = [
  "h3-datagram",
  "h3-quinn",
  "http",
+ "libc",
  "quinn",
  "rcgen",
  "rustls",

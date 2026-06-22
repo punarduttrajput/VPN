@@ -31,7 +31,9 @@ impl Lcg {
         if max == 0 {
             return 0;
         }
-        let s = self.0.fetch_add(6_364_136_223_846_793_005, Ordering::Relaxed);
+        let s = self
+            .0
+            .fetch_add(6_364_136_223_846_793_005, Ordering::Relaxed);
         s.wrapping_mul(6_364_136_223_846_793_005)
             .wrapping_add(1_442_695_040_888_963_407)
             % max
@@ -81,19 +83,14 @@ impl<T: Transport> Transport for JitteredTransport<T> {
         self.inner.try_recv(buf)
     }
 
-    fn send_batch<'a>(
-        &'a self,
-        datagrams: &'a [Vec<u8>],
-    ) -> impl std::future::Future<Output = Result<(), TransportError>> + Send + 'a {
-        async move {
-            // One random delay for the burst — still obfuscates inter-burst
-            // timing without multiplying latency by batch size.
-            let delay = self.rng.next_millis(self.max_ms);
-            if delay > 0 {
-                tokio::time::sleep(Duration::from_millis(delay)).await;
-            }
-            self.inner.send_batch(datagrams).await
+    async fn send_batch(&self, datagrams: &[Vec<u8>]) -> Result<(), TransportError> {
+        // One random delay for the burst — still obfuscates inter-burst
+        // timing without multiplying latency by batch size.
+        let delay = self.rng.next_millis(self.max_ms);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
         }
+        self.inner.send_batch(datagrams).await
     }
 }
 

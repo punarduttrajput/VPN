@@ -244,10 +244,9 @@ async fn up(config_path: &str, iface: &str, mtu: u16) -> Result<()> {
                     .unwrap_or("vpn")
                     .to_string();
                 info!("transport: masque, proxy={proxy_addr}");
-                let transport =
-                    MasqueTransport::connect(bind_addr, proxy_addr, &authority, peer)
-                        .await
-                        .context("connecting to masque proxy")?;
+                let transport = MasqueTransport::connect(bind_addr, proxy_addr, &authority, peer)
+                    .await
+                    .context("connecting to masque proxy")?;
                 drive(session, dev, transport, pad_to, jitter_ms, shutdown).await?;
             }
             #[cfg(not(feature = "masque"))]
@@ -447,7 +446,10 @@ where
         (Some(p), Some(ms)) => vpn_tunnel::run(
             session,
             device,
-            JitteredTransport::new(vpn_transport::PaddedTransport::new(transport, p as usize), ms),
+            JitteredTransport::new(
+                vpn_transport::PaddedTransport::new(transport, p as usize),
+                ms,
+            ),
             shutdown,
         )
         .await

@@ -306,7 +306,10 @@ mod tests {
         // Roam: rebind to a fresh local socket. The connection must survive.
         client.rebind("127.0.0.1:0".parse().unwrap()).unwrap();
         let after = client.local_addr_of_endpoint();
-        assert_ne!(before, after, "endpoint should be bound to a new local port");
+        assert_ne!(
+            before, after,
+            "endpoint should be bound to a new local port"
+        );
 
         // Post-migration exchange over the new path.
         client.send(b"after").await.unwrap();
