@@ -377,10 +377,38 @@ async fn up_mesh(
             }
         }
         TransportMode::Masque => {
-            anyhow::bail!(
-                "transport.mode = masque is not supported in mesh mode — MASQUE is \
-                 point-to-point (one proxy per peer); use udp or quic for the mesh"
-            );
+            #[cfg(feature = "masque")]
+            {
+                let proxy_addr: SocketAddr = config
+                    .transport
+                    .masque_proxy
+                    .as_deref()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "transport.masque_proxy is required when transport.mode = masque"
+                        )
+                    })?
+                    .parse()
+                    .context("parsing transport.masque_proxy")?;
+                let authority = config
+                    .transport
+                    .server_name
+                    .as_deref()
+                    .unwrap_or("vpn")
+                    .to_string();
+                let transport = vpn_transport::MasqueMeshTransport::new(proxy_addr, authority);
+                info!(proxy = %proxy_addr, "mesh transport: masque");
+                run_mesh(dev, transport, Vec::new(), rx, shutdown_signal())
+                    .await
+                    .context("mesh data plane")
+            }
+            #[cfg(not(feature = "masque"))]
+            {
+                anyhow::bail!(
+                    "config requests transport.mode = masque for the mesh, but this binary \
+                     was built without the `masque` feature (rebuild with --features vpn-cli/masque)"
+                );
+            }
         }
     };
     watcher.abort();
