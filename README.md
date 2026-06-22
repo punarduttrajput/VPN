@@ -1,7 +1,11 @@
-# Next-Gen VPN — Phase 1 (MVP Encrypted Tunnel)
+# Next-Gen VPN (Rust, WireGuard-based)
 
-A Rust, WireGuard-based point-to-point tunnel. This is Phase 1 of the
-[6-phase roadmap](PRD/); see [STATUS.md](STATUS.md) for progress.
+A Rust, WireGuard-based VPN: encrypted tunnel + pluggable transports
+(UDP/QUIC/MASQUE) + a gRPC control plane + a multi-peer mesh data plane.
+Built to a [6-phase roadmap](PRD/); Phases 1–3 are functionally complete and
+the mesh covers much of Phase 4. See [STATUS.md](STATUS.md) for dated progress
+and [CLAUDE.md](CLAUDE.md) for agent/developer context (build, conventions,
+architecture, environment notes).
 
 ## Workspace
 
