@@ -4,7 +4,9 @@
 //! Phase 1's [`run`](crate::run) is point-to-point. `run_mesh` holds several
 //! [`Session`]s — one per peer — over a [`MeshTransport`], routing:
 //!   * **outbound** TUN packets by destination IP against each peer's `allowed_ips`,
-//!   * **inbound** datagrams to the peer they came from (by source address).
+//!   * **inbound** datagrams by *crypto-demux* — the peer whose WireGuard session
+//!     decrypts the packet — so routing is independent of the source address and
+//!     survives relays (MASQUE) and NAT rewriting.
 //!
 //! This is the shape a [`TunnelPlan`](../../vpn_client_core) becomes: each plan
 //! peer (public key, endpoint, allowed IPs) maps to one [`MeshPeer`].
@@ -148,18 +150,41 @@ where
                 }
             }
 
-            // Inbound: datagram -> demux by source -> decrypt -> TUN.
+            // Inbound: datagram -> crypto-demux -> decrypt -> TUN.
+            //
+            // Route by *which peer's session decrypts the packet* (WireGuard
+            // receiver index / keys), not by source address. A mismatched
+            // session rejects the datagram cheaply (unknown receiver index, or
+            // peer-key mismatch on a handshake), so only the intended peer
+            // accepts it. This makes the mesh work when the source address is
+            // not the peer's advertised endpoint — e.g. traffic relayed through
+            // a MASQUE proxy, or arriving from a NAT-rewritten port.
             recv = transport.recv_from(&mut net_buf) => {
                 let (n, src) = recv?;
-                match peers.iter().position(|p| p.endpoint == src) {
-                    Some(idx) => {
-                        match peers[idx].session.decapsulate(&net_buf[..n], &mut out)? {
-                            Action::WriteToTun(pkt, _ip) => device.write_packet(pkt).await?,
-                            Action::SendToPeer(pkt) => { transport.send_to(src, pkt).await?; }
-                            Action::Done => {}
+                let mut routed = false;
+                for peer in &mut peers {
+                    match peer.session.decapsulate(&net_buf[..n], &mut out) {
+                        Ok(Action::WriteToTun(pkt, _ip)) => {
+                            device.write_packet(pkt).await?;
+                            routed = true;
+                            break;
                         }
+                        // Handshake response / cookie: reply to this peer's endpoint.
+                        Ok(Action::SendToPeer(pkt)) => {
+                            transport.send_to(peer.endpoint, pkt).await?;
+                            routed = true;
+                            break;
+                        }
+                        Ok(Action::Done) => {
+                            routed = true;
+                            break;
+                        }
+                        // Not this peer's datagram — try the next session.
+                        Err(_) => continue,
                     }
-                    None => debug!(%src, "datagram from unknown source; dropping"),
+                }
+                if !routed {
+                    debug!(%src, "no peer session accepted inbound datagram; dropping");
                 }
             }
 
