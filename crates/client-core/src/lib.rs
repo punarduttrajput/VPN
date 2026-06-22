@@ -1,15 +1,17 @@
-//! Client-side control-plane integration (PRD Phase 3, FR6 / Phase 5 client-core).
+//! Client-side core (PRD Phase 3 FR6 + Phase 5 FR1).
 //!
-//! [`ControlClient`] talks to the coordinator over gRPC: it registers the device
-//! (receiving an assigned tunnel address) and fetches the network map of peers it
-//! may reach, turning that into a [`TunnelPlan`] the data plane can apply.
-//!
-//! This is the bridge from the control plane (Phase 3) to the data plane
-//! (Phases 1–2): a `TunnelPlan` lists the peers, their endpoints, and allowed IPs
-//! that a `vpn-tunnel` session would be configured from. Applying a multi-peer
-//! plan to the running tunnel (mesh) is a later increment; today the data plane
-//! is point-to-point.
+//! Two layers:
+//! - [`ControlClient`] — the gRPC control-plane client: registers the device
+//!   (receiving an assigned tunnel address) and fetches/streams the network map
+//!   of peers it may reach, as a [`TunnelPlan`].
+//! - [`VpnClient`] — the high-level, FFI-ready facade the native shells drive
+//!   (Phase 5): a connection state machine over [`ControlClient`] with a peer
+//!   view and an event subscription. The OS data-plane bring-up (TUN +
+//!   `run_mesh`) is supplied by each platform shell.
 #![forbid(unsafe_code)]
+
+pub mod client;
+pub use client::{ClientEvent, ClientIdentity, ConnectionState, PeerPath, PeerStatus, VpnClient};
 
 use thiserror::Error;
 use tonic::transport::Channel;
