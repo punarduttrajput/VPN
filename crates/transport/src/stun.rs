@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
+use tracing::warn;
 
 use crate::TransportError;
 
@@ -65,6 +66,73 @@ pub async fn reflexive_address(
 ) -> Result<SocketAddr, TransportError> {
     let socket = UdpSocket::bind(local).await?;
     query(&socket, stun_server).await
+}
+
+/// Gather this device's NAT-traversal candidates (PRD Phase 4, milestone M2) on
+/// `listen_port` — the port the data plane will actually use.
+///
+/// Returns, best-effort and in priority order:
+/// 1. the **host** candidate — the primary local address (the kernel's chosen
+///    source IP toward `stun_server`) paired with `listen_port`, useful when
+///    peers share a LAN; and
+/// 2. the **server-reflexive** candidate — the public `ip:port` `stun_server`
+///    observes for a socket on `listen_port` (the NAT mapping).
+///
+/// A candidate that can't be determined is logged and skipped rather than
+/// failing the bring-up, so a flaky/unreachable STUN server never blocks the
+/// tunnel (the advertised endpoint is always probed regardless). With no
+/// `stun_server` this returns empty — there is nothing to discover.
+///
+/// Call this *before* binding the data-plane transport on `listen_port`: it
+/// briefly binds a socket on that port for the STUN query, so the discovered
+/// mapping matches the port peers will reach (the mapping is per-port, see
+/// [`query`]). On an endpoint-independent-mapping NAT (the common case) the
+/// data plane then re-binds the same port to the same external mapping.
+pub async fn gather_candidates(
+    listen_port: u16,
+    stun_server: Option<SocketAddr>,
+) -> Vec<SocketAddr> {
+    let mut candidates: Vec<SocketAddr> = Vec::new();
+    let Some(stun) = stun_server else {
+        return candidates;
+    };
+
+    // Host candidate: the local source IP the kernel routes toward the STUN
+    // server, on the data-plane port. A connected UDP socket sends nothing; it
+    // just resolves the route so `local_addr` reports the chosen source IP.
+    match local_source_ip(stun).await {
+        Some(ip) => candidates.push(SocketAddr::new(ip, listen_port)),
+        None => warn!("could not determine local host candidate"),
+    }
+
+    // Server-reflexive candidate: ask the STUN server what public ip:port it
+    // sees for a socket bound to our listen port.
+    let local: SocketAddr = match stun {
+        SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, listen_port).into(),
+        SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, listen_port).into(),
+    };
+    match reflexive_address(local, stun).await {
+        Ok(addr) => candidates.push(addr),
+        Err(e) => warn!("STUN server-reflexive candidate discovery failed: {e}"),
+    }
+
+    candidates.dedup();
+    candidates
+}
+
+/// Resolve the local source IP the kernel would use to reach `reference`.
+///
+/// Binds an ephemeral socket and connects it (no packets are sent — UDP connect
+/// only fixes the peer and resolves the route), then reads back the local
+/// address the kernel picked. Returns `None` if the socket can't be set up.
+async fn local_source_ip(reference: SocketAddr) -> Option<IpAddr> {
+    let bind: SocketAddr = match reference {
+        SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
+        SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
+    };
+    let probe = UdpSocket::bind(bind).await.ok()?;
+    probe.connect(reference).await.ok()?;
+    Some(probe.local_addr().ok()?.ip())
 }
 
 /// Run a STUN Binding transaction over `socket` against `stun_server` and return
@@ -381,5 +449,42 @@ mod tests {
         let expected = client.local_addr().unwrap();
         let reflexive = query(&client, server_addr).await.unwrap();
         assert_eq!(reflexive, expected);
+    }
+
+    /// With no STUN server there is nothing to discover, so gathering yields no
+    /// candidates (the advertised endpoint still covers the basic path).
+    #[tokio::test]
+    async fn gather_without_stun_server_is_empty() {
+        assert!(gather_candidates(51820, None).await.is_empty());
+    }
+
+    /// End-to-end gather: against a mock STUN server, `gather_candidates` returns
+    /// at least the server-reflexive candidate on the requested listen port.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gather_collects_reflexive_candidate_on_listen_port() {
+        // Mock STUN server: echo each request's source back as XOR-MAPPED-ADDRESS.
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (_, from) = server.recv_from(&mut buf).await.unwrap();
+            let mut txid = [0u8; 12];
+            txid.copy_from_slice(&buf[8..20]);
+            let resp = build_xor_mapped_response(&txid, from);
+            server.send_to(&resp, from).await.unwrap();
+        });
+
+        // Pick a free port for the data plane, then release it so gather can bind it.
+        let port = {
+            let tmp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            tmp.local_addr().unwrap().port()
+        };
+
+        let candidates = gather_candidates(port, Some(server_addr)).await;
+        // The reflexive (and host) candidate is on the data-plane listen port.
+        assert!(
+            candidates.iter().any(|c| c.port() == port),
+            "expected a candidate on the listen port, got {candidates:?}"
+        );
     }
 }

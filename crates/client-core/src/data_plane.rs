@@ -91,11 +91,22 @@ pub fn build_mesh_peers(private_key_b64: &str, peers: &[PeerSpec]) -> Result<Vec
 /// `transport` is a bound [`MeshTransport`] (`UdpMeshTransport`, or QUIC/MASQUE).
 /// `private_key_b64` is this device's WireGuard private key, used to build the
 /// per-peer sessions (it is never sent to the coordinator).
+///
+/// `candidates` are this device's gathered NAT-traversal candidates (host +
+/// STUN server-reflexive `ip:port`, typically from
+/// [`ferrum_transport::stun::gather_candidates`]); they are published to the
+/// coordinator after registration so permitted peers can probe them (PRD Phase
+/// 4). Pass an empty slice to skip publishing.
+// Eight parameters: each is an independent input the shell must supply (control
+// identity, keys, candidates, the OS device, the transport, shutdown). Grouping
+// them into a struct would only move the noise, so allow the lint.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_mesh_session<D, M, F>(
     client: &FerrumClient,
     coordinator: &str,
     identity: &ClientIdentity,
     private_key_b64: &str,
+    candidates: &[String],
     device: D,
     transport: M,
     shutdown: F,
@@ -111,6 +122,19 @@ where
 
     // A second channel carries live map updates into both the mesh and the facade.
     let mut control = ControlClient::connect(coordinator.to_string()).await?;
+
+    // Publish our gathered candidates (gather-then-signal, after registration) so
+    // peers learn the alternative paths to probe. Best-effort: a failure here
+    // only loses NAT-traversal candidates, not the (already-registered) tunnel.
+    if !candidates.is_empty() {
+        if let Err(e) = control
+            .publish_candidates(&identity.public_key, candidates)
+            .await
+        {
+            warn!("publishing NAT-traversal candidates failed: {e}");
+        }
+    }
+
     let mut stream = control.watch(&identity.public_key).await?;
     let (tx, rx) = mpsc::channel::<Vec<MeshPeer>>(8);
 
@@ -250,6 +274,7 @@ mod tests {
                 &url_runner,
                 &identity,
                 &priv_b64,
+                &[],
                 device,
                 transport,
                 async move {
@@ -290,6 +315,80 @@ mod tests {
             .expect("runner task panicked");
         assert!(result.is_ok(), "runner returned error: {result:?}");
         assert_eq!(client.status(), ConnectionState::Disconnected);
+    }
+
+    /// Candidates handed to `run_mesh_session` are published to the coordinator
+    /// and surface in a peer's view of this device (closing the Phase 4 M2 loop:
+    /// gather -> publish -> peer learns the path to probe).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_mesh_session_publishes_candidates_to_peers() {
+        let url = start_coordinator().await;
+
+        let me = ferrum_core::keys::KeyPair::generate();
+        let device = MockTun::default();
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let transport = UdpMeshTransport::from_socket(sock);
+
+        let client = FerrumClient::new();
+        let identity = ClientIdentity {
+            public_key: me.public_base64(),
+            name: "node-a".into(),
+            endpoint: "127.0.0.1:51820".into(),
+            tags: vec![],
+        };
+        let candidates = vec!["203.0.113.5:51820".to_string()];
+
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let runner_client = client.clone();
+        let priv_b64 = me.private_base64();
+        let url_runner = url.clone();
+        let cands = candidates.clone();
+        let handle = tokio::spawn(async move {
+            run_mesh_session(
+                &runner_client,
+                &url_runner,
+                &identity,
+                &priv_b64,
+                &cands,
+                device,
+                transport,
+                async move {
+                    let _ = stop_rx.await;
+                },
+            )
+            .await
+        });
+
+        wait_for(Duration::from_secs(5), || {
+            client.status() == ConnectionState::Connected
+        })
+        .await;
+
+        // A peer B registers and reads the network map: A's published candidate
+        // is visible on A's entry.
+        let peer = ferrum_core::keys::KeyPair::generate();
+        let mut b = ControlClient::connect(url.clone()).await.unwrap();
+        b.register(&peer.public_base64(), "node-b", "127.0.0.1:51999", &[])
+            .await
+            .unwrap();
+
+        // Poll the map until A's candidate appears (publish + broadcast are async).
+        let mut seen = vec![];
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            let peers = b.network_map(&peer.public_base64()).await.unwrap();
+            if let Some(a) = peers.iter().find(|p| p.public_key == me.public_base64()) {
+                if !a.candidates.is_empty() {
+                    seen = a.candidates.clone();
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(seen, candidates, "peer should see A's published candidate");
+
+        let _ = stop_tx.send(());
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     }
 
     /// Poll `cond` until it holds or `timeout` elapses.

@@ -61,6 +61,11 @@ enum Command {
         /// This device's reachable endpoint (`ip:port`) advertised to peers.
         #[arg(long)]
         endpoint: String,
+        /// STUN server (`ip:port`) for NAT-traversal candidate discovery. When
+        /// set, the node gathers host + server-reflexive candidates and publishes
+        /// them to the coordinator so peers can probe alternative paths (Phase 4).
+        #[arg(long)]
+        stun_server: Option<String>,
         /// Human-readable device name registered with the coordinator.
         #[arg(long, default_value = "ferrum-node")]
         name: String,
@@ -102,6 +107,7 @@ fn main() -> Result<()> {
             config,
             coordinator,
             endpoint,
+            stun_server,
             name,
             tags,
             token_file,
@@ -114,6 +120,7 @@ fn main() -> Result<()> {
                 &config,
                 &coordinator,
                 &endpoint,
+                stun_server.as_deref(),
                 &name,
                 &tags,
                 token_file.as_deref(),
@@ -269,6 +276,7 @@ async fn up_mesh(
     config_path: &str,
     coordinator: &str,
     endpoint: &str,
+    stun_server: Option<&str>,
     name: &str,
     tags: &[String],
     token_file: Option<&str>,
@@ -295,6 +303,31 @@ async fn up_mesh(
         .await
         .context("registering with coordinator")?;
     info!(%address, "registered; coordinator assigned tunnel address");
+
+    // Phase 4 M2: gather NAT-traversal candidates (host + STUN server-reflexive)
+    // and publish them so peers can probe alternative paths. Gather *before*
+    // binding the data-plane socket — STUN briefly binds the same listen port so
+    // the discovered mapping matches what peers will reach.
+    if let Some(stun) = stun_server {
+        let stun_addr: SocketAddr = stun
+            .parse()
+            .with_context(|| format!("parsing --stun-server '{stun}'"))?;
+        let candidates: Vec<String> =
+            ferrum_transport::stun::gather_candidates(config.listen_port, Some(stun_addr))
+                .await
+                .iter()
+                .map(|a| a.to_string())
+                .collect();
+        if candidates.is_empty() {
+            tracing::warn!("no NAT-traversal candidates gathered (STUN unreachable?)");
+        } else {
+            info!(?candidates, "publishing NAT-traversal candidates");
+            client
+                .publish_candidates(&public_key, &candidates)
+                .await
+                .context("publishing candidates to coordinator")?;
+        }
+    }
 
     let iface_cidr: Cidr = address
         .parse()
