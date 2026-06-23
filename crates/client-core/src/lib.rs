@@ -21,6 +21,9 @@ pub use client::{ClientEvent, ClientIdentity, ConnectionState, PeerPath, PeerSta
 #[cfg(feature = "uniffi")]
 pub mod ffi;
 
+#[cfg(feature = "data-plane")]
+pub mod data_plane;
+
 #[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();
 
@@ -42,6 +45,10 @@ pub enum Error {
     /// The coordinator returned an RPC error.
     #[error("control rpc error: {0}")]
     Rpc(#[from] tonic::Status),
+    /// A data-plane / mesh-runner failure (peer build, TUN device, or transport).
+    /// Only produced with the `data-plane` feature.
+    #[error("data plane: {0}")]
+    DataPlane(String),
 }
 
 /// One peer the device may reach, as derived from the network map.
