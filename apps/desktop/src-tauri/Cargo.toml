@@ -1,0 +1,31 @@
+[package]
+name = "vpn-desktop"
+version = "0.1.0"
+description = "Next-Gen VPN desktop shell (Tauri, Phase 5 FR4)"
+authors = ["Plasma Comp"]
+license = "MIT OR Apache-2.0"
+edition = "2021"
+rust-version = "1.77.2"
+
+# Standalone workspace: keeps the heavy Tauri/webview dependency tree out of the
+# main library workspace so its CI (clippy/test matrix) stays lean and fast.
+[workspace]
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.3" }
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+tauri = { version = "2.11.3" }
+tauri-plugin-log = "2"
+tokio = { version = "1", features = ["sync"] }
+# The shared client core (Phase 5 facade). Default features = control-plane
+# (connect/disconnect/status/peers/events); the `data-plane` runner + TUN
+# bring-up is the next increment (needs elevated privileges on Linux/macOS).
+vpn-client-core = { path = "../../../crates/client-core" }

@@ -9,6 +9,9 @@ members = [
     "crates/coordinator",
     "crates/client-core",
 ]
+# The Tauri desktop shell is its own workspace (heavy webview deps); keep it out
+# of the library workspace so this CI stays lean. See apps/desktop/.
+exclude = ["apps/desktop/src-tauri"]
 
 [workspace.package]
 version = "0.1.0"

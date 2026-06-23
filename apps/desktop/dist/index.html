@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Next-Gen VPN</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Next-Gen VPN</h1>
+        <span id="state" class="state disconnected">Disconnected</span>
+      </header>
+
+      <section class="form">
+        <label>Coordinator
+          <input id="coordinator" type="text" value="http://127.0.0.1:50051" />
+        </label>
+        <label>Device name
+          <input id="name" type="text" value="desktop" />
+        </label>
+        <label>Public key (base64)
+          <input id="public_key" type="text" placeholder="wg public key" />
+        </label>
+        <label>Advertised endpoint
+          <input id="endpoint" type="text" value="0.0.0.0:51820" />
+        </label>
+        <div class="actions">
+          <button id="connect">Connect</button>
+          <button id="disconnect" disabled>Disconnect</button>
+        </div>
+      </section>
+
+      <section>
+        <h2>Peers <span id="peer-count" class="badge">0</span></h2>
+        <ul id="peers" class="peers"><li class="empty">No peers</li></ul>
+      </section>
+
+      <section>
+        <h2>Activity</h2>
+        <ul id="log" class="log"></ul>
+      </section>
+    </main>
+    <script src="main.js"></script>
+  </body>
+</html>
