@@ -64,7 +64,9 @@ impl Transport for UdpTransport {
             for d in &datagrams[sent..] {
                 self.send(d).await?;
             }
-            return Ok(());
+            // Tail expression: on Linux this block is the function's tail (the
+            // non-Linux block is `cfg`-stripped), so no `return` is needed.
+            Ok(())
         }
         #[cfg(not(target_os = "linux"))]
         {

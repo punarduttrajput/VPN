@@ -23,7 +23,7 @@ traversal, and kernel-level scale work are the remaining frontier.
 | `vpn-cli` | `vpn` binary: `keygen`, `up` (point-to-point), `up-mesh` (coordinator mesh). |
 | `vpn-control-proto` | gRPC `Coordinator` contract (tonic/prost, vendored `protoc`). |
 | `vpn-coordinator` | Coordinator: registry, IP allocation, network map, ACL/policy, streaming, SQLite (`sqlite`), mTLS (`mtls`), OIDC (`oidc`). |
-| `vpn-client-core` | `ControlClient` (gRPC) + `VpnClient` (Phase 5 facade: connection state machine + event stream). `uniffi` feature exposes `FfiVpnClient` → generated Swift/Kotlin. `data-plane` feature adds `run_mesh_session` (ties the facade to `vpn-tunnel::run_mesh`). |
+| `vpn-client-core` | `ControlClient` (gRPC) + `VpnClient` (Phase 5 facade: connection state machine + event stream). `uniffi` feature exposes `FfiVpnClient` → generated Swift/Kotlin (incl. `run(tun_fd,…)`/`stop()` with `data-plane`). `data-plane` feature adds `run_mesh_session` (ties the facade to `vpn-tunnel::run_mesh`; consumes a `device::from_fd` TUN). |
 
 ## Build / test / lint
 
@@ -102,9 +102,10 @@ on the new environment before assuming it's still blocked.
 - **Phase 4 (~25%):** mesh data plane (UDP/QUIC/MASQUE) + crypto-demux + roaming are
   built; **ICE/STUN/TURN, DERP-style relays, path upgrade/downgrade, and the per-peer
   connection state machine are not.**
-- **Phase 5 (~20%):** shared `VpnClient` core (M1) + `uniffi` bindings (Swift/Kotlin
-  generate from `FfiVpnClient`) + data-plane glue (`run_mesh_session` ties the facade
-  to `run_mesh`); no native shells, no reliability features yet.
+- **Phase 5 (~25%):** shared `VpnClient` core (M1) + `uniffi` bindings (Swift/Kotlin
+  generate from `FfiVpnClient`) + data-plane glue (`run_mesh_session`) + the
+  TUN-from-fd FFI entry (`device::from_fd` + `FfiVpnClient::run`/`stop`); no native
+  shells, no reliability features yet.
 - **Phase 6 (~5%):** only `sendmmsg` batching; eBPF/XDP, anycast, scale not started.
 
 ## Recommended next work (highest-value, buildable in Rust)
@@ -113,8 +114,8 @@ on the new environment before assuming it's still blocked.
    (extend the gRPC streams), STUN client for server-reflexive candidates, a
    DERP-style relay keyed by public key, and the per-peer `idle→relay→connecting→
    direct` state machine with path upgrade/downgrade. All expressible in Rust.
-2. **Phase 5 — native shell or fd entry**: expose `run_mesh_session` over FFI by
-   building a `TunDevice` from a platform-provided fd (uniffi `i32` arg), then a
-   first native shell (Tauri desktop is the most testable in Rust).
+2. **Phase 5 — first native shell**: now that `FfiVpnClient::run(tun_fd,…)`/`stop()`
+   exist, build a platform shell that opens the OS TUN and calls them — Tauri desktop
+   (Linux `/dev/net/tun`) is the most testable in Rust; iOS/Android need their SDKs.
 3. **Phase 5 — reliability**: kill-switch / always-on / reconnect on the facade.
 4. **Phase 6 / NFR1**: real-hardware throughput; UDP GSO/GRO; eBPF/XDP fast path (Linux).
