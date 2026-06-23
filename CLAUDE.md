@@ -102,9 +102,12 @@ on the new environment before assuming it's still blocked.
 
 - **Phases 1–3:** functionally complete (tunnel; QUIC/MASQUE transports + migration
   + obfuscation + batch I/O; full control plane with ACL/streaming/SQLite/mTLS/OIDC).
-- **Phase 4 (~25%):** mesh data plane (UDP/QUIC/MASQUE) + crypto-demux + roaming are
-  built; **ICE/STUN/TURN, DERP-style relays, path upgrade/downgrade, and the per-peer
-  connection state machine are not.**
+- **Phase 4 (~45%):** mesh data plane (UDP/QUIC/MASQUE) + crypto-demux + roaming,
+  STUN client + coordinator candidate signaling + candidate gathering/publishing +
+  candidate probing (M1/M2), and a **DERP-style public-key-keyed relay** (`RelayServer`
+  + `RelayMeshTransport`, runnable via `ferrum relay`; M3 mechanism) are built;
+  **automatic relay fallback wiring, path upgrade/downgrade, and the per-peer
+  `idle→relay→connecting→direct` state machine are not** (the remaining M-piece).
 - **Phase 5 (~30%):** shared `FerrumClient` core (M1) + `uniffi` bindings (Swift/Kotlin
   generate from `FfiFerrumClient`) + data-plane glue (`run_mesh_session`) + the
   TUN-from-fd FFI entry (`device::from_fd` + `FfiFerrumClient::run`/`stop`) + a Tauri

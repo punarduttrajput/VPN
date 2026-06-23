@@ -34,6 +34,13 @@ struct Cli {
 enum Command {
     /// Generate a new Curve25519 keypair and print it (base64).
     Keygen,
+    /// Run a DERP-style relay server: forward mesh packets between peers keyed by
+    /// their WireGuard public key (Phase 4 fallback for peers with no direct path).
+    Relay {
+        /// Address to listen on, e.g. `0.0.0.0:51821`.
+        #[arg(long, default_value = "0.0.0.0:51821")]
+        listen: String,
+    },
     /// Bring up the tunnel from a config file and run until Ctrl-C.
     Up {
         /// Path to the TOML config file.
@@ -99,6 +106,10 @@ fn main() -> Result<()> {
             keygen();
             Ok(())
         }
+        Command::Relay { listen } => tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(relay(&listen)),
         Command::Up { config, iface, mtu } => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?
@@ -135,6 +146,24 @@ fn keygen() {
     let kp = KeyPair::generate();
     println!("private_key = \"{}\"", kp.private_base64());
     println!("public_key  = \"{}\"", kp.public_base64());
+}
+
+/// Phase 4 M3: run the public-key-keyed relay until interrupted. The relay only
+/// forwards opaque (already-encrypted) datagrams between registered peers, so it
+/// needs no keys of its own.
+async fn relay(listen: &str) -> Result<()> {
+    let addr: SocketAddr = listen
+        .parse()
+        .with_context(|| format!("parsing --listen '{listen}'"))?;
+    let server = ferrum_transport::RelayServer::bind(addr)
+        .await
+        .with_context(|| format!("binding relay on {addr}"))?;
+    info!(%addr, "relay listening (Ctrl-C to stop)");
+    tokio::select! {
+        result = server.serve() => result.context("relay server")?,
+        _ = shutdown_signal() => info!("relay stopped"),
+    }
+    Ok(())
 }
 
 /// FR1–FR3: load config, build the session + TUN device + UDP socket, run loop.

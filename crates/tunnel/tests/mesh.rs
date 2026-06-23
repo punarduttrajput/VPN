@@ -6,10 +6,12 @@ use std::time::Duration;
 
 use ferrum_core::config::Cidr;
 use ferrum_core::keys::KeyPair;
-use ferrum_transport::UdpMeshTransport;
+use ferrum_transport::{RelayMeshTransport, RelayServer, UdpMeshTransport};
 use ferrum_tunnel::device::mock::MockTun;
 use ferrum_tunnel::session::Session;
 use ferrum_tunnel::{run_mesh, MeshPeer};
+use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::oneshot;
 
@@ -766,4 +768,105 @@ async fn quic_mesh_routes_packets_to_the_right_peer() {
 
     assert_eq!(b_pkt.expect("B should receive its packet over QUIC"), to_b);
     assert_eq!(c_pkt.expect("C should receive its packet over QUIC"), to_c);
+}
+
+/// Capstone (Phase 4 M3): two nodes that know *nothing* of each other's address
+/// reach each other through a **public-key-keyed relay**. Each node connects out
+/// to the relay and addresses its peer purely by public key via an opaque
+/// endpoint handle (a non-routable loopback address that stands in for the peer).
+/// The relay forwards by key; the mesh's crypto-demux routes the inbound payload.
+/// This is the fallback path for peers with no working direct route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_connects_two_nodes_by_public_key() {
+    let (a, b) = (KeyPair::generate(), KeyPair::generate());
+
+    // The shared relay both nodes dial out to.
+    let relay = Arc::new(
+        RelayServer::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap(),
+    );
+    let relay_addr = relay.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = relay.serve().await;
+    });
+
+    // Opaque endpoint handles: stable identities for each peer, not routable
+    // (all traffic goes to the relay). Each node maps its peer's handle <-> key.
+    let handle_a: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+    let handle_b: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+
+    let trans_a = RelayMeshTransport::connect(
+        relay_addr,
+        a.public.to_bytes(),
+        &[(handle_b, b.public.to_bytes())],
+    )
+    .await
+    .unwrap();
+    let trans_b = RelayMeshTransport::connect(
+        relay_addr,
+        b.public.to_bytes(),
+        &[(handle_a, a.public.to_bytes())],
+    )
+    .await
+    .unwrap();
+
+    // A reaches B at handle_b; B reaches A at handle_a — both via the relay.
+    let a_peers = vec![MeshPeer::new(
+        Session::from_bytes(a.private.to_bytes(), b.public.to_bytes(), 1).unwrap(),
+        handle_b,
+        vec![cidr("10.8.0.2/32")],
+    )];
+    let b_peers = vec![MeshPeer::new(
+        Session::from_bytes(b.private.to_bytes(), a.public.to_bytes(), 1).unwrap(),
+        handle_a,
+        vec![cidr("10.8.0.1/32")],
+    )];
+
+    let tun_a = MockTun::default();
+    let tun_b = MockTun::default();
+    let inject_a = tun_a.to_runner.clone();
+    let recv_b = tun_b.from_runner.clone();
+
+    let (stop_a_tx, stop_a_rx) = oneshot::channel();
+    let (stop_b_tx, stop_b_rx) = oneshot::channel();
+    let (_ua_tx, ua_rx) = tokio::sync::mpsc::channel(1);
+    let (_ub_tx, ub_rx) = tokio::sync::mpsc::channel(1);
+
+    let ja = tokio::spawn(async move {
+        run_mesh(tun_a, trans_a, a_peers, ua_rx, async {
+            stop_a_rx.await.ok();
+        })
+        .await
+    });
+    let jb = tokio::spawn(async move {
+        run_mesh(tun_b, trans_b, b_peers, ub_rx, async {
+            stop_b_rx.await.ok();
+        })
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(500)).await; // handshake via relay
+
+    let to_b = ipv4([10, 8, 0, 2]);
+    inject_a.lock().unwrap().push_back(to_b.clone());
+
+    let mut b_pkt = None;
+    for _ in 0..80 {
+        b_pkt = b_pkt.or_else(|| recv_b.lock().unwrap().first().cloned());
+        if b_pkt.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let _ = stop_a_tx.send(());
+    let _ = stop_b_tx.send(());
+    let _ = ja.await;
+    let _ = jb.await;
+
+    assert_eq!(
+        b_pkt.expect("B should receive A's packet relayed by public key"),
+        to_b
+    );
 }
