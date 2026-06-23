@@ -196,11 +196,16 @@ async fn connect(
     let private_key = identity.private_key;
     let task_app = app.clone();
     tauri::async_runtime::spawn(async move {
+        // No NAT-traversal candidates yet: the GUI has no STUN-server field, so
+        // nothing is gathered/published (follow-up: a STUN input that feeds
+        // `ferrum_transport::stun::gather_candidates` here, like the CLI's
+        // `--stun-server`).
         let result = run_mesh_session(
             &client,
             &coordinator,
             &id,
             &private_key,
+            &[],
             dev,
             transport,
             async move {

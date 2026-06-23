@@ -116,7 +116,10 @@ impl FfiFerrumClient {
     /// Blocks (as an async call) for the lifetime of the tunnel; the foreign
     /// caller runs it on a background task and calls `stop` to end it.
     /// `private_key` is this device's WireGuard key (used to build peer sessions;
-    /// never sent to the coordinator). Returns when the tunnel is torn down.
+    /// never sent to the coordinator). `stun_server` (`ip:port`), when given,
+    /// enables NAT-traversal candidate gathering (host + server-reflexive) which
+    /// is published to the coordinator for peers to probe (PRD Phase 4). Returns
+    /// when the tunnel is torn down.
     pub async fn run(
         &self,
         tun_fd: i32,
@@ -124,12 +127,30 @@ impl FfiFerrumClient {
         identity: ClientIdentity,
         private_key: String,
         listen_port: u16,
+        stun_server: Option<String>,
     ) -> Result<(), Error> {
         let device =
             ferrum_tunnel::device::from_fd(tun_fd).map_err(|e| Error::DataPlane(e.to_string()))?;
         let bind: std::net::SocketAddr = format!("0.0.0.0:{listen_port}")
             .parse()
             .map_err(|e| Error::DataPlane(format!("bind address: {e}")))?;
+
+        // Gather NAT-traversal candidates *before* binding the data-plane socket
+        // (STUN briefly binds the same port). A malformed STUN address is an
+        // error; a missing one simply skips gathering.
+        let stun = match stun_server {
+            Some(s) => Some(
+                s.parse::<std::net::SocketAddr>()
+                    .map_err(|e| Error::DataPlane(format!("stun_server '{s}': {e}")))?,
+            ),
+            None => None,
+        };
+        let candidates: Vec<String> = ferrum_transport::stun::gather_candidates(listen_port, stun)
+            .await
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+
         let transport = ferrum_transport::UdpMeshTransport::bind(bind)
             .await
             .map_err(|e| Error::DataPlane(e.to_string()))?;
@@ -143,6 +164,7 @@ impl FfiFerrumClient {
             &coordinator,
             &identity,
             &private_key,
+            &candidates,
             device,
             transport,
             async move {
