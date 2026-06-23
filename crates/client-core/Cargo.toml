@@ -18,6 +18,10 @@ mtls = ["tonic/tls", "dep:rustls"]
 # `FfiVpnClient` Object so Swift/Kotlin can be generated. Off by default so the
 # regular build stays lean.
 uniffi = ["dep:uniffi"]
+# Data-plane glue (Phase 5): a `VpnClient`-driven mesh runner that ties the
+# control facade to `vpn-tunnel::run_mesh`. Pulls in the tunnel/transport/core
+# crates, so it's opt-in — control-plane-only consumers stay lean.
+data-plane = ["dep:vpn-tunnel", "dep:vpn-transport", "dep:vpn-core"]
 
 [dependencies]
 vpn-control-proto = { path = "../control-proto" }
@@ -27,6 +31,9 @@ thiserror.workspace = true
 tracing.workspace = true
 rustls = { workspace = true, optional = true }
 uniffi = { version = "0.31", features = ["tokio", "cli"], optional = true }
+vpn-tunnel = { path = "../tunnel", optional = true }
+vpn-transport = { path = "../transport", optional = true }
+vpn-core = { path = "../core", optional = true }
 
 [dev-dependencies]
 vpn-coordinator = { path = "../coordinator", features = ["mtls"] }

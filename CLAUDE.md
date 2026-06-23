@@ -23,7 +23,7 @@ traversal, and kernel-level scale work are the remaining frontier.
 | `vpn-cli` | `vpn` binary: `keygen`, `up` (point-to-point), `up-mesh` (coordinator mesh). |
 | `vpn-control-proto` | gRPC `Coordinator` contract (tonic/prost, vendored `protoc`). |
 | `vpn-coordinator` | Coordinator: registry, IP allocation, network map, ACL/policy, streaming, SQLite (`sqlite`), mTLS (`mtls`), OIDC (`oidc`). |
-| `vpn-client-core` | `ControlClient` (gRPC) + `VpnClient` (Phase 5 facade: connection state machine + event stream). `uniffi` feature exposes `FfiVpnClient` → generated Swift/Kotlin. |
+| `vpn-client-core` | `ControlClient` (gRPC) + `VpnClient` (Phase 5 facade: connection state machine + event stream). `uniffi` feature exposes `FfiVpnClient` → generated Swift/Kotlin. `data-plane` feature adds `run_mesh_session` (ties the facade to `vpn-tunnel::run_mesh`). |
 
 ## Build / test / lint
 
@@ -41,7 +41,8 @@ cargo test  --workspace --features vpn-cli/masque
 cargo test  -p vpn-coordinator --features sqlite
 cargo test  -p vpn-coordinator --features oidc
 cargo test  -p vpn-client-core -p vpn-coordinator --features vpn-coordinator/mtls,vpn-client-core/mtls
-cargo test  -p vpn-client-core --features uniffi   # FFI Object + bindings (Phase 5)
+cargo test  -p vpn-client-core --features uniffi      # FFI Object + bindings (Phase 5)
+cargo test  -p vpn-client-core --features data-plane  # VpnClient-driven mesh runner (Phase 5)
 ```
 `uniffi` bindings (Swift/Kotlin) are generated from the built cdylib — see
 [crates/client-core/bindings/README.md](crates/client-core/bindings/README.md).
@@ -101,8 +102,9 @@ on the new environment before assuming it's still blocked.
 - **Phase 4 (~25%):** mesh data plane (UDP/QUIC/MASQUE) + crypto-demux + roaming are
   built; **ICE/STUN/TURN, DERP-style relays, path upgrade/downgrade, and the per-peer
   connection state machine are not.**
-- **Phase 5 (~15%):** shared `VpnClient` core (M1) + `uniffi` bindings (Swift/Kotlin
-  generate from `FfiVpnClient`); no native shells, no reliability features yet.
+- **Phase 5 (~20%):** shared `VpnClient` core (M1) + `uniffi` bindings (Swift/Kotlin
+  generate from `FfiVpnClient`) + data-plane glue (`run_mesh_session` ties the facade
+  to `run_mesh`); no native shells, no reliability features yet.
 - **Phase 6 (~5%):** only `sendmmsg` batching; eBPF/XDP, anycast, scale not started.
 
 ## Recommended next work (highest-value, buildable in Rust)
@@ -111,8 +113,8 @@ on the new environment before assuming it's still blocked.
    (extend the gRPC streams), STUN client for server-reflexive candidates, a
    DERP-style relay keyed by public key, and the per-peer `idle→relay→connecting→
    direct` state machine with path upgrade/downgrade. All expressible in Rust.
-2. **Phase 5 — data-plane glue**: a `VpnClient`-driven mesh runner that a native
-   shell hands a TUN fd to (connect the facade to `run_mesh`).
-3. **Phase 5 — `uniffi` bindings** (now that cargo may be online): annotate the
-   `VpnClient` facade, generate Swift/Kotlin.
+2. **Phase 5 — native shell or fd entry**: expose `run_mesh_session` over FFI by
+   building a `TunDevice` from a platform-provided fd (uniffi `i32` arg), then a
+   first native shell (Tauri desktop is the most testable in Rust).
+3. **Phase 5 — reliability**: kill-switch / always-on / reconnect on the facade.
 4. **Phase 6 / NFR1**: real-hardware throughput; UDP GSO/GRO; eBPF/XDP fast path (Linux).

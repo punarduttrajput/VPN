@@ -2587,6 +2587,9 @@ dependencies = [
  "uniffi",
  "vpn-control-proto",
  "vpn-coordinator",
+ "vpn-core",
+ "vpn-transport",
+ "vpn-tunnel",
 ]
 
 [[package]]
