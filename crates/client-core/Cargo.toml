@@ -5,10 +5,19 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[lib]
+# `cdylib` so `uniffi-bindgen --library` can read the FFI metadata from the
+# built dynamic library; `lib` so the rest of the workspace links it normally.
+crate-type = ["lib", "cdylib"]
+
 [features]
 default = []
 # Mutual TLS for the coordinator channel (tonic rustls).
 mtls = ["tonic/tls", "dep:rustls"]
+# FFI bindings (Phase 5 FR1): annotate the facade for uniffi and expose the
+# `FfiVpnClient` Object so Swift/Kotlin can be generated. Off by default so the
+# regular build stays lean.
+uniffi = ["dep:uniffi"]
 
 [dependencies]
 vpn-control-proto = { path = "../control-proto" }
@@ -17,7 +26,15 @@ tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 rustls = { workspace = true, optional = true }
+uniffi = { version = "0.31", features = ["tokio", "cli"], optional = true }
 
 [dev-dependencies]
 vpn-coordinator = { path = "../coordinator", features = ["mtls"] }
 tokio-stream = { version = "0.1", features = ["net"] }
+
+# Generate foreign-language bindings:
+#   cargo run -p vpn-client-core --features uniffi --bin uniffi-bindgen -- \
+#       generate --library target/debug/<lib> --language swift  --out-dir bindings/swift
+[[bin]]
+name = "uniffi-bindgen"
+required-features = ["uniffi"]

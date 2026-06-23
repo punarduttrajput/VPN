@@ -25,6 +25,7 @@ const EVENT_CAPACITY: usize = 64;
 
 /// The connection lifecycle as shown to the UI (FR1/FR5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum ConnectionState {
     /// No tunnel; idle.
     #[default]
@@ -43,6 +44,7 @@ pub enum ConnectionState {
 /// connection-detail UI per FR5). Until live path probing lands this is
 /// best-effort: a coordinator-provided endpoint is reported as `Direct`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum PeerPath {
     /// A direct peer-to-peer path.
     Direct,
@@ -54,6 +56,7 @@ pub enum PeerPath {
 
 /// One peer as presented to the UI.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct PeerStatus {
     /// Peer's base64 public key (its identity).
     pub public_key: String,
@@ -84,17 +87,20 @@ impl PeerStatus {
 
 /// An event emitted to subscribers when the client's observable state changes.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum ClientEvent {
     /// The connection state transitioned.
     StateChanged(ConnectionState),
-    /// The peer set changed; carries the new peer count.
-    PeersUpdated(usize),
+    /// The peer set changed; carries the new peer count. (`u32`, not `usize`, so
+    /// the type crosses the FFI boundary.)
+    PeersUpdated(u32),
     /// A non-fatal or fatal error occurred; carries a human-readable reason.
     Error(String),
 }
 
 /// Identity + registration details a client presents to the coordinator.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ClientIdentity {
     /// This device's base64 public key.
     pub public_key: String,
@@ -217,7 +223,7 @@ impl VpnClient {
             inner.address = Some(plan.address);
             inner.peers = peers;
         }
-        self.emit(ClientEvent::PeersUpdated(count));
+        self.emit(ClientEvent::PeersUpdated(count as u32));
         Ok(())
     }
 
@@ -238,7 +244,7 @@ impl VpnClient {
         let peers: Vec<PeerStatus> = specs.into_iter().map(PeerStatus::from_spec).collect();
         let count = peers.len();
         self.inner.lock().expect("client mutex poisoned").peers = peers;
-        self.emit(ClientEvent::PeersUpdated(count));
+        self.emit(ClientEvent::PeersUpdated(count as u32));
     }
 
     /// Set the connection state and broadcast the transition (idempotent: a

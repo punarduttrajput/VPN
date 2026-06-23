@@ -23,7 +23,7 @@ traversal, and kernel-level scale work are the remaining frontier.
 | `vpn-cli` | `vpn` binary: `keygen`, `up` (point-to-point), `up-mesh` (coordinator mesh). |
 | `vpn-control-proto` | gRPC `Coordinator` contract (tonic/prost, vendored `protoc`). |
 | `vpn-coordinator` | Coordinator: registry, IP allocation, network map, ACL/policy, streaming, SQLite (`sqlite`), mTLS (`mtls`), OIDC (`oidc`). |
-| `vpn-client-core` | `ControlClient` (gRPC) + `VpnClient` (Phase 5 facade: connection state machine + event stream). |
+| `vpn-client-core` | `ControlClient` (gRPC) + `VpnClient` (Phase 5 facade: connection state machine + event stream). `uniffi` feature exposes `FfiVpnClient` → generated Swift/Kotlin. |
 
 ## Build / test / lint
 
@@ -41,7 +41,10 @@ cargo test  --workspace --features vpn-cli/masque
 cargo test  -p vpn-coordinator --features sqlite
 cargo test  -p vpn-coordinator --features oidc
 cargo test  -p vpn-client-core -p vpn-coordinator --features vpn-coordinator/mtls,vpn-client-core/mtls
+cargo test  -p vpn-client-core --features uniffi   # FFI Object + bindings (Phase 5)
 ```
+`uniffi` bindings (Swift/Kotlin) are generated from the built cdylib — see
+[crates/client-core/bindings/README.md](crates/client-core/bindings/README.md).
 Real-device/throughput checks live in [scripts/verify-linux.sh](scripts/verify-linux.sh)
 (root + iproute2 + iperf3; runs both peers in netns). Opt-in env flags:
 `TEST_QUIC=1`, `TEST_MESH=1`, `MESH_QUIC=1`, `STRICT_THROUGHPUT=1`.
@@ -98,8 +101,8 @@ on the new environment before assuming it's still blocked.
 - **Phase 4 (~25%):** mesh data plane (UDP/QUIC/MASQUE) + crypto-demux + roaming are
   built; **ICE/STUN/TURN, DERP-style relays, path upgrade/downgrade, and the per-peer
   connection state machine are not.**
-- **Phase 5 (~10%):** shared `VpnClient` core (M1) only; no `uniffi` bindings, no
-  native shells, no reliability features.
+- **Phase 5 (~15%):** shared `VpnClient` core (M1) + `uniffi` bindings (Swift/Kotlin
+  generate from `FfiVpnClient`); no native shells, no reliability features yet.
 - **Phase 6 (~5%):** only `sendmmsg` batching; eBPF/XDP, anycast, scale not started.
 
 ## Recommended next work (highest-value, buildable in Rust)
