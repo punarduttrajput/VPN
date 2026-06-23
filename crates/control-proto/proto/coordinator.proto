@@ -12,8 +12,14 @@ service Coordinator {
   // Return the set of peers this device may currently reach.
   rpc GetNetworkMap(NetworkMapRequest) returns (NetworkMapResponse);
   // Stream the network map: the current map immediately, then a fresh map
-  // whenever the network changes (a device registers / updates).
+  // whenever the network changes (a device registers / updates / publishes
+  // candidates).
   rpc WatchNetworkMap(NetworkMapRequest) returns (stream NetworkMapResponse);
+  // Publish this device's ICE candidates (host + STUN server-reflexive
+  // ip:port strings) for NAT traversal (PRD Phase 4 FR1/FR5). Candidates are
+  // distributed to permitted peers via the network map; republishing replaces
+  // the set and pushes a fresh map to watchers.
+  rpc PublishCandidates(PublishCandidatesRequest) returns (PublishCandidatesResponse);
 }
 
 message RegisterDeviceRequest {
@@ -35,8 +41,16 @@ message PeerInfo {
   string public_key = 1;
   string endpoint = 2;            // "ip:port"
   repeated string allowed_ips = 3; // CIDRs routed to this peer
+  repeated string candidates = 4;  // ICE candidates (host + reflexive "ip:port")
 }
 
 message NetworkMapResponse {
   repeated PeerInfo peers = 1;
 }
+
+message PublishCandidatesRequest {
+  string public_key = 1;          // the publishing device
+  repeated string candidates = 2; // ICE candidate "ip:port" strings
+}
+
+message PublishCandidatesResponse {}

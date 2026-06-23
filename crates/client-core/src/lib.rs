@@ -30,9 +30,21 @@ pub mod data_plane;
 uniffi::setup_scaffolding!();
 
 use ferrum_control_proto::coordinator::coordinator_client::CoordinatorClient;
-use ferrum_control_proto::coordinator::{NetworkMapRequest, RegisterDeviceRequest};
+use ferrum_control_proto::coordinator::{
+    NetworkMapRequest, PeerInfo, PublishCandidatesRequest, RegisterDeviceRequest,
+};
 use thiserror::Error;
 use tonic::transport::Channel;
+
+/// Convert a coordinator [`PeerInfo`] into the crate's [`PeerSpec`].
+fn peer_spec_from_info(p: PeerInfo) -> PeerSpec {
+    PeerSpec {
+        public_key: p.public_key,
+        endpoint: p.endpoint,
+        allowed_ips: p.allowed_ips,
+        candidates: p.candidates,
+    }
+}
 
 /// Errors talking to the coordinator.
 ///
@@ -63,6 +75,9 @@ pub struct PeerSpec {
     pub endpoint: String,
     /// CIDRs routed to this peer.
     pub allowed_ips: Vec<String>,
+    /// Peer's published ICE candidates (host + STUN reflexive `ip:port`), for
+    /// NAT traversal (PRD Phase 4). Empty until the peer publishes them.
+    pub candidates: Vec<String>,
 }
 
 /// The tunnel configuration derived from the control plane for this device.
@@ -162,15 +177,24 @@ impl ControlClient {
             public_key: public_key.to_string(),
         });
         let resp = self.inner.get_network_map(req).await?.into_inner();
-        Ok(resp
-            .peers
-            .into_iter()
-            .map(|p| PeerSpec {
-                public_key: p.public_key,
-                endpoint: p.endpoint,
-                allowed_ips: p.allowed_ips,
-            })
-            .collect())
+        Ok(resp.peers.into_iter().map(peer_spec_from_info).collect())
+    }
+
+    /// Publish this device's ICE candidates (host + STUN server-reflexive
+    /// `ip:port` strings) so permitted peers can learn how to reach it for NAT
+    /// traversal (PRD Phase 4). The device must already be registered;
+    /// republishing replaces the previously published set.
+    pub async fn publish_candidates(
+        &mut self,
+        public_key: &str,
+        candidates: &[String],
+    ) -> Result<(), Error> {
+        let req = self.request(PublishCandidatesRequest {
+            public_key: public_key.to_string(),
+            candidates: candidates.to_vec(),
+        });
+        self.inner.publish_candidates(req).await?;
+        Ok(())
     }
 
     /// Register then fetch the map, returning a ready-to-apply [`TunnelPlan`].
@@ -207,14 +231,7 @@ impl NetworkMapStream {
     pub async fn next(&mut self) -> Result<Option<Vec<PeerSpec>>, Error> {
         match self.inner.message().await? {
             Some(resp) => Ok(Some(
-                resp.peers
-                    .into_iter()
-                    .map(|p| PeerSpec {
-                        public_key: p.public_key,
-                        endpoint: p.endpoint,
-                        allowed_ips: p.allowed_ips,
-                    })
-                    .collect(),
+                resp.peers.into_iter().map(peer_spec_from_info).collect(),
             )),
             None => Ok(None),
         }
@@ -303,6 +320,57 @@ mod tests {
         assert_eq!(update.len(), 1);
         assert_eq!(update[0].public_key, "BBB");
         assert_eq!(update[0].endpoint, "2.2.2.2:51820");
+    }
+
+    /// A device's published ICE candidates reach a peer through the network map,
+    /// and a live `watch` stream is pushed when they are published.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn published_candidates_reach_a_peer() {
+        use std::time::Duration;
+
+        let url = start_coordinator().await;
+        let mut a = ControlClient::connect(url.clone()).await.unwrap();
+        let mut b = ControlClient::connect(url).await.unwrap();
+
+        a.register("AAA", "laptop", "1.1.1.1:51820", &[])
+            .await
+            .unwrap();
+        b.register("BBB", "gateway", "2.2.2.2:51820", &[])
+            .await
+            .unwrap();
+
+        // B watches; the initial map shows A with no candidates yet.
+        let mut stream = b.watch("BBB").await.unwrap();
+        let initial = stream.next().await.unwrap().unwrap();
+        assert_eq!(initial.len(), 1);
+        assert!(initial[0].candidates.is_empty());
+
+        // A publishes its host + reflexive candidates.
+        let cands = vec!["1.1.1.1:51820".to_string(), "203.0.113.5:7777".to_string()];
+        a.publish_candidates("AAA", &cands).await.unwrap();
+
+        // The publish pushes a fresh map to B; A now carries the candidates.
+        let update = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("watch update timed out")
+            .unwrap()
+            .unwrap();
+        assert_eq!(update.len(), 1);
+        assert_eq!(update[0].public_key, "AAA");
+        assert_eq!(update[0].candidates, cands);
+
+        // A one-shot map fetch reflects them too.
+        let map = b.network_map("BBB").await.unwrap();
+        assert_eq!(map[0].candidates, cands);
+    }
+
+    /// Publishing candidates for a device that never registered is rejected.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn publish_candidates_for_unknown_device_is_rejected() {
+        let url = start_coordinator().await;
+        let mut c = ControlClient::connect(url).await.unwrap();
+        let err = c.publish_candidates("ghost", &["1.1.1.1:1".into()]).await;
+        assert!(err.is_err(), "unregistered device must be rejected");
     }
 
     #[cfg(feature = "mtls")]

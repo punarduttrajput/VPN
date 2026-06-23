@@ -5,7 +5,8 @@ use std::sync::{Arc, Mutex};
 
 use ferrum_control_proto::coordinator::coordinator_server::Coordinator;
 use ferrum_control_proto::coordinator::{
-    NetworkMapRequest, NetworkMapResponse, PeerInfo, RegisterDeviceRequest, RegisterDeviceResponse,
+    NetworkMapRequest, NetworkMapResponse, PeerInfo, PublishCandidatesRequest,
+    PublishCandidatesResponse, RegisterDeviceRequest, RegisterDeviceResponse,
 };
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
@@ -24,6 +25,7 @@ fn current_map(registry: &Arc<Mutex<Registry>>, public_key: &str) -> NetworkMapR
             public_key: d.public_key,
             endpoint: d.endpoint,
             allowed_ips: vec![format!("{}/32", d.tunnel_ip)],
+            candidates: d.candidates,
         })
         .collect();
     NetworkMapResponse { peers }
@@ -190,6 +192,23 @@ impl Coordinator for CoordinatorService {
         });
 
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
+
+    async fn publish_candidates(
+        &self,
+        request: Request<PublishCandidatesRequest>,
+    ) -> Result<Response<PublishCandidatesResponse>, Status> {
+        self.authenticate(&request)?;
+        let req = request.into_inner();
+        {
+            let mut reg = self.registry.lock().expect("registry mutex poisoned");
+            reg.set_candidates(&req.public_key, &req.candidates)
+                .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        }
+        // New candidates change the map; push a fresh one to all watchers so
+        // peers learn how to reach this device (PRD Phase 4 FR5).
+        let _ = self.changes.send(());
+        Ok(Response::new(PublishCandidatesResponse {}))
     }
 }
 

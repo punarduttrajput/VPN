@@ -543,6 +543,7 @@ mod tests {
             public_key: public_key.to_string(),
             endpoint: endpoint.to_string(),
             allowed_ips: allowed.iter().map(|s| s.to_string()).collect(),
+            candidates: vec![],
         }
     }
 
