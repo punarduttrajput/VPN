@@ -21,7 +21,7 @@
 //! (`verify-linux.sh TEST_MESH=1`, `MESH_QUIC=1` for QUIC).
 
 use std::net::{IpAddr, SocketAddr};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ferrum_core::config::Cidr;
 use ferrum_transport::MeshTransport;
@@ -29,6 +29,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::device::TunDevice;
+use crate::path::PathMachine;
 use crate::session::{Action, Session, MAX_PACKET};
 use crate::Result;
 
@@ -124,16 +125,19 @@ fn probe_targets(peer: &MeshPeer, confirmed: bool) -> Vec<SocketAddr> {
 }
 
 /// Kick off a fresh handshake to every peer, fanning each across its candidate
-/// addresses (none are confirmed yet at this point).
+/// addresses, and move each peer's path machine into the probing state.
 async fn handshake_all<M: MeshTransport>(
     transport: &M,
     peers: &mut [MeshPeer],
-    confirmed: &[bool],
+    paths: &mut [PathMachine],
     out: &mut [u8],
 ) -> Result<()> {
     for (i, peer) in peers.iter_mut().enumerate() {
+        paths[i].begin_probing();
         if let Action::SendToPeer(pkt) = peer.session.start_handshake(out)? {
-            for target in probe_targets(peer, confirmed[i]) {
+            // Probe candidates until a direct path is confirmed.
+            let direct = paths[i].path() == crate::path::Path::Direct;
+            for target in probe_targets(peer, direct) {
                 transport.send_to(target, pkt).await?;
             }
         }
@@ -168,14 +172,15 @@ where
 {
     let mut out = vec![0u8; MAX_PACKET];
 
-    // Per-peer "has a working path been confirmed?" flag, parallel to `peers`.
-    // A path is confirmed once an inbound datagram decrypts for that peer; until
-    // then handshakes fan out across all of its candidates (M2 connectivity
-    // check). Rebuilt whenever the peer set is replaced.
-    let mut confirmed = vec![false; peers.len()];
+    // Per-peer NAT-traversal path state (`idle → connecting → relay → direct`),
+    // parallel to `peers`. A direct path is confirmed once an inbound datagram
+    // decrypts for that peer; until then handshakes fan out across its candidates
+    // (M2 connectivity check). If a confirmed path later goes stale the machine
+    // downgrades and we resume probing. Rebuilt whenever the peer set is replaced.
+    let mut paths = vec![PathMachine::new(); peers.len()];
 
     // Kick off a handshake to every peer we start with.
-    handshake_all(&transport, &mut peers, &confirmed, &mut out).await?;
+    handshake_all(&transport, &mut peers, &mut paths, &mut out).await?;
 
     let mut tun_buf = vec![0u8; MAX_PACKET];
     let mut net_buf = vec![0u8; MAX_PACKET];
@@ -198,9 +203,9 @@ where
                     Some(next) => {
                         info!(peers = next.len(), "applying updated network map");
                         peers = next;
-                        // New sessions: no confirmed paths yet, so probe candidates.
-                        confirmed = vec![false; peers.len()];
-                        handshake_all(&transport, &mut peers, &confirmed, &mut out).await?;
+                        // New sessions: fresh path machines, so probe candidates.
+                        paths = vec![PathMachine::new(); peers.len()];
+                        handshake_all(&transport, &mut peers, &mut paths, &mut out).await?;
                     }
                     // Sender dropped: stop polling this branch, keep current peers.
                     None => updates_open = false,
@@ -239,9 +244,13 @@ where
                         // Not this peer's datagram — try the next session.
                         Err(_) => continue,
                     };
-                    // A datagram decrypted for this peer: its path is now
-                    // confirmed, so stop fanning handshakes across candidates.
-                    confirmed[i] = true;
+                    // A datagram decrypted for this peer: the path it arrived on
+                    // works, so confirm/refresh it (and stop fanning handshakes
+                    // across candidates). Single transport today, so this is the
+                    // direct path; the relay underlay is a separate inbound source.
+                    if let Some(t) = paths[i].on_direct_packet(Instant::now()) {
+                        debug!(peer = i, transition = ?t, "peer path state changed");
+                    }
                     // Endpoint roaming: the datagram authenticated against this
                     // peer's session, so `src` is the peer's current reachable
                     // path. Trust it for future sends (the peer is behind a NAT
@@ -266,14 +275,31 @@ where
                 }
             }
 
-            // Timers: service each peer's handshake/keepalive. A handshake
-            // retransmit for an unconfirmed peer re-probes all its candidates,
-            // so a path can come up even if it wasn't reachable on the first try.
+            // Timers: age each peer's path state and service its WireGuard
+            // handshake/keepalive. A handshake retransmit for a peer without a
+            // confirmed direct path re-probes all its candidates, so a path can
+            // come up even if it wasn't reachable on the first try.
             _ = timer.tick() => {
+                let now = Instant::now();
                 for (i, peer) in peers.iter_mut().enumerate() {
+                    // Downgrade a confirmed path that has gone stale (peer roamed,
+                    // NAT mapping expired) and immediately re-probe its candidates,
+                    // rather than black-holing on a dead endpoint.
+                    if let Some(t) = paths[i].tick(now) {
+                        info!(peer = i, transition = ?t, "peer path state changed");
+                        if t.should_resume_probing() {
+                            if let Action::SendToPeer(pkt) = peer.session.start_handshake(&mut out)? {
+                                for target in probe_targets(peer, false) {
+                                    transport.send_to(target, pkt).await?;
+                                }
+                            }
+                            continue; // already sent a probe this tick
+                        }
+                    }
                     match peer.session.update_timers(&mut out) {
                         Ok(Action::SendToPeer(pkt)) => {
-                            for target in probe_targets(peer, confirmed[i]) {
+                            let direct = paths[i].path() == crate::path::Path::Direct;
+                            for target in probe_targets(peer, direct) {
                                 transport.send_to(target, pkt).await?;
                             }
                         }

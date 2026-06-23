@@ -4,11 +4,13 @@
 
 pub mod device;
 pub mod mesh;
+pub mod path;
 pub mod session;
 
 mod runner;
 
 pub use mesh::{run_mesh, MeshPeer};
+pub use path::{Path, PathMachine, PathState};
 pub use runner::{run, RunHandle};
 
 use thiserror::Error;
