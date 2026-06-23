@@ -22,6 +22,9 @@ pub enum RegistryError {
     /// No tunnel addresses remain in the pool.
     #[error("tunnel address pool exhausted")]
     PoolExhausted,
+    /// An operation referenced a device that is not registered.
+    #[error("device not registered")]
+    UnknownDevice,
     /// The persistence backend failed.
     #[error("persistence error: {0}")]
     Store(String),
@@ -40,6 +43,10 @@ pub struct Device {
     pub tunnel_ip: Ipv4Addr,
     /// Tags used for ACL/policy matching.
     pub tags: Vec<String>,
+    /// ICE candidates this device has published (host + STUN reflexive
+    /// `ip:port` strings), distributed to permitted peers for NAT traversal
+    /// (PRD Phase 4). Empty until the device calls `set_candidates`.
+    pub candidates: Vec<String>,
 }
 
 /// Registry of devices and their assigned tunnel addresses.
@@ -123,6 +130,9 @@ impl Registry {
                 endpoint: endpoint.to_string(),
                 tunnel_ip: ip,
                 tags: tags.to_vec(),
+                // Candidates are published separately (after STUN), via
+                // `set_candidates`; a fresh registration starts with none.
+                candidates: Vec::new(),
             };
             self.by_key.insert(public_key.to_string(), device.clone());
             device
@@ -131,6 +141,31 @@ impl Registry {
             .upsert(&device)
             .map_err(|e| RegistryError::Store(e.to_string()))?;
         Ok(device.tunnel_ip)
+    }
+
+    /// Replace a registered device's published ICE candidates (PRD Phase 4).
+    ///
+    /// Called when a device has gathered its candidates (host + STUN
+    /// server-reflexive) and wants peers to learn them. The device must already
+    /// be registered. Re-registering does **not** clear candidates, so a device
+    /// can register once and publish/refresh candidates independently.
+    pub fn set_candidates(
+        &mut self,
+        public_key: &str,
+        candidates: &[String],
+    ) -> Result<(), RegistryError> {
+        let device = {
+            let device = self
+                .by_key
+                .get_mut(public_key)
+                .ok_or(RegistryError::UnknownDevice)?;
+            device.candidates = candidates.to_vec();
+            device.clone()
+        };
+        self.store
+            .upsert(&device)
+            .map_err(|e| RegistryError::Store(e.to_string()))?;
+        Ok(())
     }
 
     /// Allocate the next free host address in the pool (excludes network,
@@ -230,6 +265,35 @@ mod tests {
         let map = r.network_map("a");
         assert_eq!(map.len(), 1);
         assert_eq!(map[0].public_key, "b");
+    }
+
+    #[test]
+    fn set_candidates_updates_device_and_survives_reregister() {
+        let mut r = registry();
+        r.register("a", "A", "1.1.1.1:51820", &[]).unwrap();
+        r.set_candidates("a", &["1.1.1.1:51820".into(), "203.0.113.5:7777".into()])
+            .unwrap();
+
+        // A peer's view of "a" now carries the published candidates.
+        let map = r.network_map("b");
+        assert_eq!(map.len(), 1);
+        assert_eq!(
+            map[0].candidates,
+            vec!["1.1.1.1:51820".to_string(), "203.0.113.5:7777".to_string()]
+        );
+
+        // Re-registering refreshes metadata but does not wipe candidates.
+        r.register("a", "A", "9.9.9.9:51820", &[]).unwrap();
+        assert_eq!(r.network_map("b")[0].candidates.len(), 2);
+    }
+
+    #[test]
+    fn set_candidates_rejects_unknown_device() {
+        let mut r = registry();
+        assert_eq!(
+            r.set_candidates("ghost", &["1.1.1.1:1".into()]),
+            Err(RegistryError::UnknownDevice)
+        );
     }
 
     #[test]

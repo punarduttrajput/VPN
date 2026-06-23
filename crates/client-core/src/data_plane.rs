@@ -182,6 +182,7 @@ mod tests {
             public_key: peer.public_base64(),
             endpoint: "not-an-addr".into(),
             allowed_ips: vec!["10.8.0.3/32".into()],
+            candidates: vec![],
         }];
         let result = build_mesh_peers(&me.private_base64(), &specs);
         assert!(matches!(result, Err(Error::DataPlane(_))));
@@ -197,11 +198,13 @@ mod tests {
                 public_key: p1.public_base64(),
                 endpoint: "127.0.0.1:51820".into(),
                 allowed_ips: vec!["10.8.0.3/32".into()],
+                candidates: vec![],
             },
             PeerSpec {
                 public_key: p2.public_base64(),
                 endpoint: "127.0.0.1:51821".into(),
                 allowed_ips: vec!["10.8.0.4/32".into()],
+                candidates: vec![],
             },
         ];
         let peers = build_mesh_peers(&me.private_base64(), &specs).unwrap();

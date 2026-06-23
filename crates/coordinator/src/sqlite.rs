@@ -30,10 +30,22 @@ impl SqliteStore {
                  name       TEXT NOT NULL,
                  endpoint   TEXT NOT NULL,
                  tunnel_ip  TEXT NOT NULL,
-                 tags       TEXT NOT NULL
+                 tags       TEXT NOT NULL,
+                 candidates TEXT NOT NULL DEFAULT '[]'
              );",
         )
         .map_err(backend)?;
+        // Migrate databases created before the candidates column existed. A
+        // duplicate-column error just means the schema is already current.
+        if let Err(e) = conn.execute(
+            "ALTER TABLE devices ADD COLUMN candidates TEXT NOT NULL DEFAULT '[]'",
+            [],
+        ) {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(backend(e));
+            }
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -50,7 +62,7 @@ impl Store for SqliteStore {
     fn load_all(&self) -> Result<Vec<Device>, StoreError> {
         let conn = self.conn.lock().expect("sqlite mutex poisoned");
         let mut stmt = conn
-            .prepare("SELECT public_key, name, endpoint, tunnel_ip, tags FROM devices")
+            .prepare("SELECT public_key, name, endpoint, tunnel_ip, tags, candidates FROM devices")
             .map_err(backend)?;
         let rows = stmt
             .query_map([], |row| {
@@ -60,23 +72,28 @@ impl Store for SqliteStore {
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
                 ))
             })
             .map_err(backend)?;
 
         let mut devices = Vec::new();
         for row in rows {
-            let (public_key, name, endpoint, ip_str, tags_json) = row.map_err(backend)?;
+            let (public_key, name, endpoint, ip_str, tags_json, candidates_json) =
+                row.map_err(backend)?;
             let tunnel_ip: Ipv4Addr = ip_str
                 .parse()
                 .map_err(|e| StoreError::Backend(format!("bad tunnel_ip '{ip_str}': {e}")))?;
             let tags: Vec<String> = serde_json::from_str(&tags_json).map_err(backend)?;
+            let candidates: Vec<String> =
+                serde_json::from_str(&candidates_json).map_err(backend)?;
             devices.push(Device {
                 public_key,
                 name,
                 endpoint,
                 tunnel_ip,
                 tags,
+                candidates,
             });
         }
         Ok(devices)
@@ -84,18 +101,20 @@ impl Store for SqliteStore {
 
     fn upsert(&self, device: &Device) -> Result<(), StoreError> {
         let tags = serde_json::to_string(&device.tags).map_err(backend)?;
+        let candidates = serde_json::to_string(&device.candidates).map_err(backend)?;
         let conn = self.conn.lock().expect("sqlite mutex poisoned");
         conn.execute(
-            "INSERT INTO devices (public_key, name, endpoint, tunnel_ip, tags)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO devices (public_key, name, endpoint, tunnel_ip, tags, candidates)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(public_key) DO UPDATE SET
-                 name = ?2, endpoint = ?3, tunnel_ip = ?4, tags = ?5",
+                 name = ?2, endpoint = ?3, tunnel_ip = ?4, tags = ?5, candidates = ?6",
             params![
                 device.public_key,
                 device.name,
                 device.endpoint,
                 device.tunnel_ip.to_string(),
-                tags
+                tags,
+                candidates
             ],
         )
         .map_err(backend)?;
@@ -114,6 +133,7 @@ mod tests {
             endpoint: "1.2.3.4:51820".to_string(),
             tunnel_ip: Ipv4Addr::from(ip),
             tags: tags.iter().map(|t| t.to_string()).collect(),
+            candidates: Vec::new(),
         }
     }
 
@@ -137,6 +157,17 @@ mod tests {
         assert_eq!(loaded[0].public_key, "AAA");
         assert_eq!(loaded[0].tags, vec!["dev".to_string(), "admin".to_string()]);
         assert_eq!(loaded[1].tunnel_ip, Ipv4Addr::new(10, 8, 0, 3));
+    }
+
+    #[test]
+    fn candidates_roundtrip_through_the_store() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut d = device("AAA", [10, 8, 0, 2], &["dev"]);
+        d.candidates = vec!["1.1.1.1:51820".into(), "203.0.113.9:7777".into()];
+        store.upsert(&d).unwrap();
+        let loaded = store.load_all().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].candidates, d.candidates);
     }
 
     #[test]
