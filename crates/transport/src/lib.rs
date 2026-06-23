@@ -26,6 +26,8 @@ pub use pad::PaddedTransport;
 pub mod udp;
 pub use udp::{UdpMeshTransport, UdpTransport};
 
+pub mod stun;
+
 #[cfg(feature = "quic")]
 pub mod quic;
 #[cfg(feature = "quic")]
