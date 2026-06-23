@@ -117,6 +117,161 @@ impl TunDevice for NoopTun {
     }
 }
 
+/// Wrap a platform-provided TUN file descriptor (Phase 5).
+///
+/// Native VPN shells (iOS `NEPacketTunnelProvider`, Android `VpnService`) don't
+/// open `/dev/net/tun` themselves — the OS hands them an already-configured fd.
+/// [`from_fd`] adopts that fd and does readiness-based async I/O on it directly
+/// (the `tun` crate ignores a supplied fd on Linux, and no address/MTU setup is
+/// needed — the platform already did it). Takes ownership: the fd is closed on
+/// drop.
+#[cfg(unix)]
+pub fn from_fd(fd: std::os::unix::io::RawFd) -> Result<impl TunDevice> {
+    fd_device::FdTun::from_raw_fd(fd)
+}
+
+/// Stub on non-Unix: there is no fd-based TUN.
+#[cfg(not(unix))]
+pub fn from_fd(_fd: i32) -> Result<NoopTun> {
+    Err(crate::TunnelError::UnsupportedPlatform)
+}
+
+#[cfg(unix)]
+mod fd_device {
+    use std::io;
+    use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+
+    use tokio::io::unix::AsyncFd;
+
+    use super::TunDevice;
+    use crate::Result;
+
+    /// A [`TunDevice`] backed by a raw, OS-provided fd.
+    pub struct FdTun {
+        inner: AsyncFd<OwnedFd>,
+    }
+
+    impl FdTun {
+        /// Adopt `fd` (must be a valid, open TUN fd) and prepare it for async I/O.
+        pub fn from_raw_fd(fd: RawFd) -> Result<Self> {
+            if fd < 0 {
+                return Err(crate::TunnelError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid TUN file descriptor",
+                )));
+            }
+            set_nonblocking(fd)?;
+            // SAFETY: the caller transfers ownership of a valid, open fd; the
+            // resulting `OwnedFd` closes it on drop.
+            let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+            Ok(Self {
+                inner: AsyncFd::new(owned)?,
+            })
+        }
+    }
+
+    impl TunDevice for FdTun {
+        async fn read_packet(&mut self, buf: &mut [u8]) -> Result<usize> {
+            loop {
+                let mut guard = self.inner.readable().await?;
+                match guard.try_io(|fd| {
+                    // SAFETY: read up to `buf.len()` bytes into `buf` from a fd the
+                    // reactor reports readable; returns the count or -1 + errno.
+                    let n = unsafe {
+                        libc::read(fd.get_ref().as_raw_fd(), buf.as_mut_ptr().cast(), buf.len())
+                    };
+                    if n < 0 {
+                        Err(io::Error::last_os_error())
+                    } else {
+                        Ok(n as usize)
+                    }
+                }) {
+                    Ok(result) => return result.map_err(Into::into),
+                    Err(_would_block) => continue,
+                }
+            }
+        }
+
+        async fn write_packet(&mut self, packet: &[u8]) -> Result<()> {
+            loop {
+                let mut guard = self.inner.writable().await?;
+                match guard.try_io(|fd| {
+                    // SAFETY: write `packet.len()` bytes from `packet` to a fd the
+                    // reactor reports writable; returns the count or -1 + errno.
+                    let n = unsafe {
+                        libc::write(
+                            fd.get_ref().as_raw_fd(),
+                            packet.as_ptr().cast(),
+                            packet.len(),
+                        )
+                    };
+                    if n < 0 {
+                        Err(io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                }) {
+                    Ok(result) => return result.map_err(Into::into),
+                    Err(_would_block) => continue,
+                }
+            }
+        }
+    }
+
+    /// Put `fd` into non-blocking mode so `AsyncFd` can drive it.
+    fn set_nonblocking(fd: RawFd) -> io::Result<()> {
+        // SAFETY: F_GETFL/F_SETFL on a valid fd only read/modify status flags.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A socketpair gives two connected fds that behave enough like a TUN
+        /// (readiness-driven, bidirectional) to exercise the `AsyncFd` I/O path
+        /// without `/dev/net/tun` or root.
+        #[tokio::test]
+        async fn fd_tun_reads_and_writes_over_socketpair() {
+            let mut fds = [0 as RawFd; 2];
+            // SAFETY: socketpair fills the 2-element array with connected fds.
+            let rc =
+                unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+            assert_eq!(rc, 0, "socketpair failed");
+            let (ours, peer) = (fds[0], fds[1]);
+
+            let mut tun = FdTun::from_raw_fd(ours).unwrap();
+
+            // Peer writes a "packet"; FdTun reads it.
+            let payload = b"hello-tun";
+            // SAFETY: write `payload` to the peer fd.
+            let n = unsafe { libc::write(peer, payload.as_ptr().cast(), payload.len()) };
+            assert_eq!(n, payload.len() as isize);
+            let mut buf = [0u8; 64];
+            let got = tun.read_packet(&mut buf).await.unwrap();
+            assert_eq!(&buf[..got], payload);
+
+            // FdTun writes a "packet"; peer reads it.
+            tun.write_packet(b"from-tun").await.unwrap();
+            let mut rbuf = [0u8; 64];
+            // SAFETY: read from the peer fd into `rbuf`.
+            let m = unsafe { libc::read(peer, rbuf.as_mut_ptr().cast(), rbuf.len()) };
+            assert!(m > 0);
+            assert_eq!(&rbuf[..m as usize], b"from-tun");
+
+            // SAFETY: close the peer fd (FdTun owns and closes `ours`).
+            unsafe { libc::close(peer) };
+        }
+    }
+}
+
 pub mod mock {
     //! An in-memory TUN device for tests: packets written by the runner are
     //! captured, and packets to deliver to the runner are queued.

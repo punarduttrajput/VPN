@@ -27,6 +27,11 @@ thiserror.workspace = true
 # which is intended for Unix (Phase 1 scope: Linux + macOS).
 tun = { version = "0.6", features = ["async"], optional = true }
 
+# Raw fd I/O for `device::from_fd` (a platform-provided TUN fd, Phase 5). Unix
+# only; needs no driver, so it's not behind `real-tun`.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 vpn-transport = { path = "../transport" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }

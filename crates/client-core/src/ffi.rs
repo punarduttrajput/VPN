@@ -30,6 +30,10 @@ pub struct FfiVpnClient {
     /// Dedicated receiver backing `next_event`; a `Mutex` because uniffi methods
     /// take `&self` and `broadcast::Receiver::recv` needs `&mut`.
     events: Mutex<broadcast::Receiver<ClientEvent>>,
+    /// Shutdown trigger for a running [`run`](FfiVpnClient::run); `stop` takes and
+    /// fires it. `std::sync::Mutex` (never held across an await).
+    #[cfg(feature = "data-plane")]
+    shutdown: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -39,7 +43,12 @@ impl FfiVpnClient {
     pub fn new() -> Arc<Self> {
         let inner = VpnClient::new();
         let events = Mutex::new(inner.subscribe());
-        Arc::new(Self { inner, events })
+        Arc::new(Self {
+            inner,
+            events,
+            #[cfg(feature = "data-plane")]
+            shutdown: std::sync::Mutex::new(None),
+        })
     }
 
     /// Connect: register with the coordinator at `coordinator` (e.g.
@@ -89,6 +98,68 @@ impl FfiVpnClient {
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => return None,
             }
+        }
+    }
+}
+
+/// Data-plane entry points (the `data-plane` feature): a native shell hands in
+/// the OS TUN file descriptor and this runs the full mesh data plane on it.
+#[cfg(feature = "data-plane")]
+#[uniffi::export(async_runtime = "tokio")]
+impl FfiVpnClient {
+    /// Run the VPN on a platform-provided TUN `tun_fd`: register with the
+    /// `coordinator`, bring up the mesh over a UDP underlay bound to
+    /// `listen_port`, and keep it converged until [`stop`](FfiVpnClient::stop).
+    ///
+    /// Blocks (as an async call) for the lifetime of the tunnel; the foreign
+    /// caller runs it on a background task and calls `stop` to end it.
+    /// `private_key` is this device's WireGuard key (used to build peer sessions;
+    /// never sent to the coordinator). Returns when the tunnel is torn down.
+    pub async fn run(
+        &self,
+        tun_fd: i32,
+        coordinator: String,
+        identity: ClientIdentity,
+        private_key: String,
+        listen_port: u16,
+    ) -> Result<(), Error> {
+        let device =
+            vpn_tunnel::device::from_fd(tun_fd).map_err(|e| Error::DataPlane(e.to_string()))?;
+        let bind: std::net::SocketAddr = format!("0.0.0.0:{listen_port}")
+            .parse()
+            .map_err(|e| Error::DataPlane(format!("bind address: {e}")))?;
+        let transport = vpn_transport::UdpMeshTransport::bind(bind)
+            .await
+            .map_err(|e| Error::DataPlane(e.to_string()))?;
+
+        // Install a fresh shutdown trigger; `stop` fires it.
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        *self.shutdown.lock().expect("shutdown mutex poisoned") = Some(stop_tx);
+
+        crate::data_plane::run_mesh_session(
+            &self.inner,
+            &coordinator,
+            &identity,
+            &private_key,
+            device,
+            transport,
+            async move {
+                let _ = stop_rx.await;
+            },
+        )
+        .await
+    }
+
+    /// Signal a running [`run`](FfiVpnClient::run) to tear down; the client
+    /// returns to `Disconnected`. A no-op if nothing is running.
+    pub fn stop(&self) {
+        if let Some(tx) = self
+            .shutdown
+            .lock()
+            .expect("shutdown mutex poisoned")
+            .take()
+        {
+            let _ = tx.send(());
         }
     }
 }
