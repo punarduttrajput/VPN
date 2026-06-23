@@ -1,5 +1,5 @@
 [package]
-name = "vpn-client-core"
+name = "ferrum-client-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -15,32 +15,32 @@ default = []
 # Mutual TLS for the coordinator channel (tonic rustls).
 mtls = ["tonic/tls", "dep:rustls"]
 # FFI bindings (Phase 5 FR1): annotate the facade for uniffi and expose the
-# `FfiVpnClient` Object so Swift/Kotlin can be generated. Off by default so the
+# `FfiFerrumClient` Object so Swift/Kotlin can be generated. Off by default so the
 # regular build stays lean.
 uniffi = ["dep:uniffi"]
-# Data-plane glue (Phase 5): a `VpnClient`-driven mesh runner that ties the
-# control facade to `vpn-tunnel::run_mesh`. Pulls in the tunnel/transport/core
+# Data-plane glue (Phase 5): a `FerrumClient`-driven mesh runner that ties the
+# control facade to `ferrum-tunnel::run_mesh`. Pulls in the tunnel/transport/core
 # crates, so it's opt-in — control-plane-only consumers stay lean.
-data-plane = ["dep:vpn-tunnel", "dep:vpn-transport", "dep:vpn-core"]
+data-plane = ["dep:ferrum-tunnel", "dep:ferrum-transport", "dep:ferrum-core"]
 
 [dependencies]
-vpn-control-proto = { path = "../control-proto" }
+ferrum-control-proto = { path = "../control-proto" }
 tonic.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 rustls = { workspace = true, optional = true }
 uniffi = { version = "0.31", features = ["tokio", "cli"], optional = true }
-vpn-tunnel = { path = "../tunnel", optional = true }
-vpn-transport = { path = "../transport", optional = true }
-vpn-core = { path = "../core", optional = true }
+ferrum-tunnel = { path = "../tunnel", optional = true }
+ferrum-transport = { path = "../transport", optional = true }
+ferrum-core = { path = "../core", optional = true }
 
 [dev-dependencies]
-vpn-coordinator = { path = "../coordinator", features = ["mtls"] }
+ferrum-coordinator = { path = "../coordinator", features = ["mtls"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 
 # Generate foreign-language bindings:
-#   cargo run -p vpn-client-core --features uniffi --bin uniffi-bindgen -- \
+#   cargo run -p ferrum-client-core --features uniffi --bin uniffi-bindgen -- \
 #       generate --library target/debug/<lib> --language swift  --out-dir bindings/swift
 [[bin]]
 name = "uniffi-bindgen"

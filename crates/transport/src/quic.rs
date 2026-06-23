@@ -51,7 +51,7 @@ impl QuicTransport {
     /// [`accept`]: QuicTransport::accept
     pub fn server_endpoint(local: SocketAddr) -> Result<Endpoint, TransportError> {
         install_provider();
-        let cert = rcgen::generate_simple_self_signed(vec!["vpn".to_string()])
+        let cert = rcgen::generate_simple_self_signed(vec!["ferrum".to_string()])
             .map_err(|e| setup(format!("self-signed cert: {e}")))?;
         let cert_der = rustls::pki_types::CertificateDer::from(cert.cert);
         let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
@@ -247,7 +247,7 @@ mod tests {
             t.connection.closed().await;
         });
 
-        let client = QuicTransport::connect("127.0.0.1:0".parse().unwrap(), server_addr, "vpn")
+        let client = QuicTransport::connect("127.0.0.1:0".parse().unwrap(), server_addr, "ferrum")
             .await
             .unwrap();
 
@@ -292,7 +292,7 @@ mod tests {
             t.connection.closed().await;
         });
 
-        let client = QuicTransport::connect("127.0.0.1:0".parse().unwrap(), server_addr, "vpn")
+        let client = QuicTransport::connect("127.0.0.1:0".parse().unwrap(), server_addr, "ferrum")
             .await
             .unwrap();
         let before = client.local_addr_of_endpoint();

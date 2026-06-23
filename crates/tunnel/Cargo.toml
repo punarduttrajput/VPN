@@ -1,5 +1,5 @@
 [package]
-name = "vpn-tunnel"
+name = "ferrum-tunnel"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,14 +10,14 @@ default = []
 # Pulls in the real OS TUN device (Linux/macOS). Off by default so the data
 # plane builds and tests on any host (incl. Windows) without platform drivers.
 real-tun = ["dep:tun"]
-# Forwarded to vpn-transport so a tunnel build can include the QUIC transport.
-quic = ["vpn-transport/quic"]
-# Forwarded to vpn-transport for the MASQUE / HTTP3 transport.
-masque = ["vpn-transport/masque"]
+# Forwarded to ferrum-transport so a tunnel build can include the QUIC transport.
+quic = ["ferrum-transport/quic"]
+# Forwarded to ferrum-transport for the MASQUE / HTTP3 transport.
+masque = ["ferrum-transport/masque"]
 
 [dependencies]
-vpn-core = { path = "../core" }
-vpn-transport = { path = "../transport" }
+ferrum-core = { path = "../core" }
+ferrum-transport = { path = "../transport" }
 boringtun.workspace = true
 x25519-dalek.workspace = true
 tokio.workspace = true
@@ -33,5 +33,5 @@ tun = { version = "0.6", features = ["async"], optional = true }
 libc.workspace = true
 
 [dev-dependencies]
-vpn-transport = { path = "../transport" }
+ferrum-transport = { path = "../transport" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }

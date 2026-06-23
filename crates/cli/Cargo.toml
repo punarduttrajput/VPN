@@ -1,26 +1,31 @@
 [package]
-name = "vpn-cli"
+name = "ferrum-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+# Full name and a short `fe` alias — both build from the same entrypoint.
 [[bin]]
-name = "vpn"
+name = "ferrum"
+path = "src/main.rs"
+
+[[bin]]
+name = "fe"
 path = "src/main.rs"
 
 [features]
 default = []
-# Build the CLI with QUIC transport available (forwarded to vpn-tunnel).
-quic = ["vpn-tunnel/quic"]
+# Build the CLI with QUIC transport available (forwarded to ferrum-tunnel).
+quic = ["ferrum-tunnel/quic"]
 # Build with the MASQUE / HTTP3 transport available.
-masque = ["vpn-tunnel/masque"]
+masque = ["ferrum-tunnel/masque"]
 
 [dependencies]
-vpn-core = { path = "../core" }
-vpn-tunnel = { path = "../tunnel" }
-vpn-transport = { path = "../transport" }
-vpn-client-core = { path = "../client-core" }
+ferrum-core = { path = "../core" }
+ferrum-tunnel = { path = "../tunnel" }
+ferrum-transport = { path = "../transport" }
+ferrum-client-core = { path = "../client-core" }
 clap.workspace = true
 tokio.workspace = true
 tracing.workspace = true

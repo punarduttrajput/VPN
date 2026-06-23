@@ -589,6 +589,115 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
+name = "ferrum-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ferrum-client-core",
+ "ferrum-core",
+ "ferrum-transport",
+ "ferrum-tunnel",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "ferrum-client-core"
+version = "0.1.0"
+dependencies = [
+ "ferrum-control-proto",
+ "ferrum-coordinator",
+ "ferrum-core",
+ "ferrum-transport",
+ "ferrum-tunnel",
+ "rustls",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "uniffi",
+]
+
+[[package]]
+name = "ferrum-control-proto"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "protoc-bin-vendored",
+ "tonic",
+ "tonic-build",
+]
+
+[[package]]
+name = "ferrum-coordinator"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "ferrum-control-proto",
+ "prost",
+ "rcgen",
+ "ring 0.17.14",
+ "rusqlite",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-stream",
+ "toml",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "ferrum-core"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "serde",
+ "thiserror 1.0.69",
+ "toml",
+ "x25519-dalek",
+]
+
+[[package]]
+name = "ferrum-transport"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "h3",
+ "h3-datagram",
+ "h3-quinn",
+ "http",
+ "libc",
+ "quinn",
+ "rcgen",
+ "rustls",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "ferrum-tunnel"
+version = "0.1.0"
+dependencies = [
+ "boringtun",
+ "ferrum-core",
+ "ferrum-transport",
+ "libc",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tun",
+ "x25519-dalek",
+]
+
+[[package]]
 name = "fiat-crypto"
 version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2558,115 +2667,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "vpn-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "vpn-client-core",
- "vpn-core",
- "vpn-transport",
- "vpn-tunnel",
-]
-
-[[package]]
-name = "vpn-client-core"
-version = "0.1.0"
-dependencies = [
- "rustls",
- "thiserror 1.0.69",
- "tokio",
- "tokio-stream",
- "tonic",
- "tracing",
- "uniffi",
- "vpn-control-proto",
- "vpn-coordinator",
- "vpn-core",
- "vpn-transport",
- "vpn-tunnel",
-]
-
-[[package]]
-name = "vpn-control-proto"
-version = "0.1.0"
-dependencies = [
- "prost",
- "protoc-bin-vendored",
- "tonic",
- "tonic-build",
-]
-
-[[package]]
-name = "vpn-coordinator"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "prost",
- "rcgen",
- "ring 0.17.14",
- "rusqlite",
- "rustls",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tokio-stream",
- "toml",
- "tonic",
- "tracing",
- "tracing-subscriber",
- "vpn-control-proto",
-]
-
-[[package]]
-name = "vpn-core"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "serde",
- "thiserror 1.0.69",
- "toml",
- "x25519-dalek",
-]
-
-[[package]]
-name = "vpn-transport"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "h3",
- "h3-datagram",
- "h3-quinn",
- "http",
- "libc",
- "quinn",
- "rcgen",
- "rustls",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "vpn-tunnel"
-version = "0.1.0"
-dependencies = [
- "boringtun",
- "libc",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "tun",
- "vpn-core",
- "vpn-transport",
- "x25519-dalek",
-]
 
 [[package]]
 name = "want"

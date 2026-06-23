@@ -1,5 +1,5 @@
 # Example coordinator ACL policy (PRD Phase 3, FR4).
-# Pass to the coordinator with:  vpn-coordinator --policy policy.example.toml
+# Pass to the coordinator with:  ferrum-coordinator --policy policy.example.toml
 # Deny-by-default: a device may reach a peer only if some rule permits it.
 # Tags are matched by name; "*" matches any tag.
 #

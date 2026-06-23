@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Product** | Next-Gen VPN (Rust) |
+| **Product** | Ferrum (Rust) |
 | **Phase** | 5 of 6 — Client Applications |
 | **Status** | Draft |
 | **Owner** | punarr@plasmacomp.com |
@@ -26,7 +26,7 @@ integration and UI.
 
 ### Goals
 - G1. Single shared `client-core` powering all platforms via `uniffi` FFI.
-- G2. iOS (NetworkExtension) and Android (VpnService) apps with login + connect.
+- G2. iOS (NetworkExtension) and Android (FerrumService) apps with login + connect.
 - G3. Desktop apps for Windows (WinTun), macOS, and Linux with system-tray UX.
 - G4. Consistent UX: SSO login, one-tap connect, peer/exit selection, connection status.
 - G5. Surface mesh state from Phase 4 (direct vs relay, latency) in the UI.
@@ -73,7 +73,7 @@ mature Rust-based products and is the fastest path to consistent, secure clients
 - Keychain storage for the device private key.
 
 ### FR3 — Android
-- `VpnService`-based tunnel hosting the Rust core (JNI via `uniffi` Kotlin bindings).
+- `FerrumService`-based tunnel hosting the Rust core (JNI via `uniffi` Kotlin bindings).
 - Jetpack Compose UI mirroring iOS feature set.
 - Android Keystore for the device private key.
 
@@ -120,7 +120,7 @@ mature Rust-based products and is the fastest path to consistent, secure clients
    │  Swift (iOS/macOS)    │      │  Tauri desktop shell     │
    │  Kotlin (Android)     │      │  (Win/macOS/Linux)       │
    │  + NetworkExtension / │      │  + WinTun / TUN + tray   │
-   │    VpnService shells  │      │                          │
+   │    FerrumService shells  │      │                          │
    └───────────────────────┘      └──────────────────────────┘
 ```
 
@@ -130,7 +130,7 @@ mature Rust-based products and is the fastest path to consistent, secure clients
 - `clients/desktop` — Tauri app + background service.
 
 ### Key dependencies
-`uniffi`, Tauri, platform SDKs (NetworkExtension, VpnService, WinTun), Phase 1–4 crates.
+`uniffi`, Tauri, platform SDKs (NetworkExtension, FerrumService, WinTun), Phase 1–4 crates.
 
 ---
 
@@ -139,7 +139,7 @@ mature Rust-based products and is the fastest path to consistent, secure clients
 1. **M1** — Define & generate `uniffi` interface; consume from a trivial Swift + Kotlin harness.
 2. **M2** — Desktop (Tauri + tray + background service) on Linux/macOS, then Windows/WinTun.
 3. **M3** — iOS app: NetworkExtension + SwiftUI login/connect.
-4. **M4** — Android app: VpnService + Compose login/connect.
+4. **M4** — Android app: FerrumService + Compose login/connect.
 5. **M5** — Reliability features: kill-switch, always-on, auto-reconnect, peer detail UI.
 6. **M6** — Auto-update, store packaging, opt-in diagnostics, polish.
 
@@ -160,7 +160,7 @@ mature Rust-based products and is the fastest path to consistent, secure clients
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| Platform VPN APIs (NE/VpnService) are restrictive | Feature gaps | Prototype tunnel-provider early; design core around constraints |
+| Platform VPN APIs (NE/FerrumService) are restrictive | Feature gaps | Prototype tunnel-provider early; design core around constraints |
 | `uniffi` async/callback ergonomics | Integration friction | Define a callback-stream pattern up front; thin shells |
 | App store review (VPN entitlements) | Launch delay | Engage store requirements early; prepare privacy disclosures |
 | Per-platform background-execution limits | Drops/battery | Use OS-sanctioned VPN lifecycle; tune keepalive per platform |

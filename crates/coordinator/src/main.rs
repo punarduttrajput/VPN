@@ -1,4 +1,4 @@
-//! `vpn-coordinator` — runs the control-plane gRPC coordinator (PRD Phase 3 M1).
+//! `ferrum-coordinator` — runs the control-plane gRPC coordinator (PRD Phase 3 M1).
 //!
 //! Listens for device registration and network-map requests. In-memory registry
 //! for now (persistence is a later increment). Bind address via `--listen`.
@@ -6,11 +6,11 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
+use ferrum_control_proto::coordinator::coordinator_server::CoordinatorServer;
+use ferrum_coordinator::{CoordinatorService, Policy, Registry};
 use tonic::transport::Server;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
-use vpn_control_proto::coordinator::coordinator_server::CoordinatorServer;
-use vpn_coordinator::{CoordinatorService, Policy, Registry};
 
 fn arg_value(flag: &str) -> Option<String> {
     std::env::args().skip_while(|a| a != flag).nth(1)
@@ -49,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "sqlite")]
     let registry = match arg_value("--store") {
         Some(path) => {
-            let store = vpn_coordinator::SqliteStore::open(&path)?;
+            let store = ferrum_coordinator::SqliteStore::open(&path)?;
             let reg = Registry::with_store(base, 24, policy, Box::new(store))?;
             info!(store = %path, devices = reg.device_count(), "using SQLite persistence");
             reg
@@ -75,8 +75,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ) {
         (Some(issuer), Some(audience), Some(jwks_path)) => {
             let jwks_doc = std::fs::read_to_string(&jwks_path)?;
-            let jwks = vpn_coordinator::Jwks::from_json(&jwks_doc)?;
-            let verifier = Arc::new(vpn_coordinator::OidcVerifier::new(&issuer, &audience, jwks));
+            let jwks = ferrum_coordinator::Jwks::from_json(&jwks_doc)?;
+            let verifier = Arc::new(ferrum_coordinator::OidcVerifier::new(
+                &issuer, &audience, jwks,
+            ));
             info!(%issuer, %audience, jwks = %jwks_path, "OIDC authentication enabled");
             CoordinatorService::with_auth(registry, verifier)
         }
@@ -99,7 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         arg_value("--tls-key"),
         arg_value("--tls-ca"),
     ) {
-        vpn_coordinator::pki::install_crypto_provider();
+        ferrum_coordinator::pki::install_crypto_provider();
         let identity = tonic::transport::Identity::from_pem(
             std::fs::read_to_string(&cert)?,
             std::fs::read_to_string(&key)?,

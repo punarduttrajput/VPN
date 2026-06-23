@@ -3,14 +3,14 @@
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+use ferrum_control_proto::coordinator::coordinator_server::Coordinator;
+use ferrum_control_proto::coordinator::{
+    NetworkMapRequest, NetworkMapResponse, PeerInfo, RegisterDeviceRequest, RegisterDeviceResponse,
+};
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
-use vpn_control_proto::coordinator::coordinator_server::Coordinator;
-use vpn_control_proto::coordinator::{
-    NetworkMapRequest, NetworkMapResponse, PeerInfo, RegisterDeviceRequest, RegisterDeviceResponse,
-};
 
 use crate::registry::Registry;
 
@@ -196,11 +196,11 @@ impl Coordinator for CoordinatorService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrum_control_proto::coordinator::coordinator_client::CoordinatorClient;
+    use ferrum_control_proto::coordinator::coordinator_server::CoordinatorServer;
     use std::net::Ipv4Addr;
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::transport::Server;
-    use vpn_control_proto::coordinator::coordinator_client::CoordinatorClient;
-    use vpn_control_proto::coordinator::coordinator_server::CoordinatorServer;
 
     /// End-to-end over real gRPC on localhost: register two devices, then a
     /// network-map request returns the other peer with its assigned address.
@@ -274,7 +274,7 @@ mod tests {
 
         let signer = TestSigner::new("k1");
         let verifier =
-            std::sync::Arc::new(signer.verifier("https://idp.example", "vpn-coordinator"));
+            std::sync::Arc::new(signer.verifier("https://idp.example", "ferrum-coordinator"));
         let registry = Arc::new(Mutex::new(Registry::new(Ipv4Addr::new(10, 8, 0, 0), 24)));
         let svc = CoordinatorService::with_auth(registry.clone(), verifier);
 
@@ -310,7 +310,7 @@ mod tests {
             .as_secs()
             + 3600;
         let token = signer.sign(&format!(
-            r#"{{"iss":"https://idp.example","aud":"vpn-coordinator","sub":"alice","exp":{exp},"tags":["dev"]}}"#
+            r#"{{"iss":"https://idp.example","aud":"ferrum-coordinator","sub":"alice","exp":{exp},"tags":["dev"]}}"#
         ));
         let mut req = Request::new(RegisterDeviceRequest {
             public_key: "AAA".into(),

@@ -4,5 +4,5 @@
 
 /// Coordinator service messages, client, and server stubs.
 pub mod coordinator {
-    tonic::include_proto!("vpn.coordinator.v1");
+    tonic::include_proto!("ferrum.coordinator.v1");
 }

@@ -1,6 +1,6 @@
 //! High-level VPN client facade (PRD Phase 5, FR1 / M1).
 //!
-//! [`VpnClient`] is the single shared entry point every native shell (iOS,
+//! [`FerrumClient`] is the single shared entry point every native shell (iOS,
 //! Android, desktop) drives — the box labelled "connection state machine" in the
 //! Phase 5 architecture. It owns the connection lifecycle, talks to the
 //! coordinator through [`ControlClient`](crate::ControlClient), surfaces the peer
@@ -123,18 +123,18 @@ struct Inner {
 ///
 /// Cheap to clone (`Arc`-backed); clones share the same state and event stream.
 #[derive(Clone)]
-pub struct VpnClient {
+pub struct FerrumClient {
     inner: Arc<Mutex<Inner>>,
     events: broadcast::Sender<ClientEvent>,
 }
 
-impl Default for VpnClient {
+impl Default for FerrumClient {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl VpnClient {
+impl FerrumClient {
     /// Create a fresh, disconnected client.
     pub fn new() -> Self {
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
@@ -269,12 +269,12 @@ impl VpnClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrum_control_proto::coordinator::coordinator_server::CoordinatorServer;
+    use ferrum_coordinator::{CoordinatorService, Registry};
     use std::net::Ipv4Addr;
     use std::sync::{Arc as StdArc, Mutex as StdMutex};
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::transport::Server;
-    use vpn_control_proto::coordinator::coordinator_server::CoordinatorServer;
-    use vpn_coordinator::{CoordinatorService, Registry};
 
     async fn start_coordinator() -> String {
         let registry = StdArc::new(StdMutex::new(Registry::new(Ipv4Addr::new(10, 8, 0, 0), 24)));
@@ -302,7 +302,7 @@ mod tests {
 
     #[test]
     fn new_client_starts_disconnected() {
-        let c = VpnClient::new();
+        let c = FerrumClient::new();
         assert_eq!(c.status(), ConnectionState::Disconnected);
         assert!(c.peers().is_empty());
         assert!(c.address().is_none());
@@ -311,8 +311,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn connect_drives_state_and_loads_peers() {
         let url = start_coordinator().await;
-        let a = VpnClient::new();
-        let b = VpnClient::new();
+        let a = FerrumClient::new();
+        let b = FerrumClient::new();
 
         // A connects first: assigned .2, no peers yet.
         a.connect(url.clone(), &identity("AAA", "laptop", "1.1.1.1:51820"))
@@ -337,7 +337,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn subscribers_observe_state_transitions() {
         let url = start_coordinator().await;
-        let c = VpnClient::new();
+        let c = FerrumClient::new();
         let mut events = c.subscribe();
 
         c.connect(url, &identity("AAA", "laptop", "1.1.1.1:51820"))
@@ -366,7 +366,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn connect_failure_transitions_to_failed() {
-        let c = VpnClient::new();
+        let c = FerrumClient::new();
         // Nothing listening on this port -> connect fails.
         let err = c
             .connect(

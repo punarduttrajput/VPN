@@ -78,7 +78,7 @@ fn h3_client_crypto() -> Result<QuicClientConfig, TransportError> {
 /// ALPN-`h3` rustls server config with a self-signed cert.
 fn h3_server_crypto() -> Result<QuicServerConfig, TransportError> {
     install_provider();
-    let cert = rcgen::generate_simple_self_signed(vec!["vpn".to_string()]).map_err(setup)?;
+    let cert = rcgen::generate_simple_self_signed(vec!["ferrum".to_string()]).map_err(setup)?;
     let cert_der = rustls::pki_types::CertificateDer::from(cert.cert);
     let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
     let mut crypto = rustls::ServerConfig::builder()
@@ -454,7 +454,7 @@ mod tests {
         });
 
         let client =
-            MasqueTransport::connect("127.0.0.1:0".parse().unwrap(), proxy_addr, "vpn", target)
+            MasqueTransport::connect("127.0.0.1:0".parse().unwrap(), proxy_addr, "ferrum", target)
                 .await
                 .unwrap();
 
@@ -532,10 +532,10 @@ mod tests {
         });
 
         // Two clients through the *same* proxy, each targeting a different peer.
-        let c1 = MasqueTransport::connect("127.0.0.1:0".parse().unwrap(), proxy_addr, "vpn", t1)
+        let c1 = MasqueTransport::connect("127.0.0.1:0".parse().unwrap(), proxy_addr, "ferrum", t1)
             .await
             .unwrap();
-        let c2 = MasqueTransport::connect("127.0.0.1:0".parse().unwrap(), proxy_addr, "vpn", t2)
+        let c2 = MasqueTransport::connect("127.0.0.1:0".parse().unwrap(), proxy_addr, "ferrum", t2)
             .await
             .unwrap();
 
@@ -585,7 +585,7 @@ mod tests {
             let _ = proxy.serve().await;
         });
 
-        let mesh = MasqueMeshTransport::new(proxy_addr, "vpn");
+        let mesh = MasqueMeshTransport::new(proxy_addr, "ferrum");
         mesh.send_to(p1, b"hi-1").await.unwrap();
         mesh.send_to(p2, b"hi-2").await.unwrap();
 

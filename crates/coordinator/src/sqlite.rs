@@ -142,7 +142,7 @@ mod tests {
     #[test]
     fn persists_across_reopen() {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("vpn-coord-test-{}.db", std::process::id()));
+        let path = dir.join(format!("ferrum-coord-test-{}.db", std::process::id()));
         let path_str = path.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&path);
 

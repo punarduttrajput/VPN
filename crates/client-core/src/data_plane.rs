@@ -1,8 +1,8 @@
 //! Data-plane glue (Phase 5): drive the OS mesh data plane from the facade.
 //!
-//! [`VpnClient`](crate::VpnClient) owns the *control* side — registration, state,
+//! [`FerrumClient`](crate::FerrumClient) owns the *control* side — registration, state,
 //! the peer view, the event stream. This module connects it to the *data* side
-//! ([`vpn_tunnel::run_mesh`]): a native shell (or the CLI) supplies an opened TUN
+//! ([`ferrum_tunnel::run_mesh`]): a native shell (or the CLI) supplies an opened TUN
 //! device and a bound [`MeshTransport`], and [`run_mesh_session`] registers with
 //! the coordinator, keeps the live mesh converged from `WatchNetworkMap`, and
 //! reflects every change back into the facade so the UI stays current.
@@ -19,13 +19,13 @@ use std::net::SocketAddr;
 use tokio::sync::mpsc;
 use tracing::warn;
 
-use vpn_core::config::Cidr;
-use vpn_transport::MeshTransport;
-use vpn_tunnel::device::TunDevice;
-use vpn_tunnel::session::Session;
-use vpn_tunnel::{run_mesh, MeshPeer};
+use ferrum_core::config::Cidr;
+use ferrum_transport::MeshTransport;
+use ferrum_tunnel::device::TunDevice;
+use ferrum_tunnel::session::Session;
+use ferrum_tunnel::{run_mesh, MeshPeer};
 
-use crate::client::VpnClient;
+use crate::client::FerrumClient;
 use crate::{ClientIdentity, ControlClient, Error, PeerSpec};
 
 /// Turn the coordinator's peer list into mesh sessions keyed by our private key.
@@ -39,13 +39,13 @@ use crate::{ClientIdentity, ControlClient, Error, PeerSpec};
 // here would be inconsistent, so allow the lint.
 #[allow(clippy::result_large_err)]
 pub fn build_mesh_peers(private_key_b64: &str, peers: &[PeerSpec]) -> Result<Vec<MeshPeer>, Error> {
-    let priv_bytes = vpn_core::keys::decode_key(private_key_b64)
+    let priv_bytes = ferrum_core::keys::decode_key(private_key_b64)
         .map_err(|e| Error::DataPlane(format!("decoding private key: {e}")))?;
     peers
         .iter()
         .enumerate()
         .map(|(i, p)| {
-            let pub_bytes = vpn_core::keys::decode_key(&p.public_key)
+            let pub_bytes = ferrum_core::keys::decode_key(&p.public_key)
                 .map_err(|e| Error::DataPlane(format!("peer key '{}': {e}", p.public_key)))?;
             let endpoint: SocketAddr = p
                 .endpoint
@@ -84,7 +84,7 @@ pub fn build_mesh_peers(private_key_b64: &str, peers: &[PeerSpec]) -> Result<Vec
 /// `private_key_b64` is this device's WireGuard private key, used to build the
 /// per-peer sessions (it is never sent to the coordinator).
 pub async fn run_mesh_session<D, M, F>(
-    client: &VpnClient,
+    client: &FerrumClient,
     coordinator: &str,
     identity: &ClientIdentity,
     private_key_b64: &str,
@@ -148,16 +148,16 @@ where
 mod tests {
     use super::*;
     use crate::client::ConnectionState;
+    use ferrum_control_proto::coordinator::coordinator_server::CoordinatorServer;
+    use ferrum_coordinator::{CoordinatorService, Registry};
+    use ferrum_transport::UdpMeshTransport;
+    use ferrum_tunnel::device::mock::MockTun;
     use std::net::Ipv4Addr;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::net::UdpSocket;
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::transport::Server;
-    use vpn_control_proto::coordinator::coordinator_server::CoordinatorServer;
-    use vpn_coordinator::{CoordinatorService, Registry};
-    use vpn_transport::UdpMeshTransport;
-    use vpn_tunnel::device::mock::MockTun;
 
     async fn start_coordinator() -> String {
         let registry = Arc::new(Mutex::new(Registry::new(Ipv4Addr::new(10, 8, 0, 0), 24)));
@@ -176,8 +176,8 @@ mod tests {
 
     #[test]
     fn build_mesh_peers_rejects_a_bad_endpoint() {
-        let me = vpn_core::keys::KeyPair::generate();
-        let peer = vpn_core::keys::KeyPair::generate();
+        let me = ferrum_core::keys::KeyPair::generate();
+        let peer = ferrum_core::keys::KeyPair::generate();
         let specs = vec![PeerSpec {
             public_key: peer.public_base64(),
             endpoint: "not-an-addr".into(),
@@ -189,9 +189,9 @@ mod tests {
 
     #[test]
     fn build_mesh_peers_builds_a_session_per_peer() {
-        let me = vpn_core::keys::KeyPair::generate();
-        let p1 = vpn_core::keys::KeyPair::generate();
-        let p2 = vpn_core::keys::KeyPair::generate();
+        let me = ferrum_core::keys::KeyPair::generate();
+        let p1 = ferrum_core::keys::KeyPair::generate();
+        let p2 = ferrum_core::keys::KeyPair::generate();
         let specs = vec![
             PeerSpec {
                 public_key: p1.public_base64(),
@@ -215,12 +215,12 @@ mod tests {
     async fn run_mesh_session_connects_then_tracks_live_peers() {
         let url = start_coordinator().await;
 
-        let me = vpn_core::keys::KeyPair::generate();
+        let me = ferrum_core::keys::KeyPair::generate();
         let device = MockTun::default();
         let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let transport = UdpMeshTransport::from_socket(sock);
 
-        let client = VpnClient::new();
+        let client = FerrumClient::new();
         let identity = ClientIdentity {
             public_key: me.public_base64(),
             name: "node-a".into(),
@@ -261,7 +261,7 @@ mod tests {
         // ICMP/WSAECONNRESET gotcha. `_sink` stays bound for the test's lifetime.
         let _sink = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let sink_addr = _sink.local_addr().unwrap();
-        let peer = vpn_core::keys::KeyPair::generate();
+        let peer = ferrum_core::keys::KeyPair::generate();
         let mut b = ControlClient::connect(url.clone()).await.unwrap();
         b.register(&peer.public_base64(), "node-b", &sink_addr.to_string(), &[])
             .await

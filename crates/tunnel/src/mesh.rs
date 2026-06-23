@@ -8,13 +8,13 @@
 //!     decrypts the packet — so routing is independent of the source address and
 //!     survives relays (MASQUE) and NAT rewriting.
 //!
-//! This is the shape a [`TunnelPlan`](../../vpn_client_core) becomes: each plan
+//! This is the shape a [`TunnelPlan`](../../ferrum_client_core) becomes: each plan
 //! peer (public key, endpoint, allowed IPs) maps to one [`MeshPeer`].
 //!
 //! The wire protocol is abstracted behind [`MeshTransport`]: a shared UDP socket
-//! ([`UdpMeshTransport`](vpn_transport::UdpMeshTransport)), QUIC
-//! ([`QuicMeshTransport`](vpn_transport::QuicMeshTransport), the `quic` feature),
-//! or MASQUE/HTTP3 ([`MasqueMeshTransport`](vpn_transport::MasqueMeshTransport),
+//! ([`UdpMeshTransport`](ferrum_transport::UdpMeshTransport)), QUIC
+//! ([`QuicMeshTransport`](ferrum_transport::QuicMeshTransport), the `quic` feature),
+//! or MASQUE/HTTP3 ([`MasqueMeshTransport`](ferrum_transport::MasqueMeshTransport),
 //! the `masque` feature). A pipelined mesh data path is a later increment.
 //! Routing is verified in-process here (UDP, QUIC, and a MASQUE node reaching a
 //! UDP peer); a real-TUN mesh run is a Linux/Codespaces path
@@ -23,10 +23,10 @@
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
+use ferrum_core::config::Cidr;
+use ferrum_transport::MeshTransport;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
-use vpn_core::config::Cidr;
-use vpn_transport::MeshTransport;
 
 use crate::device::TunDevice;
 use crate::session::{Action, Session, MAX_PACKET};
@@ -222,9 +222,9 @@ mod tests {
     #[test]
     fn routes_to_peer_by_allowed_ips() {
         // Two peers with /32 routes; pick by destination.
-        let a = vpn_core::keys::KeyPair::generate();
-        let b = vpn_core::keys::KeyPair::generate();
-        let me = vpn_core::keys::KeyPair::generate();
+        let a = ferrum_core::keys::KeyPair::generate();
+        let b = ferrum_core::keys::KeyPair::generate();
+        let me = ferrum_core::keys::KeyPair::generate();
         let peers = vec![
             MeshPeer {
                 session: Session::from_bytes(me.private.to_bytes(), a.public.to_bytes(), 1)

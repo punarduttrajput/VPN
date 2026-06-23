@@ -36,7 +36,7 @@ use crate::{MeshTransport, TransportError};
 
 /// TLS server name presented/accepted (peer identity is the inner WireGuard
 /// handshake, not TLS — see [`crate::quic`]).
-const SERVER_NAME: &str = "vpn";
+const SERVER_NAME: &str = "ferrum";
 
 /// Max bytes read for a peer's hello (an `ip:port` string is far smaller).
 const HELLO_MAX: usize = 64;

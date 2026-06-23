@@ -1,4 +1,4 @@
-# CLAUDE.md — agent context for the Next-Gen VPN
+# CLAUDE.md — agent context for the Ferrum
 
 Orientation for an AI agent (or developer) picking up this repo. Read this first,
 then [STATUS.md](STATUS.md) for the detailed, dated progress log.
@@ -17,16 +17,16 @@ traversal, and kernel-level scale work are the remaining frontier.
 
 | Crate | Role |
 |-------|------|
-| `vpn-core` | Keys, config, errors. `#![forbid(unsafe_code)]`. |
-| `vpn-transport` | `Transport` (point-to-point) + `MeshTransport` (multi-peer) traits; UDP, QUIC (`quic`), MASQUE (`masque`) impls, padding + jitter decorators. |
-| `vpn-tunnel` | boringtun session wrapper, `TunDevice` trait (real on Unix behind `real-tun`, mock otherwise), point-to-point `run` and multi-peer `run_mesh`. |
-| `vpn-cli` | `vpn` binary: `keygen`, `up` (point-to-point), `up-mesh` (coordinator mesh). |
-| `vpn-control-proto` | gRPC `Coordinator` contract (tonic/prost, vendored `protoc`). |
-| `vpn-coordinator` | Coordinator: registry, IP allocation, network map, ACL/policy, streaming, SQLite (`sqlite`), mTLS (`mtls`), OIDC (`oidc`). |
-| `vpn-client-core` | `ControlClient` (gRPC) + `VpnClient` (Phase 5 facade: connection state machine + event stream). `uniffi` feature exposes `FfiVpnClient` → generated Swift/Kotlin (incl. `run(tun_fd,…)`/`stop()` with `data-plane`). `data-plane` feature adds `run_mesh_session` (ties the facade to `vpn-tunnel::run_mesh`; consumes a `device::from_fd` TUN). |
+| `ferrum-core` | Keys, config, errors. `#![forbid(unsafe_code)]`. |
+| `ferrum-transport` | `Transport` (point-to-point) + `MeshTransport` (multi-peer) traits; UDP, QUIC (`quic`), MASQUE (`masque`) impls, padding + jitter decorators. |
+| `ferrum-tunnel` | boringtun session wrapper, `TunDevice` trait (real on Unix behind `real-tun`, mock otherwise), point-to-point `run` and multi-peer `run_mesh`. |
+| `ferrum-cli` | `ferrum` binary: `keygen`, `up` (point-to-point), `up-mesh` (coordinator mesh). |
+| `ferrum-control-proto` | gRPC `Coordinator` contract (tonic/prost, vendored `protoc`). |
+| `ferrum-coordinator` | Coordinator: registry, IP allocation, network map, ACL/policy, streaming, SQLite (`sqlite`), mTLS (`mtls`), OIDC (`oidc`). |
+| `ferrum-client-core` | `ControlClient` (gRPC) + `FerrumClient` (Phase 5 facade: connection state machine + event stream). `uniffi` feature exposes `FfiFerrumClient` → generated Swift/Kotlin (incl. `run(tun_fd,…)`/`stop()` with `data-plane`). `data-plane` feature adds `run_mesh_session` (ties the facade to `ferrum-tunnel::run_mesh`; consumes a `device::from_fd` TUN). |
 
 Outside `crates/`: **`apps/desktop`** is a Tauri v2 desktop shell (Phase 5 FR4) —
-its own standalone workspace (excluded from this one) driving `vpn-client-core`.
+its own standalone workspace (excluded from this one) driving `ferrum-client-core`.
 
 ## Build / test / lint
 
@@ -39,13 +39,13 @@ cargo clippy --all-targets -- -D warnings     # CI gate
 
 **Feature matrix** — CI runs clippy + tests for each; keep them all green:
 ```sh
-cargo test  --workspace --features vpn-cli/quic
-cargo test  --workspace --features vpn-cli/masque
-cargo test  -p vpn-coordinator --features sqlite
-cargo test  -p vpn-coordinator --features oidc
-cargo test  -p vpn-client-core -p vpn-coordinator --features vpn-coordinator/mtls,vpn-client-core/mtls
-cargo test  -p vpn-client-core --features uniffi      # FFI Object + bindings (Phase 5)
-cargo test  -p vpn-client-core --features data-plane  # VpnClient-driven mesh runner (Phase 5)
+cargo test  --workspace --features ferrum-cli/quic
+cargo test  --workspace --features ferrum-cli/masque
+cargo test  -p ferrum-coordinator --features sqlite
+cargo test  -p ferrum-coordinator --features oidc
+cargo test  -p ferrum-client-core -p ferrum-coordinator --features ferrum-coordinator/mtls,ferrum-client-core/mtls
+cargo test  -p ferrum-client-core --features uniffi      # FFI Object + bindings (Phase 5)
+cargo test  -p ferrum-client-core --features data-plane  # FerrumClient-driven mesh runner (Phase 5)
 ```
 `uniffi` bindings (Swift/Kotlin) are generated from the built cdylib — see
 [crates/client-core/bindings/README.md](crates/client-core/bindings/README.md).
@@ -90,7 +90,7 @@ on the new environment before assuming it's still blocked.
   `QuicMeshTransport` (one quinn endpoint, per-peer connections, "hello" announces
   the dialer's advertised addr), `MasqueMeshTransport` (one CONNECT-UDP session per
   peer through a proxy). Selected by `[transport] mode` in config.
-- **OIDC** (`vpn-coordinator`, `oidc` feature): coordinator is a JWT *resource
+- **OIDC** (`ferrum-coordinator`, `oidc` feature): coordinator is a JWT *resource
   server* — verifies RS256/ES256 against a JWKS offline via `ring`, derives device
   tags from a verified claim (so ACL tags become an auth boundary). No external IdP
   needed to test.
@@ -105,11 +105,12 @@ on the new environment before assuming it's still blocked.
 - **Phase 4 (~25%):** mesh data plane (UDP/QUIC/MASQUE) + crypto-demux + roaming are
   built; **ICE/STUN/TURN, DERP-style relays, path upgrade/downgrade, and the per-peer
   connection state machine are not.**
-- **Phase 5 (~30%):** shared `VpnClient` core (M1) + `uniffi` bindings (Swift/Kotlin
-  generate from `FfiVpnClient`) + data-plane glue (`run_mesh_session`) + the
-  TUN-from-fd FFI entry (`device::from_fd` + `FfiVpnClient::run`/`stop`) + a Tauri
-  desktop shell scaffold (`apps/desktop`, control-plane wired). No reliability
-  features yet; the desktop data plane isn't wired.
+- **Phase 5 (~30%):** shared `FerrumClient` core (M1) + `uniffi` bindings (Swift/Kotlin
+  generate from `FfiFerrumClient`) + data-plane glue (`run_mesh_session`) + the
+  TUN-from-fd FFI entry (`device::from_fd` + `FfiFerrumClient::run`/`stop`) + a Tauri
+  desktop shell (`apps/desktop`) whose **`connect` now drives the real data plane**
+  (opens a TUN + runs `data_plane::run_mesh_session`). No reliability features yet;
+  iOS/Android shells and a privileged-helper for the desktop TUN remain.
 - **Phase 6 (~5%):** only `sendmmsg` batching; eBPF/XDP, anycast, scale not started.
 
 ## Recommended next work (highest-value, buildable in Rust)
@@ -118,8 +119,9 @@ on the new environment before assuming it's still blocked.
    (extend the gRPC streams), STUN client for server-reflexive candidates, a
    DERP-style relay keyed by public key, and the per-peer `idle→relay→connecting→
    direct` state machine with path upgrade/downgrade. All expressible in Rust.
-2. **Phase 5 — desktop data plane**: the Tauri shell (`apps/desktop`) is scaffolded and
-   drives the control plane; next, wire its "connect" to open a TUN (Linux
-   `/dev/net/tun`, root) and run `run_mesh_session`, so the GUI actually moves packets.
+2. **Phase 5 — desktop data plane** ✅ *(done)*: the Tauri shell's "connect" opens a
+   TUN (Linux `/dev/net/tun`, root) and runs `run_mesh_session`, so the GUI moves
+   packets. Follow-up: a privileged helper so the GUI need not run as root, and
+   QUIC/MASQUE transport selection.
 3. **Phase 5 — reliability**: kill-switch / always-on / reconnect on the facade.
 4. **Phase 6 / NFR1**: real-hardware throughput; UDP GSO/GRO; eBPF/XDP fast path (Linux).

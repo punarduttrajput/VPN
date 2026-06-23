@@ -18,10 +18,10 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use ferrum_transport::{Transport, BATCH_SIZE};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
-use vpn_transport::{Transport, BATCH_SIZE};
 
 use crate::device::TunDevice;
 use crate::session::{Action, Session, MAX_PACKET};

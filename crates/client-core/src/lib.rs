@@ -4,7 +4,7 @@
 //! - [`ControlClient`] — the gRPC control-plane client: registers the device
 //!   (receiving an assigned tunnel address) and fetches/streams the network map
 //!   of peers it may reach, as a [`TunnelPlan`].
-//! - [`VpnClient`] — the high-level, FFI-ready facade the native shells drive
+//! - [`FerrumClient`] — the high-level, FFI-ready facade the native shells drive
 //!   (Phase 5): a connection state machine over [`ControlClient`] with a peer
 //!   view and an event subscription. The OS data-plane bring-up (TUN +
 //!   `run_mesh`) is supplied by each platform shell.
@@ -16,7 +16,9 @@
 #![cfg_attr(not(feature = "uniffi"), forbid(unsafe_code))]
 
 pub mod client;
-pub use client::{ClientEvent, ClientIdentity, ConnectionState, PeerPath, PeerStatus, VpnClient};
+pub use client::{
+    ClientEvent, ClientIdentity, ConnectionState, FerrumClient, PeerPath, PeerStatus,
+};
 
 #[cfg(feature = "uniffi")]
 pub mod ffi;
@@ -27,10 +29,10 @@ pub mod data_plane;
 #[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();
 
+use ferrum_control_proto::coordinator::coordinator_client::CoordinatorClient;
+use ferrum_control_proto::coordinator::{NetworkMapRequest, RegisterDeviceRequest};
 use thiserror::Error;
 use tonic::transport::Channel;
-use vpn_control_proto::coordinator::coordinator_client::CoordinatorClient;
-use vpn_control_proto::coordinator::{NetworkMapRequest, RegisterDeviceRequest};
 
 /// Errors talking to the coordinator.
 ///
@@ -197,7 +199,7 @@ impl ControlClient {
 
 /// A live stream of network-map updates from the coordinator.
 pub struct NetworkMapStream {
-    inner: tonic::Streaming<vpn_control_proto::coordinator::NetworkMapResponse>,
+    inner: tonic::Streaming<ferrum_control_proto::coordinator::NetworkMapResponse>,
 }
 
 impl NetworkMapStream {
@@ -222,12 +224,12 @@ impl NetworkMapStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrum_control_proto::coordinator::coordinator_server::CoordinatorServer;
+    use ferrum_coordinator::{CoordinatorService, Registry};
     use std::net::Ipv4Addr;
     use std::sync::{Arc, Mutex};
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::transport::Server;
-    use vpn_control_proto::coordinator::coordinator_server::CoordinatorServer;
-    use vpn_coordinator::{CoordinatorService, Registry};
 
     /// Start an in-process coordinator and return its `http://addr` URL.
     async fn start_coordinator() -> String {
@@ -306,7 +308,7 @@ mod tests {
     #[cfg(feature = "mtls")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mtls_accepts_valid_client_and_rejects_wrong_ca() {
-        use vpn_coordinator::pki;
+        use ferrum_coordinator::pki;
 
         let pki = pki::generate().unwrap();
 
