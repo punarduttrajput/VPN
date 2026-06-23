@@ -1,5 +1,5 @@
 // Desktop shell frontend. Talks to the Rust backend (which drives
-// `vpn_client_core::VpnClient`) via Tauri commands + a "client-event" stream.
+// `ferrum_client_core::FerrumClient`) via Tauri commands + a "client-event" stream.
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
@@ -55,11 +55,12 @@ connectBtn.addEventListener("click", async () => {
     await invoke("connect", {
       coordinator: $("coordinator").value.trim(),
       identity: {
-        public_key: $("public_key").value.trim(),
+        private_key: $("private_key").value.trim(),
         name: $("name").value.trim(),
         endpoint: $("endpoint").value.trim(),
         tags: [],
       },
+      listenPort: Number($("listen_port").value),
     });
   } catch (e) {
     log(`connect failed: ${e}`, true);

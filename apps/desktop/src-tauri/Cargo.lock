@@ -4423,18 +4423,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
-name = "vpn-client-core"
+name = "ferrum-client-core"
 version = "0.1.0"
 dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tonic",
  "tracing",
- "vpn-control-proto",
+ "ferrum-control-proto",
 ]
 
 [[package]]
-name = "vpn-control-proto"
+name = "ferrum-control-proto"
 version = "0.1.0"
 dependencies = [
  "prost",
@@ -4444,7 +4444,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "vpn-desktop"
+name = "ferrum-desktop"
 version = "0.1.0"
 dependencies = [
  "log",
@@ -4454,7 +4454,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-log",
  "tokio",
- "vpn-client-core",
+ "ferrum-client-core",
 ]
 
 [[package]]

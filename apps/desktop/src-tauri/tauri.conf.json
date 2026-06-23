@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "vpn-desktop",
+  "productName": "ferrum-desktop",
   "version": "0.1.0",
-  "identifier": "com.nextgenvpn.desktop",
+  "identifier": "com.ferrum.desktop",
   "build": {
     "frontendDist": "../dist"
   },
@@ -10,7 +10,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "Next-Gen VPN",
+        "title": "Ferrum",
         "width": 440,
         "height": 680,
         "resizable": true,
