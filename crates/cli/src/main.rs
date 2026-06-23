@@ -440,14 +440,22 @@ fn build_mesh_peers(private_key_b64: &str, peers: &[PeerSpec]) -> Result<Vec<Mes
                 .map(|c| c.parse::<Cidr>())
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .with_context(|| format!("parsing allowed_ips for peer '{}'", p.public_key))?;
+            // ICE candidates (host + STUN reflexive) to probe for a working path;
+            // skip any that don't parse rather than failing the whole peer.
+            let candidates = p
+                .candidates
+                .iter()
+                .filter_map(|c| c.parse::<SocketAddr>().ok())
+                .collect::<Vec<_>>();
             // Local session indices must be distinct per peer; +1 keeps them non-zero.
             let session = Session::from_bytes(priv_bytes, pub_bytes, (i as u32) + 1)
                 .with_context(|| format!("building session for peer '{}'", p.public_key))?;
-            Ok(MeshPeer {
+            Ok(MeshPeer::with_candidates(
                 session,
                 endpoint,
                 allowed_ips,
-            })
+                candidates,
+            ))
         })
         .collect()
 }

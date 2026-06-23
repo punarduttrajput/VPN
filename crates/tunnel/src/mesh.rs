@@ -32,15 +32,50 @@ use crate::device::TunDevice;
 use crate::session::{Action, Session, MAX_PACKET};
 use crate::Result;
 
-/// One peer in the mesh: its WireGuard session, reachable endpoint, and the
-/// destination CIDRs routed to it.
+/// One peer in the mesh: its WireGuard session, reachable endpoint, the
+/// destination CIDRs routed to it, and any extra ICE candidates to probe.
 pub struct MeshPeer {
     /// WireGuard session for this peer.
     pub session: Session,
-    /// The peer's reachable UDP endpoint.
+    /// The peer's currently selected reachable endpoint. Endpoint roaming
+    /// updates this to the path a valid inbound packet actually arrived on.
     pub endpoint: SocketAddr,
     /// Destination CIDRs routed to this peer (crypto-routing).
     pub allowed_ips: Vec<Cidr>,
+    /// Additional ICE candidate addresses (host + STUN server-reflexive) to try
+    /// while no working path is yet confirmed. The handshake is sent to every
+    /// candidate (plus `endpoint`) until one answers; roaming then locks
+    /// `endpoint` onto whichever path worked. Empty means "only use `endpoint`".
+    pub candidates: Vec<SocketAddr>,
+}
+
+impl MeshPeer {
+    /// A peer reachable at a single known `endpoint` (no extra ICE candidates).
+    pub fn new(session: Session, endpoint: SocketAddr, allowed_ips: Vec<Cidr>) -> Self {
+        Self {
+            session,
+            endpoint,
+            allowed_ips,
+            candidates: Vec::new(),
+        }
+    }
+
+    /// A peer with extra ICE `candidates` to probe (Phase 4 connectivity checks).
+    /// The handshake fans out across `endpoint` and every candidate until one
+    /// answers; endpoint roaming then selects the path that worked.
+    pub fn with_candidates(
+        session: Session,
+        endpoint: SocketAddr,
+        allowed_ips: Vec<Cidr>,
+        candidates: Vec<SocketAddr>,
+    ) -> Self {
+        Self {
+            session,
+            endpoint,
+            allowed_ips,
+            candidates,
+        }
+    }
 }
 
 /// Destination IP of an outbound IP packet (v4 or v6), if parseable.
@@ -65,15 +100,42 @@ fn peer_for_dest(peers: &[MeshPeer], ip: IpAddr) -> Option<usize> {
         .position(|p| p.allowed_ips.iter().any(|c| c.contains(ip)))
 }
 
-/// Kick off a fresh handshake to every peer in `peers`.
+/// Addresses to send a handshake/keepalive to for one peer (Phase 4 M2
+/// connectivity check).
+///
+/// Until a working path is `confirmed` (no inbound datagram has decrypted for
+/// this peer yet), fan handshakes out across *all* of the peer's candidates plus
+/// its current endpoint: whichever candidate is actually reachable delivers the
+/// handshake, and endpoint roaming locks `endpoint` onto the path that answered.
+/// Once confirmed, send only along the roamed `endpoint` — no need to keep
+/// probing dead candidates.
+fn probe_targets(peer: &MeshPeer, confirmed: bool) -> Vec<SocketAddr> {
+    if confirmed || peer.candidates.is_empty() {
+        return vec![peer.endpoint];
+    }
+    let mut targets = Vec::with_capacity(peer.candidates.len() + 1);
+    targets.push(peer.endpoint);
+    for c in &peer.candidates {
+        if !targets.contains(c) {
+            targets.push(*c);
+        }
+    }
+    targets
+}
+
+/// Kick off a fresh handshake to every peer, fanning each across its candidate
+/// addresses (none are confirmed yet at this point).
 async fn handshake_all<M: MeshTransport>(
     transport: &M,
     peers: &mut [MeshPeer],
+    confirmed: &[bool],
     out: &mut [u8],
 ) -> Result<()> {
-    for peer in peers {
+    for (i, peer) in peers.iter_mut().enumerate() {
         if let Action::SendToPeer(pkt) = peer.session.start_handshake(out)? {
-            transport.send_to(peer.endpoint, pkt).await?;
+            for target in probe_targets(peer, confirmed[i]) {
+                transport.send_to(target, pkt).await?;
+            }
         }
     }
     Ok(())
@@ -106,8 +168,14 @@ where
 {
     let mut out = vec![0u8; MAX_PACKET];
 
+    // Per-peer "has a working path been confirmed?" flag, parallel to `peers`.
+    // A path is confirmed once an inbound datagram decrypts for that peer; until
+    // then handshakes fan out across all of its candidates (M2 connectivity
+    // check). Rebuilt whenever the peer set is replaced.
+    let mut confirmed = vec![false; peers.len()];
+
     // Kick off a handshake to every peer we start with.
-    handshake_all(&transport, &mut peers, &mut out).await?;
+    handshake_all(&transport, &mut peers, &confirmed, &mut out).await?;
 
     let mut tun_buf = vec![0u8; MAX_PACKET];
     let mut net_buf = vec![0u8; MAX_PACKET];
@@ -130,7 +198,9 @@ where
                     Some(next) => {
                         info!(peers = next.len(), "applying updated network map");
                         peers = next;
-                        handshake_all(&transport, &mut peers, &mut out).await?;
+                        // New sessions: no confirmed paths yet, so probe candidates.
+                        confirmed = vec![false; peers.len()];
+                        handshake_all(&transport, &mut peers, &confirmed, &mut out).await?;
                     }
                     // Sender dropped: stop polling this branch, keep current peers.
                     None => updates_open = false,
@@ -163,12 +233,15 @@ where
             recv = transport.recv_from(&mut net_buf) => {
                 let (n, src) = recv?;
                 let mut routed = false;
-                for peer in &mut peers {
+                for (i, peer) in peers.iter_mut().enumerate() {
                     let action = match peer.session.decapsulate(&net_buf[..n], &mut out) {
                         Ok(a) => a,
                         // Not this peer's datagram — try the next session.
                         Err(_) => continue,
                     };
+                    // A datagram decrypted for this peer: its path is now
+                    // confirmed, so stop fanning handshakes across candidates.
+                    confirmed[i] = true;
                     // Endpoint roaming: the datagram authenticated against this
                     // peer's session, so `src` is the peer's current reachable
                     // path. Trust it for future sends (the peer is behind a NAT
@@ -193,11 +266,17 @@ where
                 }
             }
 
-            // Timers: service each peer's handshake/keepalive.
+            // Timers: service each peer's handshake/keepalive. A handshake
+            // retransmit for an unconfirmed peer re-probes all its candidates,
+            // so a path can come up even if it wasn't reachable on the first try.
             _ = timer.tick() => {
-                for peer in &mut peers {
+                for (i, peer) in peers.iter_mut().enumerate() {
                     match peer.session.update_timers(&mut out) {
-                        Ok(Action::SendToPeer(pkt)) => { transport.send_to(peer.endpoint, pkt).await?; }
+                        Ok(Action::SendToPeer(pkt)) => {
+                            for target in probe_targets(peer, confirmed[i]) {
+                                transport.send_to(target, pkt).await?;
+                            }
+                        }
                         Ok(_) => {}
                         Err(e) => warn!("timer update error: {e}"),
                     }
@@ -226,21 +305,45 @@ mod tests {
         let b = ferrum_core::keys::KeyPair::generate();
         let me = ferrum_core::keys::KeyPair::generate();
         let peers = vec![
-            MeshPeer {
-                session: Session::from_bytes(me.private.to_bytes(), a.public.to_bytes(), 1)
-                    .unwrap(),
-                endpoint: "127.0.0.1:1".parse().unwrap(),
-                allowed_ips: vec!["10.8.0.2/32".parse().unwrap()],
-            },
-            MeshPeer {
-                session: Session::from_bytes(me.private.to_bytes(), b.public.to_bytes(), 2)
-                    .unwrap(),
-                endpoint: "127.0.0.1:2".parse().unwrap(),
-                allowed_ips: vec!["10.8.0.3/32".parse().unwrap()],
-            },
+            MeshPeer::new(
+                Session::from_bytes(me.private.to_bytes(), a.public.to_bytes(), 1).unwrap(),
+                "127.0.0.1:1".parse().unwrap(),
+                vec!["10.8.0.2/32".parse().unwrap()],
+            ),
+            MeshPeer::new(
+                Session::from_bytes(me.private.to_bytes(), b.public.to_bytes(), 2).unwrap(),
+                "127.0.0.1:2".parse().unwrap(),
+                vec!["10.8.0.3/32".parse().unwrap()],
+            ),
         ];
         assert_eq!(peer_for_dest(&peers, "10.8.0.2".parse().unwrap()), Some(0));
         assert_eq!(peer_for_dest(&peers, "10.8.0.3".parse().unwrap()), Some(1));
         assert_eq!(peer_for_dest(&peers, "10.8.0.9".parse().unwrap()), None);
+    }
+
+    #[test]
+    fn probe_targets_fans_out_until_confirmed() {
+        let me = ferrum_core::keys::KeyPair::generate();
+        let p = ferrum_core::keys::KeyPair::generate();
+        let endpoint: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let cand: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        let peer = MeshPeer::with_candidates(
+            Session::from_bytes(me.private.to_bytes(), p.public.to_bytes(), 1).unwrap(),
+            endpoint,
+            vec!["10.8.0.2/32".parse().unwrap()],
+            vec![endpoint, cand], // includes the endpoint; must be de-duped
+        );
+        // Unconfirmed: probe endpoint + each distinct candidate exactly once.
+        assert_eq!(probe_targets(&peer, false), vec![endpoint, cand]);
+        // Confirmed: only the (roamed) endpoint.
+        assert_eq!(probe_targets(&peer, true), vec![endpoint]);
+
+        // No candidates -> just the endpoint, confirmed or not.
+        let bare = MeshPeer::new(
+            Session::from_bytes(me.private.to_bytes(), p.public.to_bytes(), 2).unwrap(),
+            endpoint,
+            vec!["10.8.0.2/32".parse().unwrap()],
+        );
+        assert_eq!(probe_targets(&bare, false), vec![endpoint]);
     }
 }

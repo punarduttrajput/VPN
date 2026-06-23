@@ -59,14 +59,22 @@ pub fn build_mesh_peers(private_key_b64: &str, peers: &[PeerSpec]) -> Result<Vec
                 .map_err(|e| {
                     Error::DataPlane(format!("allowed_ips for '{}': {e}", p.public_key))
                 })?;
+            // ICE candidates (host + STUN reflexive) to probe for a working path;
+            // unparseable entries are skipped rather than failing the whole peer.
+            let candidates = p
+                .candidates
+                .iter()
+                .filter_map(|c| c.parse::<SocketAddr>().ok())
+                .collect::<Vec<_>>();
             // Local session indices must be distinct per peer; +1 keeps them non-zero.
             let session = Session::from_bytes(priv_bytes, pub_bytes, (i as u32) + 1)
                 .map_err(|e| Error::DataPlane(format!("session for '{}': {e}", p.public_key)))?;
-            Ok(MeshPeer {
+            Ok(MeshPeer::with_candidates(
                 session,
                 endpoint,
                 allowed_ips,
-            })
+                candidates,
+            ))
         })
         .collect()
 }
