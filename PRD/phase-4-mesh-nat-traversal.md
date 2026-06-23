@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Product** | Next-Gen VPN (Rust) |
+| **Product** | Ferrum (Rust) |
 | **Phase** | 4 of 6 — Mesh Networking |
 | **Status** | Draft |
 | **Owner** | punarr@plasmacomp.com |

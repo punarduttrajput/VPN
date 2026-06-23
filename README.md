@@ -1,4 +1,4 @@
-# Next-Gen VPN (Rust, WireGuard-based)
+# Ferrum — a Rust, WireGuard-based VPN
 
 A Rust, WireGuard-based VPN: encrypted tunnel + pluggable transports
 (UDP/QUIC/MASQUE) + a gRPC control plane + a multi-peer mesh data plane.
@@ -11,21 +11,21 @@ architecture, environment notes).
 
 | Crate | Role |
 |-------|------|
-| [`vpn-core`](crates/core) | Keys, config, errors — `#![forbid(unsafe_code)]` foundation |
-| [`vpn-transport`](crates/transport) | `Transport` trait + UDP and QUIC (`quic` feature) implementations (Phase 2) |
-| [`vpn-tunnel`](crates/tunnel) | boringtun session, TUN device trait, transport-generic async event loop |
-| [`vpn-cli`](crates/cli) | `vpn` binary: `keygen`, `up` |
-| [`vpn-control-proto`](crates/control-proto) | gRPC coordinator service contract (Phase 3) |
-| [`vpn-coordinator`](crates/coordinator) | Control-plane coordinator: device registry, IP allocation, network map, ACL policy (Phase 3) |
-| [`vpn-client-core`](crates/client-core) | Client control integration: register with the coordinator, build a tunnel plan from the network map (Phase 3) |
+| [`ferrum-core`](crates/core) | Keys, config, errors — `#![forbid(unsafe_code)]` foundation |
+| [`ferrum-transport`](crates/transport) | `Transport` trait + UDP and QUIC (`quic` feature) implementations (Phase 2) |
+| [`ferrum-tunnel`](crates/tunnel) | boringtun session, TUN device trait, transport-generic async event loop |
+| [`ferrum-cli`](crates/cli) | `ferrum` binary: `keygen`, `up` |
+| [`ferrum-control-proto`](crates/control-proto) | gRPC coordinator service contract (Phase 3) |
+| [`ferrum-coordinator`](crates/coordinator) | Control-plane coordinator: device registry, IP allocation, network map, ACL policy (Phase 3) |
+| [`ferrum-client-core`](crates/client-core) | Client control integration: register with the coordinator, build a tunnel plan from the network map (Phase 3) |
 
 ### Optional features
 
-- `quic` (on `vpn-cli`/`vpn-tunnel`/`vpn-transport`) — build the QUIC datagram transport (quinn + ring-backed rustls). Test it with `cargo test --workspace --features vpn-cli/quic`.
-- `masque` — MASQUE CONNECT-UDP over HTTP/3 (RFC 9298): `MasqueTransport` client + `MasqueProxy` relay. Test with `cargo test --workspace --features vpn-cli/masque`.
-- `real-tun` (on `vpn-tunnel`) — the real OS TUN device (Linux/macOS).
-- `sqlite` (on `vpn-coordinator`) — durable device persistence via bundled SQLite (`--store <path>`).
-- `mtls` (on `vpn-coordinator` / `vpn-client-core`) — mutual TLS on the gRPC channel (`--tls-cert/--tls-key/--tls-ca`; `ControlClient::connect_mtls`).
+- `quic` (on `ferrum-cli`/`ferrum-tunnel`/`ferrum-transport`) — build the QUIC datagram transport (quinn + ring-backed rustls). Test it with `cargo test --workspace --features ferrum-cli/quic`.
+- `masque` — MASQUE CONNECT-UDP over HTTP/3 (RFC 9298): `MasqueTransport` client + `MasqueProxy` relay. Test with `cargo test --workspace --features ferrum-cli/masque`.
+- `real-tun` (on `ferrum-tunnel`) — the real OS TUN device (Linux/macOS).
+- `sqlite` (on `ferrum-coordinator`) — durable device persistence via bundled SQLite (`--store <path>`).
+- `mtls` (on `ferrum-coordinator` / `ferrum-client-core`) — mutual TLS on the gRPC channel (`--tls-cert/--tls-key/--tls-ca`; `ControlClient::connect_mtls`).
 
 ## Build & test
 
@@ -43,8 +43,8 @@ cargo clippy --all-targets
 The OS interface is gated behind the `real-tun` feature (Phase 1 scope):
 
 ```sh
-cargo build --features vpn-tunnel/real-tun        # on Linux/macOS
-sudo ./target/debug/vpn up --config config.toml   # needs privileges
+cargo build --features ferrum-tunnel/real-tun        # on Linux/macOS
+sudo ./target/debug/ferrum up --config config.toml   # needs privileges
 ```
 
 On other hosts (e.g. Windows) the device path returns `UnsupportedPlatform`;
@@ -62,8 +62,8 @@ all crypto/transport logic still builds and is fully tested in-process.
 ## Usage
 
 ```sh
-vpn keygen                          # generate a keypair for each peer
-vpn up --config config.example.toml # bring up the tunnel (Linux/macOS)
+ferrum keygen                          # generate a keypair for each peer
+ferrum up --config config.example.toml # bring up the tunnel (Linux/macOS)
 ```
 
 ### Transport selection (Phase 2)
@@ -74,10 +74,10 @@ The `[transport]` block selects how the encrypted tunnel is carried:
 [transport]
 mode = "quic"        # "udp" (default) or "quic"
 role = "client"      # quic only: one peer "server" (accepts), one "client"
-server_name = "vpn"  # quic only: TLS SNI (peer identity is via WireGuard)
+server_name = "ferrum"  # quic only: TLS SNI (peer identity is via WireGuard)
 ```
 
-QUIC requires building with the feature: `cargo build --features vpn-cli/quic`.
+QUIC requires building with the feature: `cargo build --features ferrum-cli/quic`.
 See [config.quic.example.toml](config.quic.example.toml). Omitting `[transport]`
 keeps plain UDP (Phase 1 behavior).
 

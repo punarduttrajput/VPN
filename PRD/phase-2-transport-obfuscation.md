@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Product** | Next-Gen VPN (Rust) |
+| **Product** | Ferrum (Rust) |
 | **Phase** | 2 of 6 — Transport & Obfuscation Layer |
 | **Status** | Draft |
 | **Owner** | punarr@plasmacomp.com |
@@ -93,7 +93,7 @@ used by Apple iCloud Private Relay.
 
 ### FR6 — Config & CLI
 - Extend Phase 1 config with `[transport]` block (mode, server name, cert/SNI, padding).
-- `vpn up` honors the selected transport transparently.
+- `ferrum up` honors the selected transport transparently.
 
 ---
 

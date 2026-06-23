@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Product** | Next-Gen VPN (Rust) |
+| **Product** | Ferrum (Rust) |
 | **Phase** | 6 of 6 — Production Scale |
 | **Status** | Draft |
 | **Owner** | punarduttrajput |

@@ -35,8 +35,10 @@ pub struct Session {
 impl Session {
     /// Build a session from base64 keys (as they appear in config).
     pub fn from_base64(private_key_b64: &str, peer_public_b64: &str) -> Result<Self> {
-        let priv_bytes = vpn_core::keys::decode_key(private_key_b64).map_err(TunnelError::Core)?;
-        let pub_bytes = vpn_core::keys::decode_key(peer_public_b64).map_err(TunnelError::Core)?;
+        let priv_bytes =
+            ferrum_core::keys::decode_key(private_key_b64).map_err(TunnelError::Core)?;
+        let pub_bytes =
+            ferrum_core::keys::decode_key(peer_public_b64).map_err(TunnelError::Core)?;
         Self::from_bytes(priv_bytes, pub_bytes, 0)
     }
 
@@ -95,7 +97,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vpn_core::keys::KeyPair;
+    use ferrum_core::keys::KeyPair;
 
     /// Drive a full handshake between two in-process sessions, then verify an
     /// IP packet survives a round trip encrypted -> decrypted (PRD M4 + M5).

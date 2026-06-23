@@ -29,7 +29,7 @@ pub struct TunConfig {
     /// Desired interface name (best effort; OS may rename).
     pub name: String,
     /// CIDR address to assign, e.g. `10.8.0.1/24`.
-    pub address: vpn_core::config::Cidr,
+    pub address: ferrum_core::config::Cidr,
     /// MTU for the interface.
     pub mtu: u16,
 }
@@ -119,7 +119,7 @@ impl TunDevice for NoopTun {
 
 /// Wrap a platform-provided TUN file descriptor (Phase 5).
 ///
-/// Native VPN shells (iOS `NEPacketTunnelProvider`, Android `VpnService`) don't
+/// Native VPN shells (iOS `NEPacketTunnelProvider`, Android `FerrumService`) don't
 /// open `/dev/net/tun` themselves — the OS hands them an already-configured fd.
 /// [`from_fd`] adopts that fd and does readiness-based async I/O on it directly
 /// (the `tun` crate ignores a supplied fd on Linux, and no address/MTU setup is

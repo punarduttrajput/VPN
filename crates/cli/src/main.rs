@@ -1,8 +1,8 @@
-//! `vpn` — the Phase 1 command-line client (PRD FR5).
+//! `ferrum` — the Phase 1 command-line client (PRD FR5).
 //!
 //! Subcommands:
-//!   * `vpn keygen`            — print a fresh private/public keypair (base64)
-//!   * `vpn up --config <path>` — bring up the tunnel and run until interrupted
+//!   * `ferrum keygen`            — print a fresh private/public keypair (base64)
+//!   * `ferrum up --config <path>` — bring up the tunnel and run until interrupted
 //!
 //! Logging is via `tracing`, controlled by `RUST_LOG`. Keys and packet payloads
 //! are never logged (NFR3 / FR5).
@@ -15,16 +15,16 @@ use tokio::sync::mpsc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use vpn_client_core::{ControlClient, PeerSpec};
-use vpn_core::config::{Cidr, Config, TransportMode};
-use vpn_core::keys::KeyPair;
-use vpn_transport::{JitteredTransport, UdpMeshTransport, UdpTransport};
-use vpn_tunnel::device::{self, TunConfig};
-use vpn_tunnel::session::Session;
-use vpn_tunnel::{run_mesh, MeshPeer};
+use ferrum_client_core::{ControlClient, PeerSpec};
+use ferrum_core::config::{Cidr, Config, TransportMode};
+use ferrum_core::keys::KeyPair;
+use ferrum_transport::{JitteredTransport, UdpMeshTransport, UdpTransport};
+use ferrum_tunnel::device::{self, TunConfig};
+use ferrum_tunnel::session::Session;
+use ferrum_tunnel::{run_mesh, MeshPeer};
 
 #[derive(Parser)]
-#[command(name = "vpn", version, about = "Next-gen VPN — Phase 1 MVP tunnel")]
+#[command(name = "ferrum", version, about = "Ferrum — Phase 1 MVP tunnel")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -40,7 +40,7 @@ enum Command {
         #[arg(short, long)]
         config: String,
         /// Interface name to request for the TUN device.
-        #[arg(long, default_value = "vpn0")]
+        #[arg(long, default_value = "ferrum0")]
         iface: String,
         /// MTU for the TUN device.
         #[arg(long, default_value_t = 1420)]
@@ -62,7 +62,7 @@ enum Command {
         #[arg(long)]
         endpoint: String,
         /// Human-readable device name registered with the coordinator.
-        #[arg(long, default_value = "vpn-node")]
+        #[arg(long, default_value = "ferrum-node")]
         name: String,
         /// Policy tag for this device (repeatable). Ignored when the coordinator
         /// runs with OIDC auth — tags then come from the verified token.
@@ -73,7 +73,7 @@ enum Command {
         #[arg(long)]
         token_file: Option<String>,
         /// Interface name to request for the TUN device.
-        #[arg(long, default_value = "vpn0")]
+        #[arg(long, default_value = "ferrum0")]
         iface: String,
         /// MTU for the TUN device.
         #[arg(long, default_value_t = 1420)]
@@ -186,13 +186,13 @@ async fn up(config_path: &str, iface: &str, mtu: u16) -> Result<()> {
         TransportMode::Quic => {
             #[cfg(feature = "quic")]
             {
-                use vpn_core::config::TransportRole;
-                use vpn_transport::QuicTransport;
+                use ferrum_core::config::TransportRole;
+                use ferrum_transport::QuicTransport;
                 let server_name = config
                     .transport
                     .server_name
                     .as_deref()
-                    .unwrap_or("vpn")
+                    .unwrap_or("ferrum")
                     .to_string();
                 match config.transport.role {
                     Some(TransportRole::Server) => {
@@ -218,14 +218,14 @@ async fn up(config_path: &str, iface: &str, mtu: u16) -> Result<()> {
             {
                 anyhow::bail!(
                     "config requests transport.mode = quic, but this binary was built \
-                     without the `quic` feature (rebuild with --features vpn-cli/quic)"
+                     without the `quic` feature (rebuild with --features ferrum-cli/quic)"
                 );
             }
         }
         TransportMode::Masque => {
             #[cfg(feature = "masque")]
             {
-                use vpn_transport::MasqueTransport;
+                use ferrum_transport::MasqueTransport;
                 let proxy_addr: SocketAddr = config
                     .transport
                     .masque_proxy
@@ -241,7 +241,7 @@ async fn up(config_path: &str, iface: &str, mtu: u16) -> Result<()> {
                     .transport
                     .server_name
                     .as_deref()
-                    .unwrap_or("vpn")
+                    .unwrap_or("ferrum")
                     .to_string();
                 info!("transport: masque, proxy={proxy_addr}");
                 let transport = MasqueTransport::connect(bind_addr, proxy_addr, &authority, peer)
@@ -253,7 +253,7 @@ async fn up(config_path: &str, iface: &str, mtu: u16) -> Result<()> {
             {
                 anyhow::bail!(
                     "config requests transport.mode = masque, but this binary was built \
-                     without the `masque` feature (rebuild with --features vpn-cli/masque)"
+                     without the `masque` feature (rebuild with --features ferrum-cli/masque)"
                 );
             }
         }
@@ -277,7 +277,7 @@ async fn up_mesh(
 ) -> Result<()> {
     let config = Config::load(config_path)
         .with_context(|| format!("loading config from '{config_path}'"))?;
-    let public_key = vpn_core::keys::public_base64_from_private(&config.private_key)
+    let public_key = ferrum_core::keys::public_base64_from_private(&config.private_key)
         .context("deriving public key from config private_key")?;
 
     info!(coordinator, "registering with coordinator");
@@ -360,7 +360,7 @@ async fn up_mesh(
         TransportMode::Quic => {
             #[cfg(feature = "quic")]
             {
-                let transport = vpn_transport::QuicMeshTransport::bind(bind_addr)
+                let transport = ferrum_transport::QuicMeshTransport::bind(bind_addr)
                     .await
                     .with_context(|| format!("binding QUIC mesh endpoint on {bind_addr}"))?;
                 info!("mesh transport: quic");
@@ -372,7 +372,7 @@ async fn up_mesh(
             {
                 anyhow::bail!(
                     "config requests transport.mode = quic for the mesh, but this binary \
-                     was built without the `quic` feature (rebuild with --features vpn-cli/quic)"
+                     was built without the `quic` feature (rebuild with --features ferrum-cli/quic)"
                 );
             }
         }
@@ -394,9 +394,9 @@ async fn up_mesh(
                     .transport
                     .server_name
                     .as_deref()
-                    .unwrap_or("vpn")
+                    .unwrap_or("ferrum")
                     .to_string();
-                let transport = vpn_transport::MasqueMeshTransport::new(proxy_addr, authority);
+                let transport = ferrum_transport::MasqueMeshTransport::new(proxy_addr, authority);
                 info!(proxy = %proxy_addr, "mesh transport: masque");
                 run_mesh(dev, transport, Vec::new(), rx, shutdown_signal())
                     .await
@@ -406,7 +406,7 @@ async fn up_mesh(
             {
                 anyhow::bail!(
                     "config requests transport.mode = masque for the mesh, but this binary \
-                     was built without the `masque` feature (rebuild with --features vpn-cli/masque)"
+                     was built without the `masque` feature (rebuild with --features ferrum-cli/masque)"
                 );
             }
         }
@@ -422,12 +422,13 @@ async fn up_mesh(
 /// Each peer gets its own [`Session`] (with a distinct local index) over the one
 /// shared UDP socket; outbound packets are routed to a peer by its `allowed_ips`.
 fn build_mesh_peers(private_key_b64: &str, peers: &[PeerSpec]) -> Result<Vec<MeshPeer>> {
-    let priv_bytes = vpn_core::keys::decode_key(private_key_b64).context("decoding private key")?;
+    let priv_bytes =
+        ferrum_core::keys::decode_key(private_key_b64).context("decoding private key")?;
     peers
         .iter()
         .enumerate()
         .map(|(i, p)| {
-            let pub_bytes = vpn_core::keys::decode_key(&p.public_key)
+            let pub_bytes = ferrum_core::keys::decode_key(&p.public_key)
                 .with_context(|| format!("decoding peer public key '{}'", p.public_key))?;
             let endpoint: SocketAddr = p
                 .endpoint
@@ -464,33 +465,33 @@ async fn drive<D, T>(
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()>
 where
-    D: vpn_tunnel::device::TunDevice + Send + 'static,
-    T: vpn_transport::Transport + Send + Sync + 'static,
+    D: ferrum_tunnel::device::TunDevice + Send + 'static,
+    T: ferrum_transport::Transport + Send + Sync + 'static,
 {
     // Layer order (outermost first): jitter → padding → inner transport.
     // Jitter goes outside padding so the randomly delayed packet is already
     // fully framed; swapping the order would still work but is less logical.
     match (pad_to, jitter_ms) {
-        (Some(p), Some(ms)) => vpn_tunnel::run(
+        (Some(p), Some(ms)) => ferrum_tunnel::run(
             session,
             device,
             JitteredTransport::new(
-                vpn_transport::PaddedTransport::new(transport, p as usize),
+                ferrum_transport::PaddedTransport::new(transport, p as usize),
                 ms,
             ),
             shutdown,
         )
         .await
         .context("tunnel event loop")?,
-        (Some(p), None) => vpn_tunnel::run(
+        (Some(p), None) => ferrum_tunnel::run(
             session,
             device,
-            vpn_transport::PaddedTransport::new(transport, p as usize),
+            ferrum_transport::PaddedTransport::new(transport, p as usize),
             shutdown,
         )
         .await
         .context("tunnel event loop")?,
-        (None, Some(ms)) => vpn_tunnel::run(
+        (None, Some(ms)) => ferrum_tunnel::run(
             session,
             device,
             JitteredTransport::new(transport, ms),
@@ -498,7 +499,7 @@ where
         )
         .await
         .context("tunnel event loop")?,
-        (None, None) => vpn_tunnel::run(session, device, transport, shutdown)
+        (None, None) => ferrum_tunnel::run(session, device, transport, shutdown)
             .await
             .context("tunnel event loop")?,
     }

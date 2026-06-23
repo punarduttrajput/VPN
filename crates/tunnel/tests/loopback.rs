@@ -6,12 +6,12 @@
 
 use std::time::Duration;
 
+use ferrum_core::keys::KeyPair;
+use ferrum_transport::UdpTransport;
+use ferrum_tunnel::device::mock::MockTun;
+use ferrum_tunnel::session::Session;
 use tokio::net::UdpSocket;
 use tokio::sync::oneshot;
-use vpn_core::keys::KeyPair;
-use vpn_transport::UdpTransport;
-use vpn_tunnel::device::mock::MockTun;
-use vpn_tunnel::session::Session;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn packet_traverses_tunnel_between_two_peers() {
@@ -43,13 +43,13 @@ async fn packet_traverses_tunnel_between_two_peers() {
     let (stop_b_tx, stop_b_rx) = oneshot::channel();
 
     let run_a = tokio::spawn(async move {
-        vpn_tunnel::run(sess_a, tun_a, trans_a, async {
+        ferrum_tunnel::run(sess_a, tun_a, trans_a, async {
             stop_a_rx.await.ok();
         })
         .await
     });
     let run_b = tokio::spawn(async move {
-        vpn_tunnel::run(sess_b, tun_b, trans_b, async {
+        ferrum_tunnel::run(sess_b, tun_b, trans_b, async {
             stop_b_rx.await.ok();
         })
         .await

@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Product** | Next-Gen VPN (Rust) |
+| **Product** | Ferrum (Rust) |
 | **Phase** | 1 of 6 — MVP Data Plane |
 | **Status** | Draft |
 | **Owner** | punarr@plasmacomp.com |
@@ -98,8 +98,8 @@ PRD covers only the `core`, `tunnel`, and `cli` crates.
 - Provide a `keygen` subcommand to generate a Curve25519 keypair (base64).
 
 ### FR5 — CLI
-- `vpn keygen` → prints a new private/public keypair.
-- `vpn up --config <path>` → brings up the tunnel and runs until interrupted.
+- `ferrum keygen` → prints a new private/public keypair.
+- `ferrum up --config <path>` → brings up the tunnel and runs until interrupted.
 - Structured logging via `tracing` (levels controlled by `RUST_LOG`).
 - **No packet payloads or keys are ever logged.**
 

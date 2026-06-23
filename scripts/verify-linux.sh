@@ -16,8 +16,8 @@
 set -euo pipefail
 
 # ---- tunables -------------------------------------------------------------
-NS1=vpnt1            # namespace for peer A
-NS2=vpnt2            # namespace for peer B
+NS1=ferrumt1            # namespace for peer A
+NS2=ferrumt2            # namespace for peer B
 UL1=10.66.0.1       # underlay (carries encrypted UDP) — peer A
 UL2=10.66.0.2       # underlay — peer B
 TUN1=10.8.0.1       # tunnel IP — peer A
@@ -52,7 +52,7 @@ MESH_QUIC=${MESH_QUIC:-0}
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"
-BIN="$ROOT/target/release/vpn"
+BIN="$ROOT/target/release/ferrum"
 PIDS=()
 PASS=0
 FAIL=0
@@ -99,10 +99,10 @@ for tool in cargo ip tc iperf3 ping awk; do
   command -v "$tool" >/dev/null || { red "missing required tool: $tool"; exit 2; }
 done
 
-BUILD_FEATURES="vpn-tunnel/real-tun"
+BUILD_FEATURES="ferrum-tunnel/real-tun"
 # QUIC is needed for the QUIC point-to-point test and/or a QUIC-carried mesh.
 if [ "$TEST_QUIC" = "1" ] || { [ "$TEST_MESH" = "1" ] && [ "$MESH_QUIC" = "1" ]; }; then
-  BUILD_FEATURES="vpn-cli/quic vpn-tunnel/real-tun"
+  BUILD_FEATURES="ferrum-cli/quic ferrum-tunnel/real-tun"
 fi
 info "Building workspace (release) with features: $BUILD_FEATURES"
 ( cd "$ROOT" && CARGO_NET_OFFLINE=false cargo build --release --features "$BUILD_FEATURES" )
@@ -165,16 +165,16 @@ fi
 
 # ---- bring up tunnels (M3) -----------------------------------------------
 info "Bringing up tunnel in each namespace (M3: real TUN device)"
-ip netns exec "$NS1" "$BIN" up --config "$WORK/a.toml" --iface vpn0 \
+ip netns exec "$NS1" "$BIN" up --config "$WORK/a.toml" --iface ferrum0 \
   >"$WORK/a.log" 2>&1 & PIDS+=($!)
-ip netns exec "$NS2" "$BIN" up --config "$WORK/b.toml" --iface vpn0 \
+ip netns exec "$NS2" "$BIN" up --config "$WORK/b.toml" --iface ferrum0 \
   >"$WORK/b.log" 2>&1 & PIDS+=($!)
 sleep 3  # allow handshake (NFR4 target < 1s; we give margin)
 
-check "TUN interface vpn0 exists in ns A" \
-  ip netns exec "$NS1" ip link show vpn0 >/dev/null
-check "TUN interface vpn0 exists in ns B" \
-  ip netns exec "$NS2" ip link show vpn0 >/dev/null
+check "TUN interface ferrum0 exists in ns A" \
+  ip netns exec "$NS1" ip link show ferrum0 >/dev/null
+check "TUN interface ferrum0 exists in ns B" \
+  ip netns exec "$NS2" ip link show ferrum0 >/dev/null
 
 # ---- ping across the tunnel (M5) -----------------------------------------
 info "Pinging across the encrypted tunnel (M5)"
@@ -270,7 +270,7 @@ allowed_ips = ["$TUN2/32"]
 [transport]
 mode = "quic"
 role = "client"
-server_name = "vpn"
+server_name = "ferrum"
 EOF
 
   cat > "$WORK/b-quic.toml" <<EOF
@@ -286,19 +286,19 @@ allowed_ips = ["$TUN1/32"]
 [transport]
 mode = "quic"
 role = "server"
-server_name = "vpn"
+server_name = "ferrum"
 EOF
 
   # Start the server first so it is accepting before the client connects.
-  ip netns exec "$NS2" "$BIN" up --config "$WORK/b-quic.toml" --iface vpn0 \
+  ip netns exec "$NS2" "$BIN" up --config "$WORK/b-quic.toml" --iface ferrum0 \
     >"$WORK/b.log" 2>&1 & PIDS+=($!)
   sleep 1
-  ip netns exec "$NS1" "$BIN" up --config "$WORK/a-quic.toml" --iface vpn0 \
+  ip netns exec "$NS1" "$BIN" up --config "$WORK/a-quic.toml" --iface ferrum0 \
     >"$WORK/a.log" 2>&1 & PIDS+=($!)
   sleep 4  # QUIC handshake + tunnel handshake
 
-  check "QUIC: TUN vpn0 up in client ns" \
-    ip netns exec "$NS1" ip link show vpn0 >/dev/null
+  check "QUIC: TUN ferrum0 up in client ns" \
+    ip netns exec "$NS1" ip link show ferrum0 >/dev/null
   check "QUIC: ping $TUN2 from client over tunnel" \
     ip netns exec "$NS1" ping -c 5 -W 2 "$TUN2" >/dev/null
 
@@ -315,7 +315,7 @@ fi
 if [ "$TEST_MESH" = "1" ]; then
   MESH_KIND="udp"; [ "$MESH_QUIC" = "1" ] && MESH_KIND="quic"
   info "Phase 3 coordinator mesh over real TUN (TEST_MESH=1, transport=$MESH_KIND)"
-  COORD_BIN="$ROOT/target/release/vpn-coordinator"
+  COORD_BIN="$ROOT/target/release/ferrum-coordinator"
   MESH_A=10.8.0.2          # first registrant
   MESH_B=10.8.0.3          # second registrant
   COORD_URL="http://$UL1:$COORD_PORT"
@@ -344,7 +344,7 @@ allowed_ips = ["10.8.0.0/24"]
 [transport]
 mode = "quic"
 role = "client"
-server_name = "vpn"
+server_name = "ferrum"
 CFG
     done
   fi
@@ -359,18 +359,18 @@ CFG
 
     # Node A registers first (assigned .2), then node B (assigned .3).
     ip netns exec "$NS1" "$BIN" up-mesh --config "$MESH_A_CFG" \
-      --coordinator "$COORD_URL" --endpoint "$UL1:$PORT" --name node-a --iface vpn0 \
+      --coordinator "$COORD_URL" --endpoint "$UL1:$PORT" --name node-a --iface ferrum0 \
       >"$WORK/mesh-a.log" 2>&1 & PIDS+=($!)
     sleep 2
     ip netns exec "$NS2" "$BIN" up-mesh --config "$MESH_B_CFG" \
-      --coordinator "$COORD_URL" --endpoint "$UL2:$PORT" --name node-b --iface vpn0 \
+      --coordinator "$COORD_URL" --endpoint "$UL2:$PORT" --name node-b --iface ferrum0 \
       >"$WORK/mesh-b.log" 2>&1 & PIDS+=($!)
     sleep 5  # registration + watch convergence + (QUIC +) WireGuard handshake
 
-    check "mesh: TUN vpn0 up in node A" \
-      ip netns exec "$NS1" ip link show vpn0 >/dev/null
-    check "mesh: TUN vpn0 up in node B" \
-      ip netns exec "$NS2" ip link show vpn0 >/dev/null
+    check "mesh: TUN ferrum0 up in node A" \
+      ip netns exec "$NS1" ip link show ferrum0 >/dev/null
+    check "mesh: TUN ferrum0 up in node B" \
+      ip netns exec "$NS2" ip link show ferrum0 >/dev/null
     check "mesh: ping $MESH_B from A over coordinator-built tunnel" \
       ip netns exec "$NS1" ping -c 5 -W 2 "$MESH_B" >/dev/null
     check "mesh: ping $MESH_A from B over coordinator-built tunnel" \

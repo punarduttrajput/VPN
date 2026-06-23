@@ -1,14 +1,14 @@
 //! uniffi FFI layer for the Phase 5 client facade (FR1).
 //!
-//! [`FfiVpnClient`] is a thin, FFI-safe wrapper around [`VpnClient`](crate::VpnClient):
+//! [`FfiFerrumClient`] is a thin, FFI-safe wrapper around [`FerrumClient`](crate::FerrumClient):
 //! the native shells (iOS/Android/desktop) drive *this* object through the
 //! generated Swift/Kotlin bindings. It is intentionally minimal — the same
 //! connection lifecycle, peer view, and event stream as the core facade, with a
 //! shape uniffi can export:
 //!
 //! - the core's `Clone` + `broadcast::Sender` don't map onto a uniffi `Object`,
-//!   so we wrap rather than annotate `VpnClient` directly;
-//! - events are delivered **pull-style** via [`FfiVpnClient::next_event`] (the
+//!   so we wrap rather than annotate `FerrumClient` directly;
+//! - events are delivered **pull-style** via [`FfiFerrumClient::next_event`] (the
 //!   wrapper holds a dedicated `broadcast::Receiver`) rather than a callback
 //!   interface — a foreign caller loops on it from a `Task`/coroutine. A
 //!   push/callback variant can be added later if a shell wants it.
@@ -20,28 +20,30 @@ use std::sync::Arc;
 
 use tokio::sync::{broadcast, Mutex};
 
-use crate::{ClientEvent, ClientIdentity, ConnectionState, Error, PeerSpec, PeerStatus, VpnClient};
+use crate::{
+    ClientEvent, ClientIdentity, ConnectionState, Error, FerrumClient, PeerSpec, PeerStatus,
+};
 
-/// FFI handle to a VPN client. Construct with [`FfiVpnClient::new`], then drive
+/// FFI handle to a VPN client. Construct with [`FfiFerrumClient::new`], then drive
 /// the connection and observe state through the exported methods.
 #[derive(uniffi::Object)]
-pub struct FfiVpnClient {
-    inner: VpnClient,
+pub struct FfiFerrumClient {
+    inner: FerrumClient,
     /// Dedicated receiver backing `next_event`; a `Mutex` because uniffi methods
     /// take `&self` and `broadcast::Receiver::recv` needs `&mut`.
     events: Mutex<broadcast::Receiver<ClientEvent>>,
-    /// Shutdown trigger for a running [`run`](FfiVpnClient::run); `stop` takes and
+    /// Shutdown trigger for a running [`run`](FfiFerrumClient::run); `stop` takes and
     /// fires it. `std::sync::Mutex` (never held across an await).
     #[cfg(feature = "data-plane")]
     shutdown: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
-impl FfiVpnClient {
+impl FfiFerrumClient {
     /// Create a fresh, disconnected client.
     #[uniffi::constructor]
     pub fn new() -> Arc<Self> {
-        let inner = VpnClient::new();
+        let inner = FerrumClient::new();
         let events = Mutex::new(inner.subscribe());
         Arc::new(Self {
             inner,
@@ -106,10 +108,10 @@ impl FfiVpnClient {
 /// the OS TUN file descriptor and this runs the full mesh data plane on it.
 #[cfg(feature = "data-plane")]
 #[uniffi::export(async_runtime = "tokio")]
-impl FfiVpnClient {
+impl FfiFerrumClient {
     /// Run the VPN on a platform-provided TUN `tun_fd`: register with the
     /// `coordinator`, bring up the mesh over a UDP underlay bound to
-    /// `listen_port`, and keep it converged until [`stop`](FfiVpnClient::stop).
+    /// `listen_port`, and keep it converged until [`stop`](FfiFerrumClient::stop).
     ///
     /// Blocks (as an async call) for the lifetime of the tunnel; the foreign
     /// caller runs it on a background task and calls `stop` to end it.
@@ -124,11 +126,11 @@ impl FfiVpnClient {
         listen_port: u16,
     ) -> Result<(), Error> {
         let device =
-            vpn_tunnel::device::from_fd(tun_fd).map_err(|e| Error::DataPlane(e.to_string()))?;
+            ferrum_tunnel::device::from_fd(tun_fd).map_err(|e| Error::DataPlane(e.to_string()))?;
         let bind: std::net::SocketAddr = format!("0.0.0.0:{listen_port}")
             .parse()
             .map_err(|e| Error::DataPlane(format!("bind address: {e}")))?;
-        let transport = vpn_transport::UdpMeshTransport::bind(bind)
+        let transport = ferrum_transport::UdpMeshTransport::bind(bind)
             .await
             .map_err(|e| Error::DataPlane(e.to_string()))?;
 
@@ -150,7 +152,7 @@ impl FfiVpnClient {
         .await
     }
 
-    /// Signal a running [`run`](FfiVpnClient::run) to tear down; the client
+    /// Signal a running [`run`](FfiFerrumClient::run) to tear down; the client
     /// returns to `Disconnected`. A no-op if nothing is running.
     pub fn stop(&self) {
         if let Some(tx) = self
@@ -170,7 +172,7 @@ mod tests {
 
     #[test]
     fn ffi_client_starts_disconnected() {
-        let c = FfiVpnClient::new();
+        let c = FfiFerrumClient::new();
         assert_eq!(c.status(), ConnectionState::Disconnected);
         assert!(c.peers().is_empty());
         assert!(c.address().is_none());
@@ -178,7 +180,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ffi_next_event_observes_disconnect() {
-        let c = FfiVpnClient::new();
+        let c = FfiFerrumClient::new();
         // A local-only transition we can drive without a coordinator.
         c.apply_peers(vec![]);
         assert_eq!(c.next_event().await, Some(ClientEvent::PeersUpdated(0)));

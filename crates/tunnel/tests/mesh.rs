@@ -4,14 +4,14 @@
 
 use std::time::Duration;
 
+use ferrum_core::config::Cidr;
+use ferrum_core::keys::KeyPair;
+use ferrum_transport::UdpMeshTransport;
+use ferrum_tunnel::device::mock::MockTun;
+use ferrum_tunnel::session::Session;
+use ferrum_tunnel::{run_mesh, MeshPeer};
 use tokio::net::UdpSocket;
 use tokio::sync::oneshot;
-use vpn_core::config::Cidr;
-use vpn_core::keys::KeyPair;
-use vpn_transport::UdpMeshTransport;
-use vpn_tunnel::device::mock::MockTun;
-use vpn_tunnel::session::Session;
-use vpn_tunnel::{run_mesh, MeshPeer};
 
 fn ipv4(dst: [u8; 4]) -> Vec<u8> {
     let mut p = vec![0u8; 20];
@@ -362,7 +362,7 @@ async fn mesh_roams_peer_endpoint_to_observed_source() {
 #[cfg(feature = "masque")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn masque_mesh_node_reaches_udp_peer() {
-    use vpn_transport::{MasqueMeshTransport, MasqueProxy};
+    use ferrum_transport::{MasqueMeshTransport, MasqueProxy};
 
     let (m, x) = (KeyPair::generate(), KeyPair::generate());
 
@@ -423,7 +423,7 @@ async fn masque_mesh_node_reaches_udp_peer() {
     let jm = tokio::spawn(async move {
         run_mesh(
             tun_m,
-            MasqueMeshTransport::new(proxy_addr, "vpn"),
+            MasqueMeshTransport::new(proxy_addr, "ferrum"),
             m_peers,
             um_rx,
             async {
@@ -555,7 +555,7 @@ async fn mesh_applies_peers_from_a_live_update() {
 #[cfg(feature = "quic")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn quic_mesh_routes_packets_to_the_right_peer() {
-    use vpn_transport::QuicMeshTransport;
+    use ferrum_transport::QuicMeshTransport;
 
     let (a, b, c) = (
         KeyPair::generate(),

@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package vpn.coordinator.v1;
+package ferrum.coordinator.v1;
 
 // The control-plane coordinator (PRD Phase 3, FR1/FR3).
 // Devices register their public key + reachable endpoint and receive a tunnel

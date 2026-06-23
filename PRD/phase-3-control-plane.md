@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Product** | Next-Gen VPN (Rust) |
+| **Product** | Ferrum (Rust) |
 | **Phase** | 3 of 6 — Control Plane |
 | **Status** | Draft |
 | **Owner** | punarr@plasmacomp.com |

@@ -1,7 +1,7 @@
 [package]
-name = "vpn-desktop"
+name = "ferrum-desktop"
 version = "0.1.0"
-description = "Next-Gen VPN desktop shell (Tauri, Phase 5 FR4)"
+description = "Ferrum desktop shell (Tauri, Phase 5 FR4)"
 authors = ["Plasma Comp"]
 license = "MIT OR Apache-2.0"
 edition = "2021"
@@ -25,7 +25,18 @@ log = "0.4"
 tauri = { version = "2.11.3" }
 tauri-plugin-log = "2"
 tokio = { version = "1", features = ["sync"] }
-# The shared client core (Phase 5 facade). Default features = control-plane
-# (connect/disconnect/status/peers/events); the `data-plane` runner + TUN
-# bring-up is the next increment (needs elevated privileges on Linux/macOS).
-vpn-client-core = { path = "../../../crates/client-core" }
+# The shared client core (Phase 5 facade) with the `data-plane` runner enabled:
+# `connect` opens a TUN and drives `run_mesh_session`, so the GUI moves packets.
+ferrum-client-core = { path = "../../../crates/client-core", features = ["data-plane"] }
+# The mesh transport (`UdpMeshTransport`) and TUN device / key helpers the shell
+# wires together when bringing up the data plane.
+ferrum-transport = { path = "../../../crates/transport" }
+ferrum-tunnel = { path = "../../../crates/tunnel" }
+ferrum-core = { path = "../../../crates/core" }
+
+# The real OS TUN device only exists on Unix (Linux/macOS) and pulls in the
+# `tun` driver crate, so enable it only there. On Windows the dev build still
+# compiles; `device::open` returns `UnsupportedPlatform` and `connect` surfaces
+# a clean error to the UI.
+[target.'cfg(unix)'.dependencies]
+ferrum-tunnel = { path = "../../../crates/tunnel", features = ["real-tun"] }

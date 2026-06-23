@@ -70,7 +70,7 @@ pub struct TransportConfig {
     /// Required for `quic`: this endpoint's role (`client` or `server`).
     #[serde(default)]
     pub role: Option<TransportRole>,
-    /// TLS server name for QUIC / MASQUE (defaults to `vpn`).
+    /// TLS server name for QUIC / MASQUE (defaults to `ferrum`).
     #[serde(default)]
     pub server_name: Option<String>,
     /// Required for `masque`: the MASQUE proxy's socket address (`ip:port`).
@@ -341,13 +341,13 @@ mod tests {
     #[test]
     fn parses_quic_transport_block() {
         let toml_str = format!(
-            "{}\n[transport]\nmode = \"quic\"\nrole = \"client\"\nserver_name = \"vpn\"\n",
+            "{}\n[transport]\nmode = \"quic\"\nrole = \"client\"\nserver_name = \"ferrum\"\n",
             valid_toml()
         );
         let cfg: Config = toml::from_str(&toml_str).unwrap();
         assert_eq!(cfg.transport.mode, TransportMode::Quic);
         assert_eq!(cfg.transport.role, Some(TransportRole::Client));
-        assert_eq!(cfg.transport.server_name.as_deref(), Some("vpn"));
+        assert_eq!(cfg.transport.server_name.as_deref(), Some("ferrum"));
         cfg.validate().unwrap();
     }
 
@@ -401,7 +401,7 @@ mod tests {
     #[test]
     fn parses_masque_transport_block() {
         let toml_str = format!(
-            "{}\n[transport]\nmode = \"masque\"\nmasque_proxy = \"203.0.113.1:443\"\nserver_name = \"vpn\"\n",
+            "{}\n[transport]\nmode = \"masque\"\nmasque_proxy = \"203.0.113.1:443\"\nserver_name = \"ferrum\"\n",
             valid_toml()
         );
         let cfg: Config = toml::from_str(&toml_str).unwrap();
@@ -410,7 +410,7 @@ mod tests {
             cfg.transport.masque_proxy.as_deref(),
             Some("203.0.113.1:443")
         );
-        assert_eq!(cfg.transport.server_name.as_deref(), Some("vpn"));
+        assert_eq!(cfg.transport.server_name.as_deref(), Some("ferrum"));
         cfg.validate().unwrap();
     }
 

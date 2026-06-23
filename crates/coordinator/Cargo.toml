@@ -1,12 +1,12 @@
 [package]
-name = "vpn-coordinator"
+name = "ferrum-coordinator"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
 [[bin]]
-name = "vpn-coordinator"
+name = "ferrum-coordinator"
 path = "src/main.rs"
 
 [features]
@@ -21,7 +21,7 @@ mtls = ["tonic/tls", "dep:rcgen", "dep:rustls"]
 oidc = ["dep:ring", "dep:base64", "dep:serde_json"]
 
 [dependencies]
-vpn-control-proto = { path = "../control-proto" }
+ferrum-control-proto = { path = "../control-proto" }
 tonic.workspace = true
 prost.workspace = true
 tokio.workspace = true

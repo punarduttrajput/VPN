@@ -382,10 +382,10 @@ mod tests {
     #[test]
     fn accepts_valid_token_and_extracts_tags() {
         let s = TestSigner::new("k1");
-        let v = s.verifier("https://idp.example", "vpn-coordinator");
+        let v = s.verifier("https://idp.example", "ferrum-coordinator");
         let token = s.sign(&claims(
             "https://idp.example",
-            "vpn-coordinator",
+            "ferrum-coordinator",
             far_future(),
             r#","tags":["dev","laptop"]"#,
         ));
@@ -397,10 +397,10 @@ mod tests {
     #[test]
     fn falls_back_to_groups_claim_for_tags() {
         let s = TestSigner::new("k1");
-        let v = s.verifier("https://idp.example", "vpn-coordinator");
+        let v = s.verifier("https://idp.example", "ferrum-coordinator");
         let token = s.sign(&claims(
             "https://idp.example",
-            "vpn-coordinator",
+            "ferrum-coordinator",
             far_future(),
             r#","groups":["server"]"#,
         ));
@@ -410,10 +410,10 @@ mod tests {
     #[test]
     fn rejects_tampered_payload() {
         let s = TestSigner::new("k1");
-        let v = s.verifier("https://idp.example", "vpn-coordinator");
+        let v = s.verifier("https://idp.example", "ferrum-coordinator");
         let token = s.sign(&claims(
             "https://idp.example",
-            "vpn-coordinator",
+            "ferrum-coordinator",
             far_future(),
             r#","tags":["dev"]"#,
         ));
@@ -421,7 +421,7 @@ mod tests {
         let mut parts: Vec<&str> = token.split('.').collect();
         let forged = B64URL.encode(claims(
             "https://idp.example",
-            "vpn-coordinator",
+            "ferrum-coordinator",
             far_future(),
             r#","tags":["admin"]"#,
         ));
@@ -433,10 +433,10 @@ mod tests {
     #[test]
     fn rejects_wrong_issuer_and_audience() {
         let s = TestSigner::new("k1");
-        let v = s.verifier("https://idp.example", "vpn-coordinator");
+        let v = s.verifier("https://idp.example", "ferrum-coordinator");
         let bad_iss = s.sign(&claims(
             "https://evil.example",
-            "vpn-coordinator",
+            "ferrum-coordinator",
             far_future(),
             "",
         ));
@@ -453,8 +453,13 @@ mod tests {
     #[test]
     fn rejects_expired_token() {
         let s = TestSigner::new("k1");
-        let v = s.verifier("https://idp.example", "vpn-coordinator");
-        let token = s.sign(&claims("https://idp.example", "vpn-coordinator", 1000, ""));
+        let v = s.verifier("https://idp.example", "ferrum-coordinator");
+        let token = s.sign(&claims(
+            "https://idp.example",
+            "ferrum-coordinator",
+            1000,
+            "",
+        ));
         assert!(matches!(v.verify(&token), Err(AuthError::Expired)));
     }
 
@@ -463,10 +468,10 @@ mod tests {
         let signer = TestSigner::new("k1");
         // Verifier trusts a *different* signer's JWKS.
         let other = TestSigner::new("k1");
-        let v = other.verifier("https://idp.example", "vpn-coordinator");
+        let v = other.verifier("https://idp.example", "ferrum-coordinator");
         let token = signer.sign(&claims(
             "https://idp.example",
-            "vpn-coordinator",
+            "ferrum-coordinator",
             far_future(),
             "",
         ));
@@ -476,9 +481,9 @@ mod tests {
     #[test]
     fn accepts_audience_array() {
         let s = TestSigner::new("k1");
-        let v = s.verifier("https://idp.example", "vpn-coordinator");
+        let v = s.verifier("https://idp.example", "ferrum-coordinator");
         let body = format!(
-            r#"{{"iss":"https://idp.example","aud":["a","vpn-coordinator"],"sub":"bob","exp":{}}}"#,
+            r#"{{"iss":"https://idp.example","aud":["a","ferrum-coordinator"],"sub":"bob","exp":{}}}"#,
             far_future()
         );
         assert_eq!(v.verify(&s.sign(&body)).unwrap().subject, "bob");
@@ -487,7 +492,7 @@ mod tests {
     #[test]
     fn rejects_malformed_token() {
         let s = TestSigner::new("k1");
-        let v = s.verifier("https://idp.example", "vpn-coordinator");
+        let v = s.verifier("https://idp.example", "ferrum-coordinator");
         assert!(matches!(v.verify("not-a-jwt"), Err(AuthError::Malformed)));
     }
 }

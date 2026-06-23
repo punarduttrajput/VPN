@@ -3,13 +3,13 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Next-Gen VPN</title>
+    <title>Ferrum</title>
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
     <main>
       <header>
-        <h1>Next-Gen VPN</h1>
+        <h1>Ferrum</h1>
         <span id="state" class="state disconnected">Disconnected</span>
       </header>
 
@@ -20,11 +20,14 @@
         <label>Device name
           <input id="name" type="text" value="desktop" />
         </label>
-        <label>Public key (base64)
-          <input id="public_key" type="text" placeholder="wg public key" />
+        <label>Private key (base64)
+          <input id="private_key" type="password" placeholder="wg private key" />
         </label>
         <label>Advertised endpoint
           <input id="endpoint" type="text" value="0.0.0.0:51820" />
+        </label>
+        <label>Listen port
+          <input id="listen_port" type="number" value="51820" min="1" max="65535" />
         </label>
         <div class="actions">
           <button id="connect">Connect</button>

@@ -270,7 +270,7 @@ mod tests {
     fn registry_persists_devices_across_restart() {
         use crate::sqlite::SqliteStore;
 
-        let path = std::env::temp_dir().join(format!("vpn-reg-test-{}.db", std::process::id()));
+        let path = std::env::temp_dir().join(format!("ferrum-reg-test-{}.db", std::process::id()));
         let path = path.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&path);
 

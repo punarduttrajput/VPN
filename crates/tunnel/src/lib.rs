@@ -18,7 +18,7 @@ use thiserror::Error;
 pub enum TunnelError {
     /// A core (key/config) error.
     #[error(transparent)]
-    Core(#[from] vpn_core::Error),
+    Core(#[from] ferrum_core::Error),
 
     /// boringtun reported a WireGuard protocol error.
     #[error("wireguard error: {0:?}")]
@@ -34,7 +34,7 @@ pub enum TunnelError {
 
     /// A transport (UDP/QUIC) error.
     #[error(transparent)]
-    Transport(#[from] vpn_transport::TransportError),
+    Transport(#[from] ferrum_transport::TransportError),
 
     /// The TUN device is not available on this platform.
     #[error("TUN device is not supported on this platform (Phase 1: Linux/macOS only)")]

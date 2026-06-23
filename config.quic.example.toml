@@ -1,5 +1,5 @@
 # Example QUIC-transport config (PRD Phase 2, FR2/FR6).
-# Build with the quic feature:  cargo build --features vpn-cli/quic
+# Build with the quic feature:  cargo build --features ferrum-cli/quic
 # One peer must be role = "server" (accepts), the other role = "client" (connects).
 #
 # This peer is 10.8.0.1 acting as the QUIC client; the remote (10.8.0.2) is the
@@ -17,4 +17,4 @@ allowed_ips = ["10.8.0.2/32"]
 [transport]
 mode = "quic"
 role = "client"        # the other peer uses role = "server"
-server_name = "vpn"    # TLS SNI presented/expected (peer identity is via WireGuard)
+server_name = "ferrum"    # TLS SNI presented/expected (peer identity is via WireGuard)
