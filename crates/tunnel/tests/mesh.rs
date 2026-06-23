@@ -44,27 +44,27 @@ async fn mesh_routes_packets_to_the_right_peer() {
 
     // A is meshed with B (10.8.0.2) and C (10.8.0.3).
     let a_peers = vec![
-        MeshPeer {
-            session: Session::from_bytes(a.private.to_bytes(), b.public.to_bytes(), 1).unwrap(),
-            endpoint: addr_b,
-            allowed_ips: vec![cidr("10.8.0.2/32")],
-        },
-        MeshPeer {
-            session: Session::from_bytes(a.private.to_bytes(), c.public.to_bytes(), 2).unwrap(),
-            endpoint: addr_c,
-            allowed_ips: vec![cidr("10.8.0.3/32")],
-        },
+        MeshPeer::new(
+            Session::from_bytes(a.private.to_bytes(), b.public.to_bytes(), 1).unwrap(),
+            addr_b,
+            vec![cidr("10.8.0.2/32")],
+        ),
+        MeshPeer::new(
+            Session::from_bytes(a.private.to_bytes(), c.public.to_bytes(), 2).unwrap(),
+            addr_c,
+            vec![cidr("10.8.0.3/32")],
+        ),
     ];
-    let b_peers = vec![MeshPeer {
-        session: Session::from_bytes(b.private.to_bytes(), a.public.to_bytes(), 1).unwrap(),
-        endpoint: addr_a,
-        allowed_ips: vec![cidr("10.8.0.1/32")],
-    }];
-    let c_peers = vec![MeshPeer {
-        session: Session::from_bytes(c.private.to_bytes(), a.public.to_bytes(), 1).unwrap(),
-        endpoint: addr_a,
-        allowed_ips: vec![cidr("10.8.0.1/32")],
-    }];
+    let b_peers = vec![MeshPeer::new(
+        Session::from_bytes(b.private.to_bytes(), a.public.to_bytes(), 1).unwrap(),
+        addr_a,
+        vec![cidr("10.8.0.1/32")],
+    )];
+    let c_peers = vec![MeshPeer::new(
+        Session::from_bytes(c.private.to_bytes(), a.public.to_bytes(), 1).unwrap(),
+        addr_a,
+        vec![cidr("10.8.0.1/32")],
+    )];
 
     let tun_a = MockTun::default();
     let tun_b = MockTun::default();
@@ -182,16 +182,16 @@ async fn mesh_routes_via_relay_with_mismatched_source() {
 
     // A sends to B *via the relay*; B sends to A directly. Neither side's inbound
     // source will equal the peer's configured endpoint.
-    let a_peers = vec![MeshPeer {
-        session: Session::from_bytes(a.private.to_bytes(), b.public.to_bytes(), 1).unwrap(),
-        endpoint: relay_addr,
-        allowed_ips: vec![cidr("10.8.0.2/32")],
-    }];
-    let b_peers = vec![MeshPeer {
-        session: Session::from_bytes(b.private.to_bytes(), a.public.to_bytes(), 1).unwrap(),
-        endpoint: addr_a,
-        allowed_ips: vec![cidr("10.8.0.1/32")],
-    }];
+    let a_peers = vec![MeshPeer::new(
+        Session::from_bytes(a.private.to_bytes(), b.public.to_bytes(), 1).unwrap(),
+        relay_addr,
+        vec![cidr("10.8.0.2/32")],
+    )];
+    let b_peers = vec![MeshPeer::new(
+        Session::from_bytes(b.private.to_bytes(), a.public.to_bytes(), 1).unwrap(),
+        addr_a,
+        vec![cidr("10.8.0.1/32")],
+    )];
 
     let tun_a = MockTun::default();
     let tun_b = MockTun::default();
@@ -280,16 +280,16 @@ async fn mesh_roams_peer_endpoint_to_observed_source() {
     });
 
     // A initiates and knows B's real address; B's endpoint for A is the sink.
-    let a_peers = vec![MeshPeer {
-        session: Session::from_bytes(a.private.to_bytes(), b.public.to_bytes(), 1).unwrap(),
-        endpoint: addr_b,
-        allowed_ips: vec![cidr("10.8.0.2/32")],
-    }];
-    let b_peers = vec![MeshPeer {
-        session: Session::from_bytes(b.private.to_bytes(), a.public.to_bytes(), 1).unwrap(),
-        endpoint: sink_addr,
-        allowed_ips: vec![cidr("10.8.0.1/32")],
-    }];
+    let a_peers = vec![MeshPeer::new(
+        Session::from_bytes(a.private.to_bytes(), b.public.to_bytes(), 1).unwrap(),
+        addr_b,
+        vec![cidr("10.8.0.2/32")],
+    )];
+    let b_peers = vec![MeshPeer::new(
+        Session::from_bytes(b.private.to_bytes(), a.public.to_bytes(), 1).unwrap(),
+        sink_addr,
+        vec![cidr("10.8.0.1/32")],
+    )];
 
     let tun_a = MockTun::default();
     let tun_b = MockTun::default();
@@ -353,6 +353,113 @@ async fn mesh_roams_peer_endpoint_to_observed_source() {
     );
 }
 
+/// Connectivity check (Phase 4 M2): a peer's *primary* endpoint is unreachable,
+/// and the only working path is carried as an extra ICE **candidate**. A must fan
+/// its handshake out across the candidate to reach B — endpoint roaming then locks
+/// onto the candidate that answered. To isolate the candidate path, B's endpoint
+/// for A is also a dead sink, so B cannot bring the tunnel up on its own: the only
+/// way data flows is A reaching B via the candidate, B learning A's address from
+/// that authenticated handshake, and the session completing. Without candidate
+/// fan-out the tunnel never comes up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn mesh_probes_candidates_to_reach_a_peer() {
+    let (a, b) = (KeyPair::generate(), KeyPair::generate());
+
+    let sock_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sock_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = sock_b.local_addr().unwrap();
+
+    // Two draining sinks: bound sockets that silently swallow datagrams (so sends
+    // don't trigger an ICMP unreachable that resets the sender on Windows). One is
+    // A's bogus primary endpoint for B; the other is B's bogus endpoint for A.
+    let sink_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sink_b_addr = sink_b.local_addr().unwrap();
+    let sink_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sink_a_addr = sink_a.local_addr().unwrap();
+    for sink in [sink_b, sink_a] {
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            while sink.recv_from(&mut buf).await.is_ok() {}
+        });
+    }
+
+    // A's *primary* endpoint for B is the dead sink; B's real address is only
+    // reachable as a candidate. B's endpoint for A is also a dead sink, with no
+    // candidates — so B cannot reach A until it learns A's path from A's handshake.
+    let a_peers = vec![MeshPeer::with_candidates(
+        Session::from_bytes(a.private.to_bytes(), b.public.to_bytes(), 1).unwrap(),
+        sink_b_addr,
+        vec![cidr("10.8.0.2/32")],
+        vec![addr_b],
+    )];
+    let b_peers = vec![MeshPeer::new(
+        Session::from_bytes(b.private.to_bytes(), a.public.to_bytes(), 1).unwrap(),
+        sink_a_addr,
+        vec![cidr("10.8.0.1/32")],
+    )];
+
+    let tun_a = MockTun::default();
+    let tun_b = MockTun::default();
+    let inject_a = tun_a.to_runner.clone();
+    let recv_b = tun_b.from_runner.clone();
+
+    let (stop_a_tx, stop_a_rx) = oneshot::channel();
+    let (stop_b_tx, stop_b_rx) = oneshot::channel();
+    let (_ua_tx, ua_rx) = tokio::sync::mpsc::channel(1);
+    let (_ub_tx, ub_rx) = tokio::sync::mpsc::channel(1);
+
+    let ja = tokio::spawn(async move {
+        run_mesh(
+            tun_a,
+            UdpMeshTransport::from_socket(sock_a),
+            a_peers,
+            ua_rx,
+            async {
+                stop_a_rx.await.ok();
+            },
+        )
+        .await
+    });
+    let jb = tokio::spawn(async move {
+        run_mesh(
+            tun_b,
+            UdpMeshTransport::from_socket(sock_b),
+            b_peers,
+            ub_rx,
+            async {
+                stop_b_rx.await.ok();
+            },
+        )
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(500)).await; // probe candidate + handshake
+
+    // A injects a packet for B; it can only arrive if A reached B via the
+    // candidate and roamed B's endpoint onto it.
+    let to_b = ipv4([10, 8, 0, 2]);
+    inject_a.lock().unwrap().push_back(to_b.clone());
+
+    let mut b_pkt = None;
+    for _ in 0..80 {
+        b_pkt = b_pkt.or_else(|| recv_b.lock().unwrap().first().cloned());
+        if b_pkt.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let _ = stop_a_tx.send(());
+    let _ = stop_b_tx.send(());
+    let _ = ja.await;
+    let _ = jb.await;
+
+    assert_eq!(
+        b_pkt.expect("A should reach B by probing the candidate, not the dead endpoint"),
+        to_b
+    );
+}
+
 /// Capstone: a node whose data plane runs over **MASQUE** (every peer tunnelled
 /// through an HTTP/3 proxy) reaches a normal UDP mesh peer end-to-end. Exercises
 /// the whole stack at once — `MasqueMeshTransport` + the multi-session proxy +
@@ -387,16 +494,16 @@ async fn masque_mesh_node_reaches_udp_peer() {
 
     // X (tunnel 10.8.0.1) peers with M (tunnel 10.8.0.2). M reaches X at addr_x
     // via the proxy; X must roam to learn M's path.
-    let x_peers = vec![MeshPeer {
-        session: Session::from_bytes(x.private.to_bytes(), m.public.to_bytes(), 1).unwrap(),
-        endpoint: sink_addr,
-        allowed_ips: vec![cidr("10.8.0.2/32")],
-    }];
-    let m_peers = vec![MeshPeer {
-        session: Session::from_bytes(m.private.to_bytes(), x.public.to_bytes(), 1).unwrap(),
-        endpoint: addr_x,
-        allowed_ips: vec![cidr("10.8.0.1/32")],
-    }];
+    let x_peers = vec![MeshPeer::new(
+        Session::from_bytes(x.private.to_bytes(), m.public.to_bytes(), 1).unwrap(),
+        sink_addr,
+        vec![cidr("10.8.0.2/32")],
+    )];
+    let m_peers = vec![MeshPeer::new(
+        Session::from_bytes(m.private.to_bytes(), x.public.to_bytes(), 1).unwrap(),
+        addr_x,
+        vec![cidr("10.8.0.1/32")],
+    )];
 
     let tun_x = MockTun::default();
     let tun_m = MockTun::default();
@@ -472,11 +579,11 @@ async fn mesh_applies_peers_from_a_live_update() {
     let addr_b = sock_b.local_addr().unwrap();
 
     // B is statically configured with A as its peer (it answers the handshake).
-    let b_peers = vec![MeshPeer {
-        session: Session::from_bytes(b.private.to_bytes(), a.public.to_bytes(), 1).unwrap(),
-        endpoint: addr_a,
-        allowed_ips: vec![cidr("10.8.0.1/32")],
-    }];
+    let b_peers = vec![MeshPeer::new(
+        Session::from_bytes(b.private.to_bytes(), a.public.to_bytes(), 1).unwrap(),
+        addr_a,
+        vec![cidr("10.8.0.1/32")],
+    )];
 
     let tun_a = MockTun::default();
     let tun_b = MockTun::default();
@@ -516,11 +623,11 @@ async fn mesh_applies_peers_from_a_live_update() {
 
     // Deliver B as a peer to A over the update channel (as a watch push would).
     upd_a_tx
-        .send(vec![MeshPeer {
-            session: Session::from_bytes(a.private.to_bytes(), b.public.to_bytes(), 1).unwrap(),
-            endpoint: addr_b,
-            allowed_ips: vec![cidr("10.8.0.2/32")],
-        }])
+        .send(vec![MeshPeer::new(
+            Session::from_bytes(a.private.to_bytes(), b.public.to_bytes(), 1).unwrap(),
+            addr_b,
+            vec![cidr("10.8.0.2/32")],
+        )])
         .await
         .unwrap();
 
@@ -576,27 +683,27 @@ async fn quic_mesh_routes_packets_to_the_right_peer() {
     let (addr_a, addr_b, addr_c) = (qa.local_addr(), qb.local_addr(), qc.local_addr());
 
     let a_peers = vec![
-        MeshPeer {
-            session: Session::from_bytes(a.private.to_bytes(), b.public.to_bytes(), 1).unwrap(),
-            endpoint: addr_b,
-            allowed_ips: vec![cidr("10.8.0.2/32")],
-        },
-        MeshPeer {
-            session: Session::from_bytes(a.private.to_bytes(), c.public.to_bytes(), 2).unwrap(),
-            endpoint: addr_c,
-            allowed_ips: vec![cidr("10.8.0.3/32")],
-        },
+        MeshPeer::new(
+            Session::from_bytes(a.private.to_bytes(), b.public.to_bytes(), 1).unwrap(),
+            addr_b,
+            vec![cidr("10.8.0.2/32")],
+        ),
+        MeshPeer::new(
+            Session::from_bytes(a.private.to_bytes(), c.public.to_bytes(), 2).unwrap(),
+            addr_c,
+            vec![cidr("10.8.0.3/32")],
+        ),
     ];
-    let b_peers = vec![MeshPeer {
-        session: Session::from_bytes(b.private.to_bytes(), a.public.to_bytes(), 1).unwrap(),
-        endpoint: addr_a,
-        allowed_ips: vec![cidr("10.8.0.1/32")],
-    }];
-    let c_peers = vec![MeshPeer {
-        session: Session::from_bytes(c.private.to_bytes(), a.public.to_bytes(), 1).unwrap(),
-        endpoint: addr_a,
-        allowed_ips: vec![cidr("10.8.0.1/32")],
-    }];
+    let b_peers = vec![MeshPeer::new(
+        Session::from_bytes(b.private.to_bytes(), a.public.to_bytes(), 1).unwrap(),
+        addr_a,
+        vec![cidr("10.8.0.1/32")],
+    )];
+    let c_peers = vec![MeshPeer::new(
+        Session::from_bytes(c.private.to_bytes(), a.public.to_bytes(), 1).unwrap(),
+        addr_a,
+        vec![cidr("10.8.0.1/32")],
+    )];
 
     let tun_a = MockTun::default();
     let tun_b = MockTun::default();
