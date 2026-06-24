@@ -20,6 +20,13 @@ service Coordinator {
   // distributed to permitted peers via the network map; republishing replaces
   // the set and pushes a fresh map to watchers.
   rpc PublishCandidates(PublishCandidatesRequest) returns (PublishCandidatesResponse);
+  // Rotate a device's static public key (PRD Phase 3, FR3 — key rotation).
+  // The device keeps its identity in the network: its assigned tunnel IP, name,
+  // endpoint, tags, and candidates are preserved; only the public key changes.
+  // The coordinator pushes a fresh map to watchers so peers re-handshake to the
+  // new key. Carries no private key — the device generates its new keypair
+  // locally and sends only the new public key.
+  rpc RotateKey(RotateKeyRequest) returns (RotateKeyResponse);
 }
 
 message RegisterDeviceRequest {
@@ -58,3 +65,12 @@ message PublishCandidatesRequest {
 }
 
 message PublishCandidatesResponse {}
+
+message RotateKeyRequest {
+  string old_public_key = 1; // the device's current public key
+  string new_public_key = 2; // the freshly generated public key to switch to
+}
+
+message RotateKeyResponse {
+  string assigned_cidr = 1; // the (unchanged) tunnel address, echoed back
+}

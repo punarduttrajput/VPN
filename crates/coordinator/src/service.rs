@@ -6,14 +6,15 @@ use std::sync::{Arc, Mutex};
 use ferrum_control_proto::coordinator::coordinator_server::Coordinator;
 use ferrum_control_proto::coordinator::{
     NetworkMapRequest, NetworkMapResponse, PeerInfo, PublishCandidatesRequest,
-    PublishCandidatesResponse, RegisterDeviceRequest, RegisterDeviceResponse,
+    PublishCandidatesResponse, RegisterDeviceRequest, RegisterDeviceResponse, RotateKeyRequest,
+    RotateKeyResponse,
 };
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
-use crate::registry::Registry;
+use crate::registry::{Registry, RegistryError};
 
 /// Compute the current network-map response for a device, advertising `relay`
 /// (the coordinator's configured relay address, or empty for none).
@@ -236,6 +237,31 @@ impl Coordinator for CoordinatorService {
         let _ = self.changes.send(());
         Ok(Response::new(PublishCandidatesResponse {}))
     }
+
+    async fn rotate_key(
+        &self,
+        request: Request<RotateKeyRequest>,
+    ) -> Result<Response<RotateKeyResponse>, Status> {
+        self.authenticate(&request)?;
+        let req = request.into_inner();
+        let ip = {
+            let mut reg = self.registry.lock().expect("registry mutex poisoned");
+            reg.rotate_key(&req.old_public_key, &req.new_public_key)
+                .map_err(|e| match e {
+                    RegistryError::UnknownDevice => Status::not_found(e.to_string()),
+                    RegistryError::InvalidKey | RegistryError::KeyInUse => {
+                        Status::invalid_argument(e.to_string())
+                    }
+                    other => Status::internal(other.to_string()),
+                })?
+        };
+        // The device now answers under a new key; push a fresh map so peers
+        // re-handshake to it (PRD Phase 3 FR3 graceful re-handshake).
+        let _ = self.changes.send(());
+        Ok(Response::new(RotateKeyResponse {
+            assigned_cidr: format!("{ip}/32"),
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -305,6 +331,78 @@ mod tests {
         assert_eq!(map.peers[0].public_key, "BBB");
         assert_eq!(map.peers[0].endpoint, "2.2.2.2:51820");
         assert_eq!(map.peers[0].allowed_ips, vec!["10.8.0.3/32".to_string()]);
+    }
+
+    /// End-to-end over gRPC: a device rotates its key and a peer's network map
+    /// reflects the new key while the tunnel IP stays the same (PRD Phase 3 FR3).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rotate_key_updates_the_map_and_keeps_the_ip() {
+        let registry = Arc::new(Mutex::new(Registry::new(Ipv4Addr::new(10, 8, 0, 0), 24)));
+        let svc = CoordinatorService::new(registry);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(CoordinatorServer::new(svc))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let mut client = CoordinatorClient::connect(format!("http://{addr}"))
+            .await
+            .unwrap();
+
+        client
+            .register_device(RegisterDeviceRequest {
+                public_key: "OLD".into(),
+                name: "a".into(),
+                endpoint: "1.1.1.1:51820".into(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
+        client
+            .register_device(RegisterDeviceRequest {
+                public_key: "PEER".into(),
+                name: "b".into(),
+                endpoint: "2.2.2.2:51820".into(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
+
+        // Rotate OLD -> NEW; the assignment (10.8.0.2/32) is echoed back unchanged.
+        let resp = client
+            .rotate_key(RotateKeyRequest {
+                old_public_key: "OLD".into(),
+                new_public_key: "NEW".into(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.assigned_cidr, "10.8.0.2/32");
+
+        // The peer's map now lists the rotated device under its NEW key, same IP.
+        let map = client
+            .get_network_map(NetworkMapRequest {
+                public_key: "PEER".into(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(map.peers.len(), 1);
+        assert_eq!(map.peers[0].public_key, "NEW");
+        assert_eq!(map.peers[0].allowed_ips, vec!["10.8.0.2/32".to_string()]);
+
+        // Rotating a key that doesn't exist is a not-found error.
+        let err = client
+            .rotate_key(RotateKeyRequest {
+                old_public_key: "GHOST".into(),
+                new_public_key: "X".into(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
     }
 
     /// End-to-end with OIDC on: an unauthenticated register is rejected, a

@@ -23,6 +23,10 @@ pub trait Store: Send + Sync {
     fn load_all(&self) -> Result<Vec<Device>, StoreError>;
     /// Insert or update a device by its public key.
     fn upsert(&self, device: &Device) -> Result<(), StoreError>;
+    /// Remove the device with this public key, if present (used by key
+    /// rotation, PRD Phase 3 FR3, to drop the record under the old key after the
+    /// new one is written). Removing an absent key is not an error.
+    fn remove(&self, public_key: &str) -> Result<(), StoreError>;
 }
 
 /// A no-op store: devices live only in memory (lost on restart).
@@ -34,6 +38,9 @@ impl Store for MemoryStore {
         Ok(Vec::new())
     }
     fn upsert(&self, _device: &Device) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn remove(&self, _public_key: &str) -> Result<(), StoreError> {
         Ok(())
     }
 }

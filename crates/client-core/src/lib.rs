@@ -32,7 +32,7 @@ uniffi::setup_scaffolding!();
 
 use ferrum_control_proto::coordinator::coordinator_client::CoordinatorClient;
 use ferrum_control_proto::coordinator::{
-    NetworkMapRequest, PeerInfo, PublishCandidatesRequest, RegisterDeviceRequest,
+    NetworkMapRequest, PeerInfo, PublishCandidatesRequest, RegisterDeviceRequest, RotateKeyRequest,
 };
 use thiserror::Error;
 use tonic::transport::Channel;
@@ -207,6 +207,25 @@ impl ControlClient {
         });
         self.inner.publish_candidates(req).await?;
         Ok(())
+    }
+
+    /// Rotate this device's static public key (PRD Phase 3, FR3): tell the
+    /// coordinator to move the device's registration from `old_public_key` to
+    /// `new_public_key`, keeping its assigned tunnel IP, name, endpoint, tags, and
+    /// candidates. Returns the (unchanged) assigned CIDR. The caller generates the
+    /// new keypair locally and rebuilds its data plane with the new private key;
+    /// peers learn the new key over their watch stream and re-handshake to it.
+    pub async fn rotate_key(
+        &mut self,
+        old_public_key: &str,
+        new_public_key: &str,
+    ) -> Result<String, Error> {
+        let req = self.request(RotateKeyRequest {
+            old_public_key: old_public_key.to_string(),
+            new_public_key: new_public_key.to_string(),
+        });
+        let resp = self.inner.rotate_key(req).await?.into_inner();
+        Ok(resp.assigned_cidr)
     }
 
     /// Register then fetch the map, returning a ready-to-apply [`TunnelPlan`].
@@ -402,6 +421,36 @@ mod tests {
         // A one-shot map fetch reflects them too.
         let map = b.network_map("BBB").await.unwrap();
         assert_eq!(map[0].candidates, cands);
+    }
+
+    /// A device rotates its static key; a peer's network map reflects the new
+    /// key while the tunnel IP is preserved (PRD Phase 3 FR3).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rotate_key_moves_the_device_to_a_new_key() {
+        let url = start_coordinator().await;
+        let mut a = ControlClient::connect(url.clone()).await.unwrap();
+        let mut b = ControlClient::connect(url).await.unwrap();
+
+        let addr = a
+            .register("OLD", "laptop", "1.1.1.1:51820", &[])
+            .await
+            .unwrap();
+        b.register("BBB", "gateway", "2.2.2.2:51820", &[])
+            .await
+            .unwrap();
+
+        // Rotate OLD -> NEW; the assigned CIDR is unchanged.
+        let after = a.rotate_key("OLD", "NEW").await.unwrap();
+        assert_eq!(after, addr);
+
+        // B's map now shows the device under its NEW key with the same allowed IP.
+        let peers = b.network_map("BBB").await.unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].public_key, "NEW");
+        assert_eq!(peers[0].allowed_ips, vec!["10.8.0.2/32".to_string()]);
+
+        // Rotating an unregistered key is rejected.
+        assert!(b.rotate_key("ghost", "x").await.is_err());
     }
 
     /// Publishing candidates for a device that never registered is rejected.

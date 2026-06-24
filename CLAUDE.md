@@ -100,8 +100,10 @@ on the new environment before assuming it's still blocked.
 
 ## Completion snapshot (see STATUS.md for detail)
 
-- **Phases 1–3:** functionally complete (tunnel; QUIC/MASQUE transports + migration
-  + obfuscation + batch I/O; full control plane with ACL/streaming/SQLite/mTLS/OIDC).
+- **Phases 1–3:** functionally complete (tunnel; QUIC/MASQUE transports + QUIC
+  connection migration + padding/timing-jitter obfuscation + batch I/O; full control
+  plane with ACL/streaming/SQLite/mTLS/OIDC + static-key rotation). Phase 2's only
+  open items are external-only (third-party MASQUE interop; nDPI DPI check).
 - **Phase 4 (NAT traversal — ✅ functionally complete):** mesh data plane
   (UDP/QUIC/MASQUE) + crypto-demux + roaming, STUN client + coordinator candidate
   signaling + candidate gathering/publishing + candidate probing (M1/M2), a

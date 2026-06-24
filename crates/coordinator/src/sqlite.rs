@@ -120,6 +120,16 @@ impl Store for SqliteStore {
         .map_err(backend)?;
         Ok(())
     }
+
+    fn remove(&self, public_key: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        conn.execute(
+            "DELETE FROM devices WHERE public_key = ?1",
+            params![public_key],
+        )
+        .map_err(backend)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -168,6 +178,19 @@ mod tests {
         let loaded = store.load_all().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].candidates, d.candidates);
+    }
+
+    #[test]
+    fn remove_deletes_a_device() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.upsert(&device("AAA", [10, 8, 0, 2], &[])).unwrap();
+        store.upsert(&device("BBB", [10, 8, 0, 3], &[])).unwrap();
+        store.remove("AAA").unwrap();
+        let loaded = store.load_all().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].public_key, "BBB");
+        // Removing an absent key is a no-op, not an error.
+        store.remove("AAA").unwrap();
     }
 
     #[test]
