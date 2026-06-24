@@ -41,3 +41,16 @@ ferrum-core = { path = "../../../crates/core" }
 # a clean error to the UI.
 [target.'cfg(unix)'.dependencies]
 ferrum-tunnel = { path = "../../../crates/tunnel", features = ["real-tun"] }
+
+# The kill-switch (FR5) enforces its leak-block via the Windows Filtering Platform
+# on Windows (see src/killswitch.rs `wfp`). Version pinned to the one already in the
+# tree (pulled transitively by Tauri) so the resolver doesn't add a second copy.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Rpc",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_WindowsFilteringPlatform",
+] }

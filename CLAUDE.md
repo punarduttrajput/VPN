@@ -129,9 +129,12 @@ on the new environment before assuming it's still blocked.
   `data_plane::run_mesh_session_supervised` (reruns the whole mesh session with backoff
   on any drop, rebuilding device+transport via caller factories) — **adopted by both the
   CLI (`ferrum up-mesh`) and the desktop shell**, the latter also **enforcing the kill-switch
-  in the OS firewall** (an `nftables` leak-block engaged on the `TrafficBlocked` signal,
-  allow-listing loopback/tunnel/coordinator; Linux — see `apps/desktop/.../killswitch.rs`).
-  Remaining: iOS/Android shells, a privileged-helper for the desktop TUN, and macOS/Windows
+  in the OS firewall** (a leak-block engaged on the `TrafficBlocked` signal, allow-listing
+  loopback/tunnel/coordinator — **Linux via `nftables`** *and* **Windows via the Windows
+  Filtering Platform**: a dedicated WFP provider/sublayer with a default-block + higher-weight
+  permit filters at the `ALE_AUTH_CONNECT` v4/v6 layers, installed in a transaction and torn
+  down by filter-id; see `apps/desktop/.../killswitch.rs`).
+  Remaining: iOS/Android shells, a privileged-helper for the desktop TUN, and **macOS** (`pf`)
   kill-switch enforcement.
 - **Phase 6 (~15%):** `sendmmsg` batching + **UDP GSO send-path** (`UDP_SEGMENT`; Linux,
   CI-verified — not buildable on this no-WSL/no-rustup host) + **observability M1 done (coordinator + relay)**:
@@ -161,8 +164,8 @@ on the new environment before assuming it's still blocked.
    `FerrumClient` facade / data-plane glue and FFI; **both `ferrum up-mesh` and the Tauri
    desktop run on the supervisor** (always-on auto-reconnect; OIDC token via
    `FerrumClient::set_token`), and the **desktop enforces the kill-switch in the OS firewall**
-   (`nftables`, Linux — `apps/desktop/.../killswitch.rs`). Remaining: macOS (`pf`)/Windows
-   (WFP) kill-switch enforcement; a privileged-helper for the desktop TUN.
+   (**`nftables` on Linux + WFP on Windows** — `apps/desktop/.../killswitch.rs`). Remaining:
+   macOS (`pf`) kill-switch enforcement; a privileged-helper for the desktop TUN.
    (Phase 4 NAT traversal is functionally complete:
    signaling, STUN, relay, state machine, automatic fallback, and both local +
    coordinator-advertised relay selection all land. Optional Phase 4 hardening: fuller
