@@ -12,19 +12,25 @@
 //! Linux/macOS host; on Windows (or without privileges) `connect` surfaces a
 //! clean error and the UI stays disconnected.
 
-use std::net::SocketAddr;
+mod killswitch;
+
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::oneshot;
 
-use ferrum_client_core::data_plane::run_mesh_session;
-use ferrum_client_core::{ClientEvent, ClientIdentity, ConnectionState, FerrumClient};
+use ferrum_client_core::data_plane::run_mesh_session_supervised;
+use ferrum_client_core::{
+    ClientEvent, ClientIdentity, ConnectionState, FerrumClient, ReconnectPolicy,
+};
 use ferrum_core::config::Cidr;
 use ferrum_transport::UdpMeshTransport;
 use ferrum_tunnel::device::{self, TunConfig};
+
+use killswitch::KillSwitch;
 
 /// TUN interface name requested from the OS (best effort; the OS may rename).
 const TUN_IFACE: &str = "ferrum0";
@@ -43,6 +49,13 @@ struct DataPlaneHandle {
 struct AppState {
     client: FerrumClient,
     data_plane: Mutex<Option<DataPlaneHandle>>,
+    /// Enforces the kill-switch firewall rules in response to `TrafficBlocked`
+    /// events from the core (FR5).
+    kill_switch: Mutex<KillSwitch>,
+    /// Coordinator address(es) resolved at `connect`, allow-listed by the
+    /// kill-switch so the control plane can still reconnect while traffic is
+    /// otherwise blocked. Empty until the first connect.
+    coordinator_ips: Mutex<Vec<IpAddr>>,
 }
 
 /// A peer as presented to the webview.
@@ -77,6 +90,8 @@ struct UiEvent {
     peers: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blocked: Option<bool>,
 }
 
 fn state_name(s: ConnectionState) -> String {
@@ -98,6 +113,7 @@ fn error_event(message: String) -> UiEvent {
         state: None,
         peers: None,
         message: Some(message),
+        blocked: None,
     }
 }
 
@@ -108,20 +124,51 @@ fn to_ui_event(ev: ClientEvent) -> UiEvent {
             state: Some(state_name(s)),
             peers: None,
             message: None,
+            blocked: None,
         },
         ClientEvent::PeersUpdated(n) => UiEvent {
             kind: "peers",
             state: None,
             peers: Some(n),
             message: None,
+            blocked: None,
         },
         ClientEvent::Error(m) => UiEvent {
             kind: "error",
             state: None,
             peers: None,
             message: Some(m),
+            blocked: None,
+        },
+        // The kill-switch's "block non-tunnel traffic" signal flipped (FR5). The
+        // backend enforces it via the firewall; the UI reflects the state.
+        ClientEvent::TrafficBlocked(b) => UiEvent {
+            kind: "kill-switch",
+            state: None,
+            peers: None,
+            message: None,
+            blocked: Some(b),
         },
     }
+}
+
+/// Best-effort resolve a coordinator URL (`http://host:port`) to its IP
+/// address(es), used to allow-list it in the kill-switch so the control plane can
+/// reconnect while other traffic is blocked. Returns empty on a parse/resolve
+/// failure (the kill-switch then blocks strictly — the safe default).
+fn resolve_coordinator_ips(coordinator: &str) -> Vec<IpAddr> {
+    use std::net::ToSocketAddrs;
+    let authority = coordinator
+        .rsplit("://")
+        .next()
+        .unwrap_or(coordinator)
+        .split('/')
+        .next()
+        .unwrap_or("");
+    authority
+        .to_socket_addrs()
+        .map(|addrs| addrs.map(|a| a.ip()).collect())
+        .unwrap_or_default()
 }
 
 /// Bring up the data plane: register, open a TUN, and run the mesh session.
@@ -161,7 +208,7 @@ async fn connect(
         .await
         .map_err(|e| format!("registering with coordinator: {e}"))?;
 
-    // Open the real OS TUN with the assigned address.
+    // The assigned tunnel address configures the TUN before the runner takes over.
     let cidr: Cidr = address
         .parse()
         .map_err(|e| format!("assigned tunnel address '{address}': {e}"))?;
@@ -170,16 +217,21 @@ async fn connect(
         address: cidr,
         mtu: TUN_MTU,
     };
-    let dev = device::open(&tun_cfg)
-        .map_err(|e| format!("opening TUN device (needs privileges on Linux/macOS): {e}"))?;
-
-    // Bind the UDP mesh transport for the data plane.
     let bind_addr: SocketAddr = format!("0.0.0.0:{listen_port}")
         .parse()
         .map_err(|e| format!("invalid listen port {listen_port}: {e}"))?;
-    let transport = UdpMeshTransport::bind(bind_addr)
-        .await
-        .map_err(|e| format!("binding UDP socket on {bind_addr}: {e}"))?;
+
+    // Pre-flight the TUN once so an unsupported platform / missing privileges
+    // fails *now* with a clean UI error, rather than the always-on supervisor
+    // retrying a never-succeeding open forever. Drop it immediately; the
+    // supervisor's factory reopens a fresh device per attempt (a TUN fd is
+    // single-use). On Linux/macOS with privileges this is a brief re-open.
+    device::open(&tun_cfg)
+        .map_err(|e| format!("opening TUN device (needs privileges on Linux/macOS): {e}"))?;
+
+    // Resolve the coordinator so the kill-switch can allow-list it (reconnect
+    // while blocked); empty on failure → strict block.
+    *state.coordinator_ips.lock().unwrap() = resolve_coordinator_ips(&coordinator);
 
     // Register the shutdown channel before spawning so a fast-failing runner
     // can't clear a not-yet-stored handle (the task clears it on exit).
@@ -196,19 +248,38 @@ async fn connect(
     let private_key = identity.private_key;
     let task_app = app.clone();
     tauri::async_runtime::spawn(async move {
+        // Always-on: rerun the whole mesh session (control sync + OS data plane)
+        // with backoff on any drop, rebuilding the TUN + socket each attempt via
+        // these factories (a session consumes them, and an OS TUN is single-use).
+        let device_cfg = tun_cfg.clone();
+        let make_device = move || {
+            let cfg = device_cfg.clone();
+            async move {
+                device::open(&cfg).map_err(|e| {
+                    ferrum_client_core::Error::DataPlane(format!("opening TUN device: {e}"))
+                })
+            }
+        };
+        let make_transport = move || async move {
+            UdpMeshTransport::bind(bind_addr)
+                .await
+                .map_err(|e| ferrum_client_core::Error::DataPlane(e.to_string()))
+        };
+
         // No NAT-traversal candidates and no local relay override: the GUI has no
         // STUN-server field (follow-up, like the CLI's `--stun-server`), so nothing
         // is gathered/published. The relay arg is `None`, so the mesh uses whatever
         // relay the coordinator advertises (or runs direct-only if none).
-        let result = run_mesh_session(
+        let result = run_mesh_session_supervised(
             &client,
             &coordinator,
             &id,
             &private_key,
             &[],
-            dev,
-            transport,
+            make_device,
+            make_transport,
             None,
+            &ReconnectPolicy::default(),
             async move {
                 let _ = stop_rx.await;
             },
@@ -243,6 +314,20 @@ fn disconnect(state: State<'_, AppState>) {
     }
 }
 
+/// Arm or disarm the kill-switch (FR5). When armed, the core emits
+/// `TrafficBlocked` as the tunnel goes up/down and the backend enforces the
+/// firewall rules; this only sets the policy.
+#[tauri::command]
+fn set_kill_switch(state: State<'_, AppState>, enabled: bool) {
+    state.client.set_kill_switch(enabled);
+}
+
+/// Whether the kill-switch is armed (for the initial UI paint).
+#[tauri::command]
+fn kill_switch_enabled(state: State<'_, AppState>) -> bool {
+    state.client.kill_switch_enabled()
+}
+
 /// The current connection state (for the initial UI paint).
 #[tauri::command]
 fn get_status(state: State<'_, AppState>) -> String {
@@ -267,7 +352,7 @@ fn get_peers(state: State<'_, AppState>) -> Vec<PeerDto> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(
             tauri_plugin_log::Builder::default()
                 .level(log::LevelFilter::Info)
@@ -276,9 +361,12 @@ pub fn run() {
         .manage(AppState {
             client: FerrumClient::new(),
             data_plane: Mutex::new(None),
+            kill_switch: Mutex::new(KillSwitch::default()),
+            coordinator_ips: Mutex::new(Vec::new()),
         })
         .setup(|app| {
-            // Forward core events (state / peers / errors) to the webview.
+            // Forward core events to the webview, and enforce the kill-switch's
+            // block/release signal in the OS firewall as it flips (FR5).
             let client = app.state::<AppState>().client.clone();
             let mut events = client.subscribe();
             let handle: AppHandle = app.handle().clone();
@@ -286,6 +374,15 @@ pub fn run() {
                 loop {
                     match events.recv().await {
                         Ok(ev) => {
+                            if let ClientEvent::TrafficBlocked(blocked) = &ev {
+                                let st = handle.state::<AppState>();
+                                if *blocked {
+                                    let ips = st.coordinator_ips.lock().unwrap().clone();
+                                    st.kill_switch.lock().unwrap().engage(TUN_IFACE, &ips);
+                                } else {
+                                    st.kill_switch.lock().unwrap().disengage();
+                                }
+                            }
                             let _ = handle.emit("client-event", to_ui_event(ev));
                         }
                         // A lagging UI just misses intermediate events.
@@ -297,8 +394,26 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            connect, disconnect, get_status, get_peers
+            connect,
+            disconnect,
+            get_status,
+            get_peers,
+            set_kill_switch,
+            kill_switch_enabled
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|app_handle, event| {
+        // On exit, tear down any kill-switch firewall rules so the network isn't
+        // left blocked (managed-state `Drop` isn't guaranteed on exit).
+        if let RunEvent::Exit = event {
+            app_handle
+                .state::<AppState>()
+                .kill_switch
+                .lock()
+                .unwrap()
+                .disengage();
+        }
+    });
 }

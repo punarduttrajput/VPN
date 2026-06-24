@@ -11,14 +11,23 @@ is in that workspace's `exclude` list.
 
 ## What it does today
 
-- **Connect moves packets.** `connect` registers with the coordinator to learn
-  the assigned tunnel address, opens a real TUN with it, binds a UDP mesh
-  transport, and runs `ferrum_client_core::data_plane::run_mesh_session` in a
-  background task — so the GUI drives the actual data plane, not just the control
-  plane. `disconnect` signals that task to wind down.
+- **Connect moves packets, and stays up.** `connect` registers with the coordinator
+  to learn the assigned tunnel address, then runs
+  `ferrum_client_core::data_plane::run_mesh_session_supervised` in a background task —
+  so the GUI drives the actual data plane and **auto-reconnects with backoff** on any
+  drop (reopening the TUN + rebinding the socket each attempt via factories). A
+  one-shot pre-flight `device::open` fails fast with a clean error on an unsupported
+  platform / missing privileges. `disconnect` signals the supervisor to wind down.
+- **Kill-switch (FR5).** A toggle arms the core's kill-switch; while the tunnel is
+  not up, the backend installs an `nftables` leak-block (a dedicated
+  `inet ferrum_killswitch` table that drops non-tunnel egress, allow-listing
+  loopback, the tunnel interface, and the coordinator so reconnect still works) and
+  removes it when the tunnel comes back or on app exit. Enforcement is Linux-only for
+  now (macOS `pf` / Windows WFP are follow-ups); the UI still reflects the intent
+  everywhere. See [`src-tauri/src/killswitch.rs`](src-tauri/src/killswitch.rs).
 - Live connection state and the peer list, driven through the shared facade.
-  Core events (`StateChanged` / `PeersUpdated` / `Error`) are pushed to the UI as
-  `client-event`.
+  Core events (`StateChanged` / `PeersUpdated` / `Error` / `TrafficBlocked`) are
+  pushed to the UI as `client-event`.
 
 The connect form takes the device's WireGuard **private key** (the public key is
 derived from it and advertised to the coordinator; the private key never leaves

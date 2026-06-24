@@ -121,36 +121,37 @@ on the new environment before assuming it's still blocked.
 - **Phase 5 (~35%):** shared `FerrumClient` core (M1) + `uniffi` bindings (Swift/Kotlin
   generate from `FfiFerrumClient`) + data-plane glue (`run_mesh_session`) + the
   TUN-from-fd FFI entry (`device::from_fd` + `FfiFerrumClient::run`/`stop`) + a Tauri
-  desktop shell (`apps/desktop`) whose **`connect` now drives the real data plane**
-  (opens a TUN + runs `data_plane::run_mesh_session`) + the **reliability core (FR5)**:
-  `connect_with_retry` (exponential-backoff control-plane reconnect via the `Reconnecting`
-  state, cancellable by `disconnect`), a kill-switch policy
+  desktop shell (`apps/desktop`) whose **`connect` drives the real data plane on the
+  always-on supervisor** (`run_mesh_session_supervised` with TUN/socket factories) + the
+  **reliability core (FR5)**: `connect_with_retry` (exponential-backoff control-plane
+  reconnect via the `Reconnecting` state, cancellable by `disconnect`), a kill-switch policy
   (`set_kill_switch`/`traffic_blocked` + a `TrafficBlocked` change event), and
   `data_plane::run_mesh_session_supervised` (reruns the whole mesh session with backoff
-  on any drop, rebuilding device+transport via caller factories). Remaining: iOS/Android
-  shells, a privileged-helper for the desktop TUN, supervisor/kill-switch adoption in the
-  CLI + shells (incl. shell-side firewall enforcement and an OS-TUN re-acquire factory).
+  on any drop, rebuilding device+transport via caller factories) — **adopted by both the
+  CLI (`ferrum up-mesh`) and the desktop shell**, the latter also **enforcing the kill-switch
+  in the OS firewall** (an `nftables` leak-block engaged on the `TrafficBlocked` signal,
+  allow-listing loopback/tunnel/coordinator; Linux — see `apps/desktop/.../killswitch.rs`).
+  Remaining: iOS/Android shells, a privileged-helper for the desktop TUN, and macOS/Windows
+  kill-switch enforcement.
 - **Phase 6 (~5%):** only `sendmmsg` batching; eBPF/XDP, anycast, scale not started.
 
 ## Recommended next work (highest-value, buildable in Rust)
 
-1. **Phase 5 — reliability (core done)** 🟡: `connect_with_retry`
+1. **Phase 5 — reliability (FR5)** ✅ *(core + CLI + desktop done)*: `connect_with_retry`
    (exponential-backoff control-plane reconnect) + a kill-switch policy (`set_kill_switch`/
    `traffic_blocked` + `TrafficBlocked` event) + `data_plane::run_mesh_session_supervised`
-   (data-plane auto-restart with backoff via device/transport factories) now land on the
-   `FerrumClient` facade / data-plane glue and FFI, and **`ferrum up-mesh` runs on the
-   supervisor** (always-on auto-reconnect; OIDC token carried via `FerrumClient::set_token`).
-   Remaining: **adopt the supervisor in the desktop/mobile shells** (each supplies a factory
-   that re-acquires its OS TUN — the FFI's `run` `tun_fd` is single-use since `from_fd`
-   closes it on drop) and **shell-side kill-switch firewall enforcement** — both per-platform.
+   (data-plane auto-restart with backoff via device/transport factories) land on the
+   `FerrumClient` facade / data-plane glue and FFI; **both `ferrum up-mesh` and the Tauri
+   desktop run on the supervisor** (always-on auto-reconnect; OIDC token via
+   `FerrumClient::set_token`), and the **desktop enforces the kill-switch in the OS firewall**
+   (`nftables`, Linux — `apps/desktop/.../killswitch.rs`). Remaining: macOS (`pf`)/Windows
+   (WFP) kill-switch enforcement; a privileged-helper for the desktop TUN.
    (Phase 4 NAT traversal is functionally complete:
    signaling, STUN, relay, state machine, automatic fallback, and both local +
    coordinator-advertised relay selection all land. Optional Phase 4 hardening: fuller
    ICE candidate-pair prioritization; a desktop-GUI relay/STUN field.)
-2. **Phase 5 — desktop data plane** ✅ *(done)*: the Tauri shell's "connect" opens a
-   TUN (Linux `/dev/net/tun`, root) and runs `run_mesh_session`, so the GUI moves
-   packets. Follow-up: a privileged helper so the GUI need not run as root, and
-   QUIC/MASQUE transport selection.
-3. **Phase 5 — native shells**: iOS (NetworkExtension + SwiftUI) / Android
-   (FerrumService + Compose) over the existing `uniffi` bindings.
+2. **Phase 5 — native shells**: iOS (NetworkExtension + SwiftUI) / Android
+   (FerrumService + Compose) over the existing `uniffi` bindings (needs Apple/Android toolchains).
+3. **Phase 6 — observability (M1, buildable here)**: Prometheus metrics + `tracing`/OTel on
+   the coordinator + relay (strict label allowlist; no traffic content per NFR5).
 4. **Phase 6 / NFR1**: real-hardware throughput; UDP GSO/GRO; eBPF/XDP fast path (Linux).
