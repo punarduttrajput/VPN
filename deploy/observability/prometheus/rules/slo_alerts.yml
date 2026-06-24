@@ -1,0 +1,177 @@
+# SLO + operational alerting rules for the Ferrum control plane (PRD Phase 6 FR4).
+#
+# Burn-rate alerts follow the multi-window, multi-burn-rate method (Google SRE
+# Workbook): each alert ANDs a long and a short window so it fires fast on a hard
+# outage yet won't flap on a brief blip, and auto-resolves once the short window
+# recovers. Thresholds are `burn_rate * error_budget`, with the SLO target written
+# inline so the budget is auditable.
+#
+# Tiers:  fast page  = 14.4x over 1h & 5m   (burns a 30d budget in ~2d)
+#         slow page  =  6x   over 6h & 30m
+#         ticket     =  1x   over 3d & 6h   (warning, not a page)
+#
+# SLO targets:  availability 99.95% (budget 0.0005, maps to NFR3)
+#               relay forwarding success 99% (budget 0.01)
+
+groups:
+  # ---------------------------------------------------------------------------
+  # Availability SLO (per control-plane job) — error budget burn.
+  # ---------------------------------------------------------------------------
+  - name: ferrum-slo-availability
+    rules:
+      - alert: FerrumAvailabilityFastBurn
+        expr: |
+          job:ferrum_availability:err_ratio_1h > (14.4 * 0.0005)
+          and
+          job:ferrum_availability:err_ratio_5m > (14.4 * 0.0005)
+        labels:
+          severity: critical
+          slo: availability
+        annotations:
+          summary: "{{ $labels.job }} is burning its availability budget fast (page)"
+          description: "{{ $labels.job }} unavailability is {{ $value | humanizePercentage }} over 1h & 5m — >14.4x the 99.95% error budget. At this rate the 30d budget is exhausted in ~2 days."
+
+      - alert: FerrumAvailabilitySlowBurn
+        expr: |
+          job:ferrum_availability:err_ratio_6h > (6 * 0.0005)
+          and
+          job:ferrum_availability:err_ratio_30m > (6 * 0.0005)
+        labels:
+          severity: critical
+          slo: availability
+        annotations:
+          summary: "{{ $labels.job }} is burning its availability budget (page)"
+          description: "{{ $labels.job }} unavailability is {{ $value | humanizePercentage }} over 6h & 30m — >6x the 99.95% error budget."
+
+      - alert: FerrumAvailabilityBudgetTicket
+        expr: |
+          job:ferrum_availability:err_ratio_3d > (1 * 0.0005)
+          and
+          job:ferrum_availability:err_ratio_6h > (1 * 0.0005)
+        labels:
+          severity: warning
+          slo: availability
+        annotations:
+          summary: "{{ $labels.job }} is slowly eating its availability budget (ticket)"
+          description: "{{ $labels.job }} unavailability is {{ $value | humanizePercentage }} over 3d & 6h — above the sustainable 99.95% rate."
+
+  # ---------------------------------------------------------------------------
+  # Relay forwarding-success SLO — error budget burn (target 99%).
+  # ---------------------------------------------------------------------------
+  - name: ferrum-slo-relay-forwarding
+    rules:
+      - alert: FerrumRelayForwardFastBurn
+        expr: |
+          ferrum_relay:forward_err_ratio:1h > (14.4 * 0.01)
+          and
+          ferrum_relay:forward_err_ratio:5m > (14.4 * 0.01)
+        labels:
+          severity: critical
+          slo: relay-forwarding
+        annotations:
+          summary: "Relay is dropping frames fast (page)"
+          description: "Relay frame-drop ratio is {{ $value | humanizePercentage }} over 1h & 5m — >14.4x the 99% forwarding-success budget."
+
+      - alert: FerrumRelayForwardSlowBurn
+        expr: |
+          ferrum_relay:forward_err_ratio:6h > (6 * 0.01)
+          and
+          ferrum_relay:forward_err_ratio:30m > (6 * 0.01)
+        labels:
+          severity: critical
+          slo: relay-forwarding
+        annotations:
+          summary: "Relay forwarding-success budget burning (page)"
+          description: "Relay frame-drop ratio is {{ $value | humanizePercentage }} over 6h & 30m — >6x the 99% budget."
+
+      - alert: FerrumRelayForwardBudgetTicket
+        expr: |
+          ferrum_relay:forward_err_ratio:3d > (1 * 0.01)
+          and
+          ferrum_relay:forward_err_ratio:6h > (1 * 0.01)
+        labels:
+          severity: warning
+          slo: relay-forwarding
+        annotations:
+          summary: "Relay slowly eating its forwarding budget (ticket)"
+          description: "Relay frame-drop ratio is {{ $value | humanizePercentage }} over 3d & 6h — above the sustainable 99% rate."
+
+  # ---------------------------------------------------------------------------
+  # Hard availability — a target is down or has disappeared entirely.
+  # ---------------------------------------------------------------------------
+  - name: ferrum-availability-hard
+    rules:
+      - alert: FerrumCoordinatorDown
+        expr: up{job="ferrum-coordinator"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Coordinator target down"
+          description: "Prometheus has not scraped {{ $labels.instance }} ({{ $labels.job }}) for >2m."
+
+      - alert: FerrumRelayDown
+        expr: up{job="ferrum-relay"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Relay target down"
+          description: "Prometheus has not scraped {{ $labels.instance }} ({{ $labels.job }}) for >2m."
+
+      - alert: FerrumTargetMissing
+        expr: absent(up{job="ferrum-coordinator"}) or absent(up{job="ferrum-relay"})
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "A Ferrum scrape target has disappeared"
+          description: "No series for a coordinator or relay target for >5m — the service may be unregistered or Prometheus misconfigured."
+
+  # ---------------------------------------------------------------------------
+  # Capacity — approaching a resource limit before it becomes an outage.
+  # ---------------------------------------------------------------------------
+  - name: ferrum-capacity
+    rules:
+      # The default tunnel-IP pool is a /24 (~254 usable hosts). Tune to the pool
+      # size the coordinator is configured with.
+      - alert: FerrumCoordinatorIPPoolNearExhaustion
+        expr: ferrum_devices_registered > 228
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Coordinator tunnel-IP pool >90% full"
+          description: "{{ $value }} devices registered — approaching the /24 pool limit (~254). New devices will fail to get an address."
+
+      - alert: FerrumCoordinatorWatchStreamsHigh
+        expr: ferrum_watch_streams_active > 5000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Coordinator watch-stream fan-out high"
+          description: "{{ $value }} concurrent WatchNetworkMap streams open — review coordinator capacity/sharding."
+
+      - alert: FerrumRelayClientsHigh
+        expr: ferrum_relay_clients_registered > 5000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Relay client fan-out high"
+          description: "{{ $value }} clients registered on a single relay — consider adding relay capacity."
+
+  # ---------------------------------------------------------------------------
+  # Security signal — a sustained flood of auth-rejected RPCs (OIDC enabled).
+  # ---------------------------------------------------------------------------
+  - name: ferrum-security
+    rules:
+      - alert: FerrumCoordinatorAuthRejectionSpike
+        expr: sum(rate(ferrum_unauthenticated_total[5m])) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sustained auth-rejected RPCs at the coordinator"
+          description: "{{ $value | humanize }} unauthenticated RPCs/s over 10m — possible misconfigured client or credential-stuffing attempt."

@@ -34,6 +34,7 @@ services:
       - --web.enable-lifecycle
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
       - prometheus-data:/prometheus
     ports:
       - "9090:9090"
@@ -41,6 +42,23 @@ services:
     # Desktop and most Linux setups `host-gateway` resolves to the host.
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    depends_on:
+      - alertmanager
+    networks:
+      - ferrum
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: ferrum-alertmanager
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    ports:
+      - "9093:9093"
     networks:
       - ferrum
 
@@ -82,6 +100,7 @@ services:
 volumes:
   prometheus-data:
   grafana-data:
+  alertmanager-data:
 
 networks:
   ferrum:

@@ -1,0 +1,62 @@
+# SLO recording rules for the Ferrum control plane (PRD Phase 6 FR4 / G4).
+#
+# Precompute the SLI *error ratios* over the multiple windows the burn-rate alerts
+# need (5m / 30m / 1h / 6h / 3d), so the alert expressions stay readable and the
+# windows are defined in exactly one place.
+#
+# Two SLOs are measured from the existing aggregate metrics (NFR5 — no per-user
+# labels anywhere):
+#   * Availability  — 1 - avg(up) per control-plane job (maps to NFR3, 99.95%).
+#   * Relay forwarding success — dropped / (forwarded + dropped) (target 99%).
+#
+# Latency SLOs are intentionally absent: the services expose no request-duration
+# histogram SLI yet (the tracing spans carry timing but aren't a Prometheus
+# histogram). Adding one is the documented follow-up to enable a latency SLO.
+
+groups:
+  # --- Availability error ratio: fraction of scrapes the target was down. ---
+  - name: ferrum-slo-availability-recording
+    interval: 30s
+    rules:
+      - record: job:ferrum_availability:err_ratio_5m
+        expr: 1 - avg by (job) (avg_over_time(up{job=~"ferrum-coordinator|ferrum-relay"}[5m]))
+      - record: job:ferrum_availability:err_ratio_30m
+        expr: 1 - avg by (job) (avg_over_time(up{job=~"ferrum-coordinator|ferrum-relay"}[30m]))
+      - record: job:ferrum_availability:err_ratio_1h
+        expr: 1 - avg by (job) (avg_over_time(up{job=~"ferrum-coordinator|ferrum-relay"}[1h]))
+      - record: job:ferrum_availability:err_ratio_6h
+        expr: 1 - avg by (job) (avg_over_time(up{job=~"ferrum-coordinator|ferrum-relay"}[6h]))
+      - record: job:ferrum_availability:err_ratio_3d
+        expr: 1 - avg by (job) (avg_over_time(up{job=~"ferrum-coordinator|ferrum-relay"}[3d]))
+
+  # --- Relay forwarding error ratio: dropped / (forwarded + dropped). ---
+  # NaN when the relay is idle (0/0) — a NaN comparison is false, so an idle relay
+  # never trips a burn-rate alert.
+  - name: ferrum-slo-relay-forward-recording
+    interval: 30s
+    rules:
+      - record: ferrum_relay:forward_err_ratio:5m
+        expr: |
+          sum(rate(ferrum_relay_frames_dropped_total[5m]))
+          /
+          (sum(rate(ferrum_relay_frames_forwarded_total[5m])) + sum(rate(ferrum_relay_frames_dropped_total[5m])))
+      - record: ferrum_relay:forward_err_ratio:30m
+        expr: |
+          sum(rate(ferrum_relay_frames_dropped_total[30m]))
+          /
+          (sum(rate(ferrum_relay_frames_forwarded_total[30m])) + sum(rate(ferrum_relay_frames_dropped_total[30m])))
+      - record: ferrum_relay:forward_err_ratio:1h
+        expr: |
+          sum(rate(ferrum_relay_frames_dropped_total[1h]))
+          /
+          (sum(rate(ferrum_relay_frames_forwarded_total[1h])) + sum(rate(ferrum_relay_frames_dropped_total[1h])))
+      - record: ferrum_relay:forward_err_ratio:6h
+        expr: |
+          sum(rate(ferrum_relay_frames_dropped_total[6h]))
+          /
+          (sum(rate(ferrum_relay_frames_forwarded_total[6h])) + sum(rate(ferrum_relay_frames_dropped_total[6h])))
+      - record: ferrum_relay:forward_err_ratio:3d
+        expr: |
+          sum(rate(ferrum_relay_frames_dropped_total[3d]))
+          /
+          (sum(rate(ferrum_relay_frames_forwarded_total[3d])) + sum(rate(ferrum_relay_frames_dropped_total[3d])))

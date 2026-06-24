@@ -1,0 +1,49 @@
+# Alertmanager routing for the Ferrum control plane (PRD Phase 6 FR4).
+#
+# Groups alerts by alertname + job, pages on `severity: critical`, and tickets on
+# `severity: warning`. Receivers ship with no external integration configured (so
+# the stack runs without secrets); plug in Slack / PagerDuty / email / a webhook
+# where the comments mark — the routing is already wired.
+
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: default
+  group_by: ['alertname', 'job']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    # Pages — fast notification, short repeat.
+    - matchers:
+        - severity = critical
+      receiver: pager
+      group_wait: 10s
+      repeat_interval: 1h
+    # Tickets — everything else (warnings).
+    - matchers:
+        - severity = warning
+      receiver: default
+
+receivers:
+  - name: default
+    # e.g. a chat channel / ticketing webhook:
+    # webhook_configs:
+    #   - url: http://your-webhook/notify
+
+  - name: pager
+    # e.g. PagerDuty:
+    # pagerduty_configs:
+    #   - routing_key: <PD_ROUTING_KEY>
+    # or Slack:
+    # slack_configs:
+    #   - api_url: <SLACK_WEBHOOK_URL>
+    #     channel: '#ferrum-alerts'
+
+inhibit_rules:
+  # A hard down/missing target silences the noisier burn-rate pages for the same
+  # job — one incident, one page.
+  - source_matchers: [severity = critical, alertname =~ "FerrumCoordinatorDown|FerrumRelayDown|FerrumTargetMissing"]
+    target_matchers: [slo = availability]
+    equal: ['job']
