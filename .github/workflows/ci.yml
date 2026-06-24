@@ -151,3 +151,29 @@ jobs:
 
       - name: Run verification with QUIC end-to-end
         run: sudo -E env "PATH=$PATH" TEST_QUIC=1 bash ./scripts/verify-linux.sh
+
+  # Phase 6 FR4: validate the observability stack's Prometheus SLO rules and
+  # Alertmanager config, and run the promtool alert-rule unit tests.
+  observability:
+    name: observability (SLO rules)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint Prometheus rules
+        run: |
+          docker run --rm --entrypoint promtool \
+            -v "$PWD/deploy/observability":/work prom/prometheus:v2.54.1 \
+            check rules /work/prometheus/rules/slo_recording.yml /work/prometheus/rules/slo_alerts.yml
+
+      - name: Run promtool alert-rule unit tests
+        run: |
+          docker run --rm --entrypoint promtool \
+            -v "$PWD/deploy/observability":/work prom/prometheus:v2.54.1 \
+            test rules /work/prometheus/tests/slo_tests.yml
+
+      - name: Check Alertmanager config
+        run: |
+          docker run --rm --entrypoint amtool \
+            -v "$PWD/deploy/observability":/work prom/alertmanager:v0.27.0 \
+            check-config /work/alertmanager/alertmanager.yml

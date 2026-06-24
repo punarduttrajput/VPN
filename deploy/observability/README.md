@@ -4,7 +4,8 @@ A reproducible local/dev observability stack for the Ferrum control plane:
 
 | Service | Role | URL |
 |---------|------|-----|
-| **Prometheus** | Scrapes the coordinator + relay `/metrics` | http://localhost:9090 |
+| **Prometheus** | Scrapes the coordinator + relay `/metrics`; evaluates SLO rules | http://localhost:9090 |
+| **Alertmanager** | Routes/dedupes fired SLO alerts | http://localhost:9093 |
 | **Grafana** | Dashboards over Prometheus + Jaeger (pre-provisioned) | http://localhost:3000 |
 | **Jaeger** | Receives OTLP spans from `--otlp-endpoint` | http://localhost:16686 |
 
@@ -71,6 +72,57 @@ and gauges only — see the module docs in `crates/coordinator/src/metrics.rs` a
   `ferrum_unauthenticated_total`
 - `ferrum_relay_clients_registered`, `ferrum_relay_frames_forwarded_total`,
   `ferrum_relay_bytes_forwarded_total`, `ferrum_relay_frames_dropped_total`
+
+## SLO-based alerting
+
+Prometheus loads SLO recording + alerting rules from
+[prometheus/rules/](prometheus/rules/) and ships fired alerts to **Alertmanager**.
+
+**SLOs** (measured from the existing aggregate metrics — NFR5):
+
+| SLO | Target | Error budget | SLI |
+|-----|--------|--------------|-----|
+| Control-plane availability | 99.95% (NFR3) | 0.05% | `1 - avg(up)` per job |
+| Relay forwarding success | 99% | 1% | `dropped / (forwarded + dropped)` |
+
+Both use **multi-window, multi-burn-rate** alerts (Google SRE Workbook): each
+alert ANDs a long and a short window so it pages fast on a hard outage but won't
+flap on a blip, and auto-resolves on recovery.
+
+| Tier | Burn rate | Windows | Severity |
+|------|-----------|---------|----------|
+| Fast page | 14.4× | 1h & 5m | critical |
+| Slow page | 6× | 6h & 30m | critical |
+| Ticket | 1× | 3d & 6h | warning |
+
+Plus operational alerts: `FerrumCoordinatorDown` / `FerrumRelayDown` /
+`FerrumTargetMissing` (hard availability), `FerrumCoordinatorIPPoolNearExhaustion`
+/ `FerrumCoordinatorWatchStreamsHigh` / `FerrumRelayClientsHigh` (capacity), and
+`FerrumCoordinatorAuthRejectionSpike` (security).
+
+Alertmanager ([alertmanager/alertmanager.yml](alertmanager/alertmanager.yml))
+routes `severity: critical` to a `pager` receiver and `warning` to `default`.
+Both receivers ship **without** an external integration so the stack runs with no
+secrets — plug in Slack/PagerDuty/email/a webhook where the comments mark.
+
+> **Latency SLO** is intentionally not defined: the services expose no
+> request-duration histogram SLI yet (the tracing spans carry timing but aren't a
+> Prometheus histogram). Adding one is the follow-up that unlocks a latency SLO.
+
+### Test the rules
+
+The alert rules have **promtool unit tests** that prove each alert fires on its
+condition (and stays quiet when healthy) without waiting for real `for` windows —
+also run in CI (the `observability` job):
+
+```sh
+docker run --rm --entrypoint promtool -v "$PWD/deploy/observability":/work \
+  prom/prometheus:v2.54.1 test rules /work/prometheus/tests/slo_tests.yml
+```
+
+To see an alert fire live, start the coordinator with `--metrics-listen`, let
+Prometheus scrape it (target `up`), then stop it: after ~2m `FerrumCoordinatorDown`
+moves to *firing* (Prometheus → Status → Alerts) and appears in Alertmanager.
 
 ## Tear down
 

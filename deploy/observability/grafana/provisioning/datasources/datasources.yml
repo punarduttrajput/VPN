@@ -18,3 +18,12 @@ datasources:
     uid: ferrum-jaeger
     access: proxy
     url: http://jaeger:16686
+
+  - name: Alertmanager
+    type: alertmanager
+    uid: ferrum-alertmanager
+    access: proxy
+    url: http://alertmanager:9093
+    jsonData:
+      implementation: prometheus
+      handleGrafanaManagedAlerts: false

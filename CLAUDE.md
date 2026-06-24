@@ -143,10 +143,14 @@ on the new environment before assuming it's still blocked.
   `--otlp-endpoint <url>` exports those same `skip_all` spans to a collector over OTLP/gRPC via
   `opentelemetry`/`tracing-opentelemetry`; verified end-to-end against Jaeger in WSL2 — the
   `ferrum-coordinator` service + its RPC spans land with no key/IP leakage) **and a committed
-  Prometheus + Grafana + Jaeger stack** (`deploy/observability/`: compose + scrape config +
-  Grafana datasource/dashboard provisioning + a "Ferrum — Control Plane Overview" dashboard;
-  verified up in WSL2 with both scrape targets reporting healthy). Remaining FR4: SLO-based
-  alerting rules. eBPF/XDP, anycast, autoscaling not started.
+  Prometheus + Grafana + Jaeger + Alertmanager stack** (`deploy/observability/`: compose +
+  scrape config + Grafana datasource/dashboard provisioning + a "Ferrum — Control Plane
+  Overview" dashboard) **and SLO-based alerting** (multi-window burn-rate rules for
+  availability 99.95% + relay-forwarding 99% SLOs, plus hard-down/capacity/security alerts →
+  Alertmanager; promtool unit tests + a CI `observability` job; verified live by fault
+  injection — `FerrumCoordinatorDown` fired and routed to the pager receiver). **FR4 is
+  complete** except a latency SLO (needs a request-duration histogram SLI — the documented
+  follow-up). eBPF/XDP, anycast, autoscaling not started.
 
 ## Recommended next work (highest-value, buildable in Rust)
 
@@ -170,6 +174,7 @@ on the new environment before assuming it's still blocked.
    `#[tracing::instrument(skip_all)]` spans across the coordinator RPC handlers + relay loop
    (NFR5-guarded by the `tracing_privacy` integration test) + **OTLP span export** (optional
    `otlp` feature; `--otlp-endpoint <url>` → OTLP/gRPC, verified against Jaeger in WSL2) +
-   a **committed Prometheus/Grafana/Jaeger stack** (`deploy/observability/`). Remaining FR4:
-   SLO-based alerting rules (a thin follow-up on the stack).
+   a **committed Prometheus/Grafana/Jaeger/Alertmanager stack** (`deploy/observability/`) with
+   **SLO burn-rate alerting** (promtool-tested + a CI `observability` job). FR4 complete bar a
+   latency SLO (needs a request-duration histogram SLI).
 4. **Phase 6 / NFR1**: real-hardware throughput; UDP GSO/GRO; eBPF/XDP fast path (Linux).
