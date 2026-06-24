@@ -15,7 +15,7 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # Unit + integration tests on every push, across Linux and Windows (the dev host).
+  # Unit + integration tests on every push, across Linux and Windows (the dev host)./
   test:
     name: test (${{ matrix.os }})
     strategy:
