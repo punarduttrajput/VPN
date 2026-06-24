@@ -1,0 +1,107 @@
+{
+  "uid": "ferrum-overview",
+  "title": "Ferrum — Control Plane Overview",
+  "tags": ["ferrum", "phase6"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "time": { "from": "now-30m", "to": "now" },
+  "editable": true,
+  "templating": { "list": [] },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Coordinator",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 1,
+      "collapsed": false
+    },
+    {
+      "type": "stat",
+      "title": "Devices registered",
+      "datasource": { "type": "prometheus", "uid": "ferrum-prometheus" },
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 1 },
+      "id": 2,
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "blue", "value": null } ] } }, "overrides": [] },
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } },
+      "targets": [ { "datasource": { "type": "prometheus", "uid": "ferrum-prometheus" }, "expr": "ferrum_devices_registered", "refId": "A" } ]
+    },
+    {
+      "type": "stat",
+      "title": "Active watch streams",
+      "datasource": { "type": "prometheus", "uid": "ferrum-prometheus" },
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 1 },
+      "id": 3,
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] } }, "overrides": [] },
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } },
+      "targets": [ { "datasource": { "type": "prometheus", "uid": "ferrum-prometheus" }, "expr": "ferrum_watch_streams_active", "refId": "A" } ]
+    },
+    {
+      "type": "timeseries",
+      "title": "RPCs (per second)",
+      "datasource": { "type": "prometheus", "uid": "ferrum-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
+      "id": 4,
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10 }, "unit": "reqps" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "lastNotNull"] }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "ferrum-prometheus" }, "expr": "rate(ferrum_register_total[5m])", "legendFormat": "register", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "ferrum-prometheus" }, "expr": "rate(ferrum_network_map_requests_total[5m])", "legendFormat": "get_network_map", "refId": "B" },
+        { "datasource": { "type": "prometheus", "uid": "ferrum-prometheus" }, "expr": "rate(ferrum_rotate_key_total[5m])", "legendFormat": "rotate_key", "refId": "C" },
+        { "datasource": { "type": "prometheus", "uid": "ferrum-prometheus" }, "expr": "rate(ferrum_publish_candidates_total[5m])", "legendFormat": "publish_candidates", "refId": "D" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Auth rejections (per second)",
+      "datasource": { "type": "prometheus", "uid": "ferrum-prometheus" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 7 },
+      "id": 5,
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 10 }, "unit": "reqps", "color": { "mode": "fixed", "fixedColor": "red" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } },
+      "targets": [ { "datasource": { "type": "prometheus", "uid": "ferrum-prometheus" }, "expr": "rate(ferrum_unauthenticated_total[5m])", "legendFormat": "unauthenticated", "refId": "A" } ]
+    },
+    {
+      "type": "row",
+      "title": "Relay",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 },
+      "id": 6,
+      "collapsed": false
+    },
+    {
+      "type": "stat",
+      "title": "Relay clients registered",
+      "datasource": { "type": "prometheus", "uid": "ferrum-prometheus" },
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 15 },
+      "id": 7,
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "purple", "value": null } ] } }, "overrides": [] },
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } },
+      "targets": [ { "datasource": { "type": "prometheus", "uid": "ferrum-prometheus" }, "expr": "ferrum_relay_clients_registered", "refId": "A" } ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Relay frames (per second)",
+      "datasource": { "type": "prometheus", "uid": "ferrum-prometheus" },
+      "gridPos": { "h": 8, "w": 9, "x": 6, "y": 15 },
+      "id": 8,
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 10 }, "unit": "pps" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "lastNotNull"] }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "ferrum-prometheus" }, "expr": "rate(ferrum_relay_frames_forwarded_total[5m])", "legendFormat": "forwarded", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "ferrum-prometheus" }, "expr": "rate(ferrum_relay_frames_dropped_total[5m])", "legendFormat": "dropped", "refId": "B" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Relay throughput (bytes/sec forwarded)",
+      "datasource": { "type": "prometheus", "uid": "ferrum-prometheus" },
+      "gridPos": { "h": 8, "w": 9, "x": 15, "y": 15 },
+      "id": 9,
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 20 }, "unit": "Bps" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } },
+      "targets": [ { "datasource": { "type": "prometheus", "uid": "ferrum-prometheus" }, "expr": "rate(ferrum_relay_bytes_forwarded_total[5m])", "legendFormat": "bytes/s", "refId": "A" } ]
+    }
+  ]
+}

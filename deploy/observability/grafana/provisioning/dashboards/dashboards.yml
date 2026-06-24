@@ -1,0 +1,15 @@
+# Grafana dashboard provisioning (PRD Phase 6 FR4).
+# Loads JSON dashboards baked into the image-mounted directory.
+apiVersion: 1
+
+providers:
+  - name: ferrum
+    orgId: 1
+    folder: Ferrum
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

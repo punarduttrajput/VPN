@@ -142,8 +142,11 @@ on the new environment before assuming it's still blocked.
   guards NFR5) **and OTLP span export** (optional `otlp` feature on coordinator + CLI:
   `--otlp-endpoint <url>` exports those same `skip_all` spans to a collector over OTLP/gRPC via
   `opentelemetry`/`tracing-opentelemetry`; verified end-to-end against Jaeger in WSL2 — the
-  `ferrum-coordinator` service + its RPC spans land with no key/IP leakage). Remaining FR4:
-  Grafana dashboards/alerting (needs a stack). eBPF/XDP, anycast, autoscaling not started.
+  `ferrum-coordinator` service + its RPC spans land with no key/IP leakage) **and a committed
+  Prometheus + Grafana + Jaeger stack** (`deploy/observability/`: compose + scrape config +
+  Grafana datasource/dashboard provisioning + a "Ferrum — Control Plane Overview" dashboard;
+  verified up in WSL2 with both scrape targets reporting healthy). Remaining FR4: SLO-based
+  alerting rules. eBPF/XDP, anycast, autoscaling not started.
 
 ## Recommended next work (highest-value, buildable in Rust)
 
@@ -166,6 +169,7 @@ on the new environment before assuming it's still blocked.
    Prometheus metrics (`--metrics-listen` → `/metrics`, aggregate counts only per NFR5) +
    `#[tracing::instrument(skip_all)]` spans across the coordinator RPC handlers + relay loop
    (NFR5-guarded by the `tracing_privacy` integration test) + **OTLP span export** (optional
-   `otlp` feature; `--otlp-endpoint <url>` → OTLP/gRPC, verified against Jaeger in WSL2).
-   Remaining FR4: Grafana dashboards/alerting (needs a stack).
+   `otlp` feature; `--otlp-endpoint <url>` → OTLP/gRPC, verified against Jaeger in WSL2) +
+   a **committed Prometheus/Grafana/Jaeger stack** (`deploy/observability/`). Remaining FR4:
+   SLO-based alerting rules (a thin follow-up on the stack).
 4. **Phase 6 / NFR1**: real-hardware throughput; UDP GSO/GRO; eBPF/XDP fast path (Linux).
