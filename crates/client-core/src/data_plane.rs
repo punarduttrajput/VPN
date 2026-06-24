@@ -20,10 +20,10 @@ use tokio::sync::mpsc;
 use tracing::warn;
 
 use ferrum_core::config::Cidr;
-use ferrum_transport::MeshTransport;
+use ferrum_transport::{MeshTransport, RelayMeshTransport};
 use ferrum_tunnel::device::TunDevice;
 use ferrum_tunnel::session::Session;
-use ferrum_tunnel::{run_mesh, MeshPeer};
+use ferrum_tunnel::{run_mesh, run_mesh_relayed, MeshPeer};
 
 use crate::client::FerrumClient;
 use crate::{ClientIdentity, ControlClient, Error, PeerSpec};
@@ -89,8 +89,11 @@ pub fn build_mesh_peers(private_key_b64: &str, peers: &[PeerSpec]) -> Result<Vec
 ///
 /// `device` is the opened TUN (a shell hands one built from its platform fd);
 /// `transport` is a bound [`MeshTransport`] (`UdpMeshTransport`, or QUIC/MASQUE).
-/// `private_key_b64` is this device's WireGuard private key, used to build the
-/// per-peer sessions (it is never sent to the coordinator).
+/// `relay`, when `Some`, is a connected public-key-keyed relay underlay: the mesh
+/// then runs direct + relay at once ([`run_mesh_relayed`]), preferring direct and
+/// falling back per peer (PRD Phase 4). `private_key_b64` is this device's
+/// WireGuard private key, used to build the per-peer sessions (it is never sent to
+/// the coordinator).
 ///
 /// `candidates` are this device's gathered NAT-traversal candidates (host +
 /// STUN server-reflexive `ip:port`, typically from
@@ -109,6 +112,7 @@ pub async fn run_mesh_session<D, M, F>(
     candidates: &[String],
     device: D,
     transport: M,
+    relay: Option<RelayMeshTransport>,
     shutdown: F,
 ) -> Result<(), Error>
 where
@@ -166,10 +170,13 @@ where
     });
 
     // Start the mesh empty; the watch stream delivers the current peer set
-    // immediately, then updates as the network changes.
-    let result = run_mesh(device, transport, Vec::new(), rx, shutdown)
-        .await
-        .map_err(|e| Error::DataPlane(e.to_string()));
+    // immediately, then updates as the network changes. With a relay configured
+    // the mesh runs both underlays and selects per peer; otherwise direct only.
+    let result = match relay {
+        Some(relay) => run_mesh_relayed(device, transport, relay, Vec::new(), rx, shutdown).await,
+        None => run_mesh(device, transport, Vec::new(), rx, shutdown).await,
+    }
+    .map_err(|e| Error::DataPlane(e.to_string()));
 
     watcher.abort();
     client.disconnect();
@@ -277,6 +284,7 @@ mod tests {
                 &[],
                 device,
                 transport,
+                None,
                 async move {
                     let _ = stop_rx.await;
                 },
@@ -352,6 +360,7 @@ mod tests {
                 &cands,
                 device,
                 transport,
+                None,
                 async move {
                     let _ = stop_rx.await;
                 },

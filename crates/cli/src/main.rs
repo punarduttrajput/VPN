@@ -21,7 +21,7 @@ use ferrum_core::keys::KeyPair;
 use ferrum_transport::{JitteredTransport, UdpMeshTransport, UdpTransport};
 use ferrum_tunnel::device::{self, TunConfig};
 use ferrum_tunnel::session::Session;
-use ferrum_tunnel::{run_mesh, MeshPeer};
+use ferrum_tunnel::{run_mesh, run_mesh_relayed, MeshPeer};
 
 #[derive(Parser)]
 #[command(name = "ferrum", version, about = "Ferrum — Phase 1 MVP tunnel")]
@@ -405,6 +405,26 @@ async fn up_mesh(
         }
     });
 
+    // Optional relay fallback underlay (Phase 4): runs alongside the chosen direct
+    // transport, selected per peer by the path state machine. Connect with no
+    // peers — the data plane aligns the relay's key table from the network map.
+    let relay = match config.transport.relay.as_deref() {
+        Some(r) => {
+            let relay_addr: SocketAddr = r
+                .parse()
+                .with_context(|| format!("parsing transport.relay '{r}'"))?;
+            let self_key = ferrum_core::keys::decode_key(&public_key)
+                .context("decoding our public key for the relay")?;
+            info!(relay = %relay_addr, "relay fallback enabled");
+            Some(
+                ferrum_transport::RelayMeshTransport::connect(relay_addr, self_key, &[])
+                    .await
+                    .with_context(|| format!("connecting to relay at {relay_addr}"))?,
+            )
+        }
+        None => None,
+    };
+
     info!("starting mesh data plane (Ctrl-C to stop)");
     // Start with an empty mesh; the watch stream delivers the current peer set
     // immediately, then updates as the network changes. Pick the mesh transport
@@ -415,9 +435,7 @@ async fn up_mesh(
                 .await
                 .with_context(|| format!("binding UDP socket on {bind_addr}"))?;
             info!("mesh transport: udp");
-            run_mesh(dev, transport, Vec::new(), rx, shutdown_signal())
-                .await
-                .context("mesh data plane")
+            drive_mesh(dev, transport, relay, rx, shutdown_signal()).await
         }
         TransportMode::Quic => {
             #[cfg(feature = "quic")]
@@ -426,9 +444,7 @@ async fn up_mesh(
                     .await
                     .with_context(|| format!("binding QUIC mesh endpoint on {bind_addr}"))?;
                 info!("mesh transport: quic");
-                run_mesh(dev, transport, Vec::new(), rx, shutdown_signal())
-                    .await
-                    .context("mesh data plane")
+                drive_mesh(dev, transport, relay, rx, shutdown_signal()).await
             }
             #[cfg(not(feature = "quic"))]
             {
@@ -460,9 +476,7 @@ async fn up_mesh(
                     .to_string();
                 let transport = ferrum_transport::MasqueMeshTransport::new(proxy_addr, authority);
                 info!(proxy = %proxy_addr, "mesh transport: masque");
-                run_mesh(dev, transport, Vec::new(), rx, shutdown_signal())
-                    .await
-                    .context("mesh data plane")
+                drive_mesh(dev, transport, relay, rx, shutdown_signal()).await
             }
             #[cfg(not(feature = "masque"))]
             {
@@ -572,6 +586,32 @@ where
         (None, None) => ferrum_tunnel::run(session, device, transport, shutdown)
             .await
             .context("tunnel event loop")?,
+    }
+    Ok(())
+}
+
+/// Run the mesh data plane, adding a relay fallback underlay when one is
+/// configured (Phase 4 NAT traversal). With a relay both underlays run at once
+/// and the per-peer path machine selects between them; without one it is
+/// direct-only — identical to the prior behavior.
+async fn drive_mesh<D, M>(
+    device: D,
+    transport: M,
+    relay: Option<ferrum_transport::RelayMeshTransport>,
+    updates: mpsc::Receiver<Vec<MeshPeer>>,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<()>
+where
+    D: ferrum_tunnel::device::TunDevice + Send + 'static,
+    M: ferrum_transport::MeshTransport + Send + 'static,
+{
+    match relay {
+        Some(relay) => run_mesh_relayed(device, transport, relay, Vec::new(), updates, shutdown)
+            .await
+            .context("mesh data plane")?,
+        None => run_mesh(device, transport, Vec::new(), updates, shutdown)
+            .await
+            .context("mesh data plane")?,
     }
     Ok(())
 }

@@ -76,6 +76,12 @@ pub struct TransportConfig {
     /// Required for `masque`: the MASQUE proxy's socket address (`ip:port`).
     #[serde(default)]
     pub masque_proxy: Option<String>,
+    /// Optional DERP-style relay fallback (Phase 4 NAT traversal): the relay
+    /// server's socket address (`ip:port`). Independent of `mode` — when set, the
+    /// mesh runs the chosen direct transport *and* a public-key-keyed relay
+    /// underlay, preferring direct and falling back to the relay per peer.
+    #[serde(default)]
+    pub relay: Option<String>,
     /// Pad datagrams to a uniform size to blunt size-fingerprinting (FR5).
     /// Both peers must set the same value. Defaults to off.
     #[serde(default)]
@@ -225,6 +231,13 @@ impl Config {
             proxy.parse::<SocketAddr>().map_err(|e| {
                 Error::ConfigInvalid(format!("transport.masque_proxy '{proxy}': {e}"))
             })?;
+        }
+
+        // An optional relay fallback must be a valid socket address.
+        if let Some(relay) = self.transport.relay.as_deref() {
+            relay
+                .parse::<SocketAddr>()
+                .map_err(|e| Error::ConfigInvalid(format!("transport.relay '{relay}': {e}")))?;
         }
 
         Ok(())
@@ -425,6 +438,35 @@ mod tests {
     fn rejects_masque_with_bad_proxy_addr() {
         let toml_str = format!(
             "{}\n[transport]\nmode = \"masque\"\nmasque_proxy = \"not-an-addr\"\n",
+            valid_toml()
+        );
+        let cfg: Config = toml::from_str(&toml_str).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn relay_defaults_to_none() {
+        let cfg: Config = toml::from_str(&valid_toml()).unwrap();
+        assert_eq!(cfg.transport.relay, None);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn parses_relay_fallback_alongside_udp() {
+        let toml_str = format!(
+            "{}\n[transport]\nmode = \"udp\"\nrelay = \"203.0.113.7:9999\"\n",
+            valid_toml()
+        );
+        let cfg: Config = toml::from_str(&toml_str).unwrap();
+        assert_eq!(cfg.transport.mode, TransportMode::Udp);
+        assert_eq!(cfg.transport.relay.as_deref(), Some("203.0.113.7:9999"));
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_relay_with_bad_addr() {
+        let toml_str = format!(
+            "{}\n[transport]\nmode = \"udp\"\nrelay = \"not-an-addr\"\n",
             valid_toml()
         );
         let cfg: Config = toml::from_str(&toml_str).unwrap();
