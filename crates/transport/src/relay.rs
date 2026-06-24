@@ -227,6 +227,10 @@ impl RelayServer {
     /// data frames are forwarded to the destination key's current address,
     /// rewritten to carry the *source* key. Unknown senders or destinations are
     /// dropped (a client must register before it can be reached).
+    // One span for the serve loop's lifetime (cheap — not per frame); the
+    // per-frame debug events nest under it. `skip_all`: no addresses/keys/payloads
+    // enter the span (NFR5).
+    #[tracing::instrument(skip_all, name = "relay_serve")]
     pub async fn serve(&self) -> Result<(), TransportError> {
         let mut buf = vec![0u8; FRAME_BUF];
         loop {

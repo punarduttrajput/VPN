@@ -133,11 +133,13 @@ on the new environment before assuming it's still blocked.
   allow-listing loopback/tunnel/coordinator; Linux — see `apps/desktop/.../killswitch.rs`).
   Remaining: iOS/Android shells, a privileged-helper for the desktop TUN, and macOS/Windows
   kill-switch enforcement.
-- **Phase 6 (~12%):** `sendmmsg` batching + **observability M1 metrics done for coordinator
-  *and* relay** (privacy-preserving Prometheus metrics on a `--metrics-listen` `/metrics`
-  endpoint each: aggregate RPC/forwarding counters + gauges, no per-user/flow labels — NFR5;
-  hand-rolled, dependency-free). eBPF/XDP, anycast, autoscaling, and `tracing`/OTel spans not
-  started.
+- **Phase 6 (~15%):** `sendmmsg` batching + **observability M1 done (coordinator + relay)**:
+  privacy-preserving Prometheus metrics on a `--metrics-listen` `/metrics` endpoint each
+  (aggregate counters/gauges, no per-user/flow labels — NFR5; hand-rolled, dependency-free)
+  **and** `#[tracing::instrument(skip_all)]` spans across the coordinator RPC handlers + the
+  relay forward loop (request fields never enter a span; a `tracing_privacy` integration test
+  guards NFR5). Remaining FR4: OTLP span export (needs a collector). eBPF/XDP, anycast,
+  autoscaling not started.
 
 ## Recommended next work (highest-value, buildable in Rust)
 
@@ -156,7 +158,9 @@ on the new environment before assuming it's still blocked.
    ICE candidate-pair prioritization; a desktop-GUI relay/STUN field.)
 2. **Phase 5 — native shells**: iOS (NetworkExtension + SwiftUI) / Android
    (FerrumService + Compose) over the existing `uniffi` bindings (needs Apple/Android toolchains).
-3. **Phase 6 — observability (M1, buildable here)** 🟡: coordinator *and* relay Prometheus
-   metrics land (`--metrics-listen` → `/metrics` on each, aggregate counts only per NFR5).
-   Next: `tracing`/OpenTelemetry spans across the coordinator/relay request paths.
+3. **Phase 6 — observability (M1)** ✅ *(buildable parts done)*: coordinator *and* relay
+   Prometheus metrics (`--metrics-listen` → `/metrics`, aggregate counts only per NFR5) +
+   `#[tracing::instrument(skip_all)]` spans across the coordinator RPC handlers + relay loop
+   (NFR5-guarded by the `tracing_privacy` integration test). Remaining FR4: OTLP span export
+   (needs a running collector — a thin follow-up).
 4. **Phase 6 / NFR1**: real-hardware throughput; UDP GSO/GRO; eBPF/XDP fast path (Linux).

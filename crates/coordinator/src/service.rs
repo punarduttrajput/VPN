@@ -166,6 +166,10 @@ fn bearer_token(meta: &tonic::metadata::MetadataMap) -> Result<&str, Status> {
 
 #[tonic::async_trait]
 impl Coordinator for CoordinatorService {
+    // `skip_all`: the request carries the device public key/name/endpoint; none of
+    // it enters the span (NFR5 — no per-user identity in traces). The span records
+    // only the operation and a safe outcome.
+    #[tracing::instrument(skip_all, name = "register_device")]
     async fn register_device(
         &self,
         request: Request<RegisterDeviceRequest>,
@@ -186,11 +190,13 @@ impl Coordinator for CoordinatorService {
         };
         // Notify watchers that the network changed (ignored if none are connected).
         let _ = self.changes.send(());
+        tracing::info!(authenticated = claims.is_some(), "registered device");
         Ok(Response::new(RegisterDeviceResponse {
             assigned_cidr: format!("{ip}/32"),
         }))
     }
 
+    #[tracing::instrument(skip_all, name = "get_network_map")]
     async fn get_network_map(
         &self,
         request: Request<NetworkMapRequest>,
@@ -198,16 +204,15 @@ impl Coordinator for CoordinatorService {
         self.authenticate_metered(&request)?;
         self.metrics.inc_network_map_request();
         let req = request.into_inner();
-        Ok(Response::new(current_map(
-            &self.registry,
-            &req.public_key,
-            &self.relay,
-        )))
+        let map = current_map(&self.registry, &req.public_key, &self.relay);
+        tracing::debug!(peers = map.peers.len(), "served network map");
+        Ok(Response::new(map))
     }
 
     type WatchNetworkMapStream =
         Pin<Box<dyn Stream<Item = Result<NetworkMapResponse, Status>> + Send>>;
 
+    #[tracing::instrument(skip_all, name = "watch_network_map")]
     async fn watch_network_map(
         &self,
         request: Request<NetworkMapRequest>,
@@ -220,6 +225,7 @@ impl Coordinator for CoordinatorService {
         // Track this stream in the active-streams gauge; the guard rides into the
         // serving task and decrements when it ends (disconnect / close / error).
         let guard = self.metrics.watch_started();
+        tracing::info!("watch stream opened");
         let (tx, rx) = mpsc::channel(16);
 
         tokio::spawn(async move {
@@ -249,6 +255,7 @@ impl Coordinator for CoordinatorService {
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 
+    #[tracing::instrument(skip_all, name = "publish_candidates")]
     async fn publish_candidates(
         &self,
         request: Request<PublishCandidatesRequest>,
@@ -256,6 +263,7 @@ impl Coordinator for CoordinatorService {
         self.authenticate_metered(&request)?;
         self.metrics.inc_publish_candidates();
         let req = request.into_inner();
+        tracing::debug!(candidates = req.candidates.len(), "published candidates");
         {
             let mut reg = self.registry.lock().expect("registry mutex poisoned");
             reg.set_candidates(&req.public_key, &req.candidates)
@@ -267,6 +275,7 @@ impl Coordinator for CoordinatorService {
         Ok(Response::new(PublishCandidatesResponse {}))
     }
 
+    #[tracing::instrument(skip_all, name = "rotate_key")]
     async fn rotate_key(
         &self,
         request: Request<RotateKeyRequest>,
@@ -288,6 +297,7 @@ impl Coordinator for CoordinatorService {
         // The device now answers under a new key; push a fresh map so peers
         // re-handshake to it (PRD Phase 3 FR3 graceful re-handshake).
         let _ = self.changes.send(());
+        tracing::info!("rotated device key");
         Ok(Response::new(RotateKeyResponse {
             assigned_cidr: format!("{ip}/32"),
         }))
