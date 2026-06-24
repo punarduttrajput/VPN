@@ -11,6 +11,7 @@ pub mod policy;
 pub mod registry;
 pub mod service;
 pub mod store;
+pub mod telemetry;
 
 #[cfg(feature = "sqlite")]
 pub mod sqlite;

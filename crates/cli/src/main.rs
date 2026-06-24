@@ -12,7 +12,8 @@ use std::net::SocketAddr;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing::info;
-use tracing_subscriber::EnvFilter;
+
+mod telemetry;
 
 use ferrum_client_core::data_plane::run_mesh_session_supervised;
 use ferrum_client_core::{ClientIdentity, ControlClient, FerrumClient, ReconnectPolicy};
@@ -43,6 +44,10 @@ enum Command {
         /// (`GET /metrics`), e.g. `0.0.0.0:9096` (Phase 6 FR4).
         #[arg(long)]
         metrics_listen: Option<String>,
+        /// Optional OTLP collector endpoint to export tracing spans to, e.g.
+        /// `http://localhost:4317` (Phase 6 FR4; requires the `otlp` feature).
+        #[arg(long)]
+        otlp_endpoint: Option<String>,
     },
     /// Bring up the tunnel from a config file and run until Ctrl-C.
     Up {
@@ -97,13 +102,15 @@ enum Command {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
-
     let cli = Cli::parse();
+
+    // The relay is a Phase 6 FR4 observability target and may export spans over
+    // OTLP, which must be initialized inside the tokio runtime (the OTLP/gRPC
+    // exporter needs a tokio context); its tracing is set up in `relay()` itself.
+    // Every other command just gets the stderr `fmt` subscriber here.
+    let _telemetry =
+        (!matches!(cli.command, Command::Relay { .. })).then(|| telemetry::init(None, "ferrum"));
+
     match cli.command {
         Command::Keygen => {
             keygen();
@@ -112,10 +119,15 @@ fn main() -> Result<()> {
         Command::Relay {
             listen,
             metrics_listen,
+            otlp_endpoint,
         } => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?
-            .block_on(relay(&listen, metrics_listen.as_deref())),
+            .block_on(relay(
+                &listen,
+                metrics_listen.as_deref(),
+                otlp_endpoint.as_deref(),
+            )),
         Command::Up { config, iface, mtu } => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?
@@ -158,7 +170,16 @@ fn keygen() {
 /// forwards opaque (already-encrypted) datagrams between registered peers, so it
 /// needs no keys of its own. With `metrics_listen` set, also serve
 /// privacy-preserving Prometheus metrics on `GET /metrics` (Phase 6 FR4).
-async fn relay(listen: &str, metrics_listen: Option<&str>) -> Result<()> {
+async fn relay(
+    listen: &str,
+    metrics_listen: Option<&str>,
+    otlp_endpoint: Option<&str>,
+) -> Result<()> {
+    // Tracing: stderr logs always; OTLP span export (Phase 6 FR4) when
+    // --otlp-endpoint is given and the `otlp` feature is built. The guard flushes
+    // the exporter on drop, so it must outlive the serve loop below.
+    let _telemetry = telemetry::init(otlp_endpoint, "ferrum-relay");
+
     let addr: SocketAddr = listen
         .parse()
         .with_context(|| format!("parsing --listen '{listen}'"))?;

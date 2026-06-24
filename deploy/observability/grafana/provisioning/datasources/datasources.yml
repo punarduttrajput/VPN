@@ -1,0 +1,20 @@
+# Grafana datasource provisioning (PRD Phase 6 FR4).
+# Prometheus for the aggregate metrics; Jaeger for the OTLP traces.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: ferrum-prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      httpMethod: POST
+      timeInterval: 15s
+
+  - name: Jaeger
+    type: jaeger
+    uid: ferrum-jaeger
+    access: proxy
+    url: http://jaeger:16686

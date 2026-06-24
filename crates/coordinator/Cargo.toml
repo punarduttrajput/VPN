@@ -19,6 +19,15 @@ mtls = ["tonic/tls", "dep:rcgen", "dep:rustls"]
 # device tags become a verified authorization boundary. Offline JWT verify via
 # in-tree `ring` (no external IdP needed to test).
 oidc = ["dep:ring", "dep:base64", "dep:serde_json"]
+# OpenTelemetry span export (PRD Phase 6 FR4): export the existing RPC-handler
+# tracing spans to an OTLP collector (gRPC, default :4317) via --otlp-endpoint.
+# The spans use skip_all already (NFR5), so this exports aggregate timing only.
+otlp = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+]
 
 [dependencies]
 ferrum-control-proto = { path = "../control-proto" }
@@ -37,6 +46,10 @@ rcgen = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 ring = { version = "0.17", optional = true }
 base64 = { workspace = true, optional = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio-stream = { version = "0.1", features = ["net"] }

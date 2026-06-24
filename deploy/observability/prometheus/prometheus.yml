@@ -1,0 +1,33 @@
+# Prometheus scrape config for the Ferrum control plane (PRD Phase 6 FR4).
+#
+# Targets the privacy-preserving /metrics endpoints exposed by the coordinator
+# (--metrics-listen) and relay (--metrics-listen). These expose aggregate counts
+# only — no per-user/flow labels (NFR5).
+
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  external_labels:
+    monitor: ferrum
+
+scrape_configs:
+  # The control-plane coordinator. By default it runs on the host; in a
+  # containerized deployment, replace the target with the service name, e.g.
+  # `coordinator:9095`, and drop the host.docker.internal extra_hosts mapping.
+  - job_name: ferrum-coordinator
+    static_configs:
+      - targets: ["host.docker.internal:9095"]
+        labels:
+          component: coordinator
+
+  # The DERP-style relay.
+  - job_name: ferrum-relay
+    static_configs:
+      - targets: ["host.docker.internal:9096"]
+        labels:
+          component: relay
+
+  # Prometheus scraping itself (stack health).
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

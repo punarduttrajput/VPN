@@ -1,0 +1,89 @@
+# Ferrum observability stack (PRD Phase 6 FR4 / G4).
+#
+# Brings up Prometheus (scrapes the coordinator + relay /metrics endpoints),
+# Grafana (pre-provisioned with the Prometheus + Jaeger datasources and a starter
+# dashboard), and Jaeger (receives OTLP spans from --otlp-endpoint).
+#
+# Privacy (NFR5): the only telemetry that flows here is the aggregate,
+# label-free metrics and the skip_all spans the services already emit — no
+# per-user traffic, keys, IPs, or destinations. See the crates' metrics/telemetry
+# module docs.
+#
+#   docker compose -f deploy/observability/docker-compose.yml up -d
+#     Prometheus  -> http://localhost:9090
+#     Grafana     -> http://localhost:3000   (anonymous viewer; admin/admin to edit)
+#     Jaeger UI   -> http://localhost:16686
+#
+# Scrape targets default to `host.docker.internal:{9095,9096}` — i.e. a coordinator
+# and relay running on the *host*:
+#   ferrum-coordinator --metrics-listen 0.0.0.0:9095 [--otlp-endpoint http://localhost:4317]
+#   ferrum relay        --metrics-listen 0.0.0.0:9096 [--otlp-endpoint http://localhost:4317]
+# In a containerized deployment, run the services on the `ferrum` network below and
+# point the scrape jobs at their service names instead (see prometheus/prometheus.yml).
+
+name: ferrum-observability
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: ferrum-prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    # Lets Prometheus reach a coordinator/relay running on the host. On Docker
+    # Desktop and most Linux setups `host-gateway` resolves to the host.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - ferrum
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: ferrum-grafana
+    restart: unless-stopped
+    environment:
+      # Anonymous read-only access so the dashboard is viewable without a login;
+      # the admin account (admin/admin) is still there for editing.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+      GF_USERS_DEFAULT_THEME: "dark"
+      GF_LOG_LEVEL: "warn"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - ferrum
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    container_name: ferrum-jaeger
+    restart: unless-stopped
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686" # UI
+      - "4317:4317"   # OTLP gRPC (coordinator/relay --otlp-endpoint)
+      - "4318:4318"   # OTLP HTTP
+    networks:
+      - ferrum
+
+volumes:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  ferrum:
+    name: ferrum-observability
+    driver: bridge
