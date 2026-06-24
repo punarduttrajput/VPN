@@ -39,6 +39,10 @@ enum Command {
         /// Address to listen on, e.g. `0.0.0.0:51821`.
         #[arg(long, default_value = "0.0.0.0:51821")]
         listen: String,
+        /// Optional address to serve privacy-preserving Prometheus metrics on
+        /// (`GET /metrics`), e.g. `0.0.0.0:9096` (Phase 6 FR4).
+        #[arg(long)]
+        metrics_listen: Option<String>,
     },
     /// Bring up the tunnel from a config file and run until Ctrl-C.
     Up {
@@ -105,10 +109,13 @@ fn main() -> Result<()> {
             keygen();
             Ok(())
         }
-        Command::Relay { listen } => tokio::runtime::Builder::new_multi_thread()
+        Command::Relay {
+            listen,
+            metrics_listen,
+        } => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?
-            .block_on(relay(&listen)),
+            .block_on(relay(&listen, metrics_listen.as_deref())),
         Command::Up { config, iface, mtu } => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?
@@ -149,20 +156,74 @@ fn keygen() {
 
 /// Phase 4 M3: run the public-key-keyed relay until interrupted. The relay only
 /// forwards opaque (already-encrypted) datagrams between registered peers, so it
-/// needs no keys of its own.
-async fn relay(listen: &str) -> Result<()> {
+/// needs no keys of its own. With `metrics_listen` set, also serve
+/// privacy-preserving Prometheus metrics on `GET /metrics` (Phase 6 FR4).
+async fn relay(listen: &str, metrics_listen: Option<&str>) -> Result<()> {
     let addr: SocketAddr = listen
         .parse()
         .with_context(|| format!("parsing --listen '{listen}'"))?;
     let server = ferrum_transport::RelayServer::bind(addr)
         .await
         .with_context(|| format!("binding relay on {addr}"))?;
+
+    if let Some(metrics_addr) = metrics_listen {
+        let metrics_addr: SocketAddr = metrics_addr
+            .parse()
+            .with_context(|| format!("parsing --metrics-listen '{metrics_addr}'"))?;
+        let metrics = server.metrics();
+        info!(%metrics_addr, "relay metrics enabled");
+        tokio::spawn(serve_relay_metrics(metrics_addr, metrics));
+    }
+
     info!(%addr, "relay listening (Ctrl-C to stop)");
     tokio::select! {
         result = server.serve() => result.context("relay server")?,
         _ = shutdown_signal() => info!("relay stopped"),
     }
     Ok(())
+}
+
+/// Serve the relay's privacy-preserving metrics (PRD Phase 6 FR4) on a tiny
+/// HTTP/1 endpoint at `GET /metrics` — enough for a Prometheus scraper,
+/// hand-rolled over a `TcpListener` so the CLI gains no HTTP-server dependency.
+async fn serve_relay_metrics(
+    addr: SocketAddr,
+    metrics: std::sync::Arc<ferrum_transport::RelayMetrics>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = match TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!(%addr, error = %e, "failed to bind relay metrics endpoint");
+            return;
+        }
+    };
+    loop {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            continue;
+        };
+        let metrics = metrics.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            let response = if buf[..n].starts_with(b"GET /metrics") {
+                let body = metrics.render();
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+            } else {
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_string()
+            };
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+    }
 }
 
 /// FR1–FR3: load config, build the session + TUN device + UDP socket, run loop.

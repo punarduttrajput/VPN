@@ -29,7 +29,7 @@ pub use udp::{UdpMeshTransport, UdpTransport};
 pub mod stun;
 
 pub mod relay;
-pub use relay::{RelayMeshTransport, RelayServer};
+pub use relay::{RelayMeshTransport, RelayMetrics, RelayServer};
 
 #[cfg(feature = "quic")]
 pub mod quic;

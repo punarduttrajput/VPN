@@ -30,6 +30,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -74,6 +75,97 @@ fn data_frame(key: &PublicKey, payload: &[u8]) -> Vec<u8> {
     f
 }
 
+/// Privacy-preserving relay metrics (PRD Phase 6, FR4 / NFR5).
+///
+/// Aggregate counts only — **no labels carrying public keys, addresses, or any
+/// per-client/flow identity** (the relay knows who-talks-to-whom, but that never
+/// leaves it as a metric). Rendered in the Prometheus text exposition format by
+/// the `ferrum relay --metrics-listen` endpoint, mirroring the coordinator's
+/// hand-rolled, dependency-free approach.
+#[derive(Default)]
+pub struct RelayMetrics {
+    registers_total: AtomicU64,
+    frames_forwarded_total: AtomicU64,
+    bytes_forwarded_total: AtomicU64,
+    frames_dropped_total: AtomicU64,
+    clients_registered: AtomicU64,
+}
+
+impl RelayMetrics {
+    /// A register frame was processed; `client_count` is the live `key -> addr`
+    /// table size right after it (the current gauge value).
+    fn note_register(&self, client_count: usize) {
+        self.registers_total.fetch_add(1, Ordering::Relaxed);
+        self.clients_registered
+            .store(client_count as u64, Ordering::Relaxed);
+    }
+
+    /// A data frame of `payload_len` bytes was forwarded to its destination.
+    fn note_forwarded(&self, payload_len: usize) {
+        self.frames_forwarded_total.fetch_add(1, Ordering::Relaxed);
+        self.bytes_forwarded_total
+            .fetch_add(payload_len as u64, Ordering::Relaxed);
+    }
+
+    /// A frame was dropped (unknown sender/destination, malformed, or a failed
+    /// forward).
+    fn note_dropped(&self) {
+        self.frames_dropped_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Render all relay metrics in the Prometheus text exposition format.
+    pub fn render(&self) -> String {
+        let mut out = String::with_capacity(512);
+        gauge(
+            &mut out,
+            "ferrum_relay_clients_registered",
+            "Relay clients currently in the key->addr table.",
+            self.clients_registered.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "ferrum_relay_registers_total",
+            "Total register frames processed.",
+            self.registers_total.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "ferrum_relay_frames_forwarded_total",
+            "Total data frames forwarded to a destination.",
+            self.frames_forwarded_total.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "ferrum_relay_bytes_forwarded_total",
+            "Total payload bytes forwarded (opaque WireGuard datagrams).",
+            self.bytes_forwarded_total.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "ferrum_relay_frames_dropped_total",
+            "Total frames dropped (unknown sender/destination, malformed, or failed forward).",
+            self.frames_dropped_total.load(Ordering::Relaxed),
+        );
+        out
+    }
+}
+
+/// Append one `gauge`-typed metric (HELP + TYPE + value) to the exposition text.
+fn gauge(out: &mut String, name: &str, help: &str, value: u64) {
+    emit(out, name, help, "gauge", value);
+}
+
+/// Append one `counter`-typed metric to the exposition text.
+fn counter(out: &mut String, name: &str, help: &str, value: u64) {
+    emit(out, name, help, "counter", value);
+}
+
+fn emit(out: &mut String, name: &str, help: &str, typ: &str, value: u64) {
+    out.push_str(&format!(
+        "# HELP {name} {help}\n# TYPE {name} {typ}\n{name} {value}\n"
+    ));
+}
+
 /// The relay server: a public-key-keyed UDP packet forwarder.
 ///
 /// Bind it on a reachable address, then drive [`serve`](RelayServer::serve).
@@ -82,6 +174,7 @@ fn data_frame(key: &PublicKey, payload: &[u8]) -> Vec<u8> {
 pub struct RelayServer {
     socket: UdpSocket,
     clients: Mutex<Clients>,
+    metrics: Arc<RelayMetrics>,
 }
 
 /// The relay's bidirectional `key <-> addr` table.
@@ -115,12 +208,19 @@ impl RelayServer {
         Ok(Self {
             socket: UdpSocket::bind(local).await?,
             clients: Mutex::new(Clients::default()),
+            metrics: Arc::new(RelayMetrics::default()),
         })
     }
 
     /// The address the relay is listening on (useful when bound to port 0).
     pub fn local_addr(&self) -> Result<SocketAddr, TransportError> {
         Ok(self.socket.local_addr()?)
+    }
+
+    /// A handle to this relay's metrics, for a `/metrics` exporter to render
+    /// (PRD Phase 6 FR4). Clone it before moving the server into its serve loop.
+    pub fn metrics(&self) -> Arc<RelayMetrics> {
+        self.metrics.clone()
     }
 
     /// Forward frames until the socket errors. Register frames update the table;
@@ -136,10 +236,12 @@ impl RelayServer {
                 Some(&TAG_REGISTER) if n == 1 + KEY_LEN => {
                     let mut key = [0u8; KEY_LEN];
                     key.copy_from_slice(&frame[1..1 + KEY_LEN]);
-                    self.clients
-                        .lock()
-                        .expect("relay table poisoned")
-                        .register(key, from);
+                    let count = {
+                        let mut clients = self.clients.lock().expect("relay table poisoned");
+                        clients.register(key, from);
+                        clients.by_key.len()
+                    };
+                    self.metrics.note_register(count);
                     debug!(%from, "relay client registered");
                 }
                 Some(&TAG_DATA) if n >= DATA_HEADER => {
@@ -152,17 +254,26 @@ impl RelayServer {
                         match (clients.by_addr.get(&from), clients.by_key.get(&dst_key)) {
                             (Some(src), Some(dst)) => (*src, *dst),
                             _ => {
+                                self.metrics.note_dropped();
                                 debug!(%from, "relay: unknown sender or destination; dropping");
                                 continue;
                             }
                         }
                     };
-                    let out = data_frame(&src_key, &frame[DATA_HEADER..]);
-                    if let Err(e) = self.socket.send_to(&out, dst_addr).await {
-                        warn!(%dst_addr, "relay forward failed: {e}");
+                    let payload = &frame[DATA_HEADER..];
+                    let out = data_frame(&src_key, payload);
+                    match self.socket.send_to(&out, dst_addr).await {
+                        Ok(_) => self.metrics.note_forwarded(payload.len()),
+                        Err(e) => {
+                            self.metrics.note_dropped();
+                            warn!(%dst_addr, "relay forward failed: {e}");
+                        }
                     }
                 }
-                _ => debug!(%from, len = n, "relay: malformed frame; dropping"),
+                _ => {
+                    self.metrics.note_dropped();
+                    debug!(%from, len = n, "relay: malformed frame; dropping");
+                }
             }
         }
     }
@@ -334,18 +445,36 @@ mod tests {
         [b; KEY_LEN]
     }
 
-    /// Spawn a relay server on loopback and return its address.
-    async fn start_relay() -> SocketAddr {
+    /// Spawn a relay server on loopback and return its address + metrics handle.
+    async fn start_relay() -> (SocketAddr, Arc<RelayMetrics>) {
         let server = Arc::new(
             RelayServer::bind("127.0.0.1:0".parse().unwrap())
                 .await
                 .unwrap(),
         );
         let addr = server.local_addr().unwrap();
+        let metrics = server.metrics();
         tokio::spawn(async move {
             let _ = server.serve().await;
         });
-        addr
+        (addr, metrics)
+    }
+
+    #[test]
+    fn relay_metrics_render_in_prometheus_format() {
+        let m = RelayMetrics::default();
+        m.note_register(1);
+        m.note_register(2);
+        m.note_forwarded(100);
+        m.note_dropped();
+        let t = m.render();
+        assert!(t.contains("# TYPE ferrum_relay_clients_registered gauge"));
+        assert!(t.contains("ferrum_relay_clients_registered 2\n"));
+        assert!(t.contains("# TYPE ferrum_relay_registers_total counter"));
+        assert!(t.contains("ferrum_relay_registers_total 2\n"));
+        assert!(t.contains("ferrum_relay_frames_forwarded_total 1\n"));
+        assert!(t.contains("ferrum_relay_bytes_forwarded_total 100\n"));
+        assert!(t.contains("ferrum_relay_frames_dropped_total 1\n"));
     }
 
     #[test]
@@ -365,7 +494,7 @@ mod tests {
     /// (reported as that peer's endpoint handle).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn relays_payload_between_two_clients_by_key() {
-        let relay = start_relay().await;
+        let (relay, metrics) = start_relay().await;
         let (ka, kb) = (key(0xAA), key(0xBB));
         // Endpoint handles the mesh would use for each peer (need not be routable).
         let handle_b: SocketAddr = "127.0.0.1:9002".parse().unwrap();
@@ -393,13 +522,36 @@ mod tests {
         assert_eq!(&buf[..n], b"ping through the relay");
         // B sees the packet as coming from A's endpoint handle.
         assert_eq!(src, handle_a);
+
+        // Metrics reflect the exchange: both clients registered, one frame (of
+        // the payload's length) forwarded, none dropped.
+        let text = metrics.render();
+        assert!(
+            text.contains("ferrum_relay_clients_registered 2\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("ferrum_relay_frames_forwarded_total 1\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "ferrum_relay_bytes_forwarded_total {}\n",
+                b"ping through the relay".len()
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains("ferrum_relay_frames_dropped_total 0\n"),
+            "{text}"
+        );
     }
 
     /// A data frame for an unregistered destination key is dropped (no panic, no
     /// delivery), and the sender's own loop is unaffected.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drops_data_for_unknown_destination() {
-        let relay = start_relay().await;
+        let (relay, _metrics) = start_relay().await;
         let ka = key(0x01);
         let handle_ghost: SocketAddr = "127.0.0.1:9009".parse().unwrap();
         let a = RelayMeshTransport::connect(relay, ka, &[(handle_ghost, key(0x99))])
