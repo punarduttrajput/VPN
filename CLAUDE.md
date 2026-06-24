@@ -121,21 +121,25 @@ on the new environment before assuming it's still blocked.
   TUN-from-fd FFI entry (`device::from_fd` + `FfiFerrumClient::run`/`stop`) + a Tauri
   desktop shell (`apps/desktop`) whose **`connect` now drives the real data plane**
   (opens a TUN + runs `data_plane::run_mesh_session`) + the **reliability core (FR5)**:
-  `connect_with_retry` (exponential-backoff auto-reconnect via the `Reconnecting`
-  state, cancellable by `disconnect`) and a kill-switch policy
-  (`set_kill_switch`/`traffic_blocked` + a `TrafficBlocked` change event), all FFI-exposed.
-  Remaining: iOS/Android shells, a privileged-helper for the desktop TUN, data-plane
-  auto-restart on drop, and shell-side kill-switch firewall enforcement.
+  `connect_with_retry` (exponential-backoff control-plane reconnect via the `Reconnecting`
+  state, cancellable by `disconnect`), a kill-switch policy
+  (`set_kill_switch`/`traffic_blocked` + a `TrafficBlocked` change event), and
+  `data_plane::run_mesh_session_supervised` (reruns the whole mesh session with backoff
+  on any drop, rebuilding device+transport via caller factories). Remaining: iOS/Android
+  shells, a privileged-helper for the desktop TUN, supervisor/kill-switch adoption in the
+  CLI + shells (incl. shell-side firewall enforcement and an OS-TUN re-acquire factory).
 - **Phase 6 (~5%):** only `sendmmsg` batching; eBPF/XDP, anycast, scale not started.
 
 ## Recommended next work (highest-value, buildable in Rust)
 
-1. **Phase 5 — reliability (facade core done)** 🟡: `connect_with_retry`
-   (exponential-backoff auto-reconnect) + a kill-switch policy (`set_kill_switch`/
-   `traffic_blocked` + `TrafficBlocked` event) now land on the `FerrumClient` facade
-   and FFI. Remaining: **data-plane auto-restart** (a shell reruns `run_mesh_session`
-   when `connect_with_retry` resolves) and **shell-side kill-switch firewall
-   enforcement** — both per-platform. (Phase 4 NAT traversal is functionally complete:
+1. **Phase 5 — reliability (core done)** 🟡: `connect_with_retry`
+   (exponential-backoff control-plane reconnect) + a kill-switch policy (`set_kill_switch`/
+   `traffic_blocked` + `TrafficBlocked` event) + `data_plane::run_mesh_session_supervised`
+   (data-plane auto-restart with backoff via device/transport factories) now land on the
+   `FerrumClient` facade / data-plane glue and FFI. Remaining: **adopt the supervisor in
+   the CLI + shells** (each supplies a factory that re-acquires its OS TUN — the FFI's
+   `run` `tun_fd` is single-use since `from_fd` closes it on drop) and **shell-side
+   kill-switch firewall enforcement** — both per-platform. (Phase 4 NAT traversal is functionally complete:
    signaling, STUN, relay, state machine, automatic fallback, and both local +
    coordinator-advertised relay selection all land. Optional Phase 4 hardening: fuller
    ICE candidate-pair prioritization; a desktop-GUI relay/STUN field.)

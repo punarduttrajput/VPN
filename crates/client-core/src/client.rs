@@ -459,6 +459,20 @@ impl FerrumClient {
         // Ignore the "no subscribers" error — events are best-effort.
         let _ = self.events.send(event);
     }
+
+    /// Move the facade into `Reconnecting` (crate-internal): used by the data-plane
+    /// supervisor between a dropped session and its next attempt, so the UI shows
+    /// a reconnect in progress rather than a bare `Disconnected`/`Failed`.
+    pub(crate) fn mark_reconnecting(&self) {
+        self.set_state(ConnectionState::Reconnecting);
+    }
+
+    /// Broadcast an `Error` event (crate-internal): lets the supervisor surface a
+    /// data-plane build failure (TUN/transport) that happens before
+    /// [`connect`](FerrumClient::connect) would otherwise emit one.
+    pub(crate) fn emit_error(&self, reason: String) {
+        self.emit(ClientEvent::Error(reason));
+    }
 }
 
 #[cfg(test)]

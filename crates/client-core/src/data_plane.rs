@@ -15,6 +15,7 @@
 
 use std::future::Future;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -26,7 +27,7 @@ use ferrum_tunnel::session::Session;
 use ferrum_tunnel::{run_mesh, run_mesh_relayed, MeshPeer};
 
 use crate::client::FerrumClient;
-use crate::{ClientIdentity, ControlClient, Error, PeerSpec};
+use crate::{ClientIdentity, ControlClient, Error, PeerSpec, ReconnectPolicy};
 
 /// Turn the coordinator's peer list into mesh sessions keyed by our private key.
 ///
@@ -222,6 +223,152 @@ where
     watcher.abort();
     client.disconnect();
     result
+}
+
+/// Run a **self-healing** mesh session (Phase 5 FR5): keep a working
+/// [`run_mesh_session`] alive, automatically restarting it with exponential
+/// backoff whenever it drops, until `shutdown` resolves.
+///
+/// This is the data-plane half of "always-on": where
+/// [`FerrumClient::connect_with_retry`](crate::FerrumClient::connect_with_retry)
+/// reconnects the *control plane*, this reruns the whole mesh session — control
+/// sync **and** the OS data plane — so a coordinator outage, a dropped watch
+/// stream, or a transport failure all recover on their own.
+///
+/// Because a session **consumes** its TUN device and transport (and an OS TUN fd
+/// is closed when its [`TunDevice`] drops — see
+/// [`ferrum_tunnel::device::from_fd`]), the caller supplies *factories* rather
+/// than values: `make_device`/`make_transport` are invoked to build a fresh pair
+/// for each attempt. A native shell's factory re-acquires its OS TUN (e.g. a new
+/// `NEPacketTunnelProvider`/`VpnService` fd) and rebinds its socket; the CLI's
+/// reopens `/dev/net/tun` and rebinds. A factory error is treated like a session
+/// failure (it counts against the retry budget and backs off).
+///
+/// Backoff follows `policy` (see [`ReconnectPolicy`]): it escalates on consecutive
+/// failures and resets after a session that had come up and then ended, so a long
+/// healthy tunnel that briefly drops reconnects promptly rather than after a grown
+/// delay. With `policy.max_retries == 0` it retries forever (the always-on case);
+/// otherwise it returns the last error once the budget is exhausted. The backoff
+/// wait and an in-flight session are both interrupted promptly by `shutdown`, and
+/// the facade is moved to `Reconnecting` between attempts.
+// Eleven parameters: the same independent inputs as `run_mesh_session` with the
+// device/transport replaced by factories, plus the retry policy. Grouping them
+// into a struct would only move the noise across the boundary, so allow the lint.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_mesh_session_supervised<D, M, MkD, MkM, FutD, FutM, F>(
+    client: &FerrumClient,
+    coordinator: &str,
+    identity: &ClientIdentity,
+    private_key_b64: &str,
+    candidates: &[String],
+    mut make_device: MkD,
+    mut make_transport: MkM,
+    relay: Option<String>,
+    policy: &ReconnectPolicy,
+    shutdown: F,
+) -> Result<(), Error>
+where
+    D: TunDevice + Send + 'static,
+    M: MeshTransport + Send + 'static,
+    MkD: FnMut() -> FutD + Send,
+    MkM: FnMut() -> FutM + Send,
+    FutD: Future<Output = Result<D, Error>> + Send,
+    FutM: Future<Output = Result<M, Error>> + Send,
+    F: Future<Output = ()> + Send,
+{
+    // `stop` is flipped true once `shutdown` resolves. Each session derives its
+    // own shutdown future from a clone, so the same external signal tears down
+    // whichever session is currently running — without spawning a task (which
+    // would force a `'static` bound on `shutdown`).
+    let (stop, watch_stop) = tokio::sync::watch::channel(false);
+    tokio::pin!(shutdown);
+
+    let mut attempt: u32 = 0;
+    let mut backoff = policy.initial_backoff_ms.max(1);
+
+    loop {
+        if *watch_stop.borrow() {
+            return Ok(());
+        }
+
+        // Build a fresh device + transport for this attempt.
+        let built = async {
+            let device = make_device().await?;
+            let transport = make_transport().await?;
+            Ok::<_, Error>((device, transport))
+        }
+        .await;
+
+        let outcome: Result<(), Error> = match built {
+            Ok((device, transport)) => {
+                let mut session_stop = watch_stop.clone();
+                let session_shutdown = async move {
+                    let _ = session_stop.wait_for(|stop| *stop).await;
+                };
+                let session = run_mesh_session(
+                    client,
+                    coordinator,
+                    identity,
+                    private_key_b64,
+                    candidates,
+                    device,
+                    transport,
+                    relay.clone(),
+                    session_shutdown,
+                );
+                tokio::pin!(session);
+                tokio::select! {
+                    // External shutdown: signal the running session, let it clean
+                    // up (abort its watcher, return the facade to Disconnected),
+                    // then we're done.
+                    _ = &mut shutdown => {
+                        let _ = stop.send(true);
+                        let _ = (&mut session).await;
+                        return Ok(());
+                    }
+                    // The session ended on its own (error, or the watch stream
+                    // closed) — fall through to backoff + restart.
+                    r = &mut session => r,
+                }
+            }
+            Err(e) => {
+                client.emit_error(e.to_string());
+                Err(e)
+            }
+        };
+
+        let failed = outcome.is_err();
+        match outcome {
+            // A session that came up and then ended: reconnect promptly with a
+            // fresh budget rather than a backoff grown by earlier failures.
+            Ok(()) => {
+                attempt = 0;
+                backoff = policy.initial_backoff_ms.max(1);
+            }
+            Err(e) => {
+                attempt += 1;
+                if policy.max_retries != 0 && attempt > policy.max_retries {
+                    return Err(e);
+                }
+            }
+        }
+
+        client.mark_reconnecting();
+
+        // Interruptible backoff before the next attempt.
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(backoff)) => {}
+            _ = &mut shutdown => {
+                let _ = stop.send(true);
+                return Ok(());
+            }
+        }
+
+        // Escalate the delay only after a genuine failure.
+        if failed {
+            backoff = backoff.saturating_mul(2).min(policy.max_backoff_ms.max(1));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -439,6 +586,142 @@ mod tests {
 
         let _ = stop_tx.send(());
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    fn node_identity(me: &ferrum_core::keys::KeyPair) -> ClientIdentity {
+        ClientIdentity {
+            public_key: me.public_base64(),
+            name: "node-a".into(),
+            endpoint: "127.0.0.1:51820".into(),
+            tags: vec![],
+        }
+    }
+
+    /// The supervisor retries a failing data-plane build with backoff and reaches
+    /// `Connected` once the build succeeds, then stops cleanly on shutdown.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn supervised_retries_until_the_data_plane_builds() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let url = start_coordinator().await;
+        let me = ferrum_core::keys::KeyPair::generate();
+        let identity = node_identity(&me);
+        let policy = ReconnectPolicy {
+            max_retries: 0, // forever
+            initial_backoff_ms: 10,
+            max_backoff_ms: 10,
+        };
+
+        // The transport factory fails its first two calls, then succeeds — so the
+        // supervisor must retry before a session can come up.
+        let tries = Arc::new(AtomicUsize::new(0));
+        let tries_f = tries.clone();
+        let make_transport = move || {
+            let tries = tries_f.clone();
+            async move {
+                if tries.fetch_add(1, Ordering::SeqCst) < 2 {
+                    Err(Error::DataPlane("transport not ready".into()))
+                } else {
+                    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                    Ok(UdpMeshTransport::from_socket(sock))
+                }
+            }
+        };
+        let make_device = || async { Ok::<MockTun, Error>(MockTun::default()) };
+
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let client = FerrumClient::new();
+        let runner_client = client.clone();
+        let priv_b64 = me.private_base64();
+        let url_runner = url.clone();
+        let handle = tokio::spawn(async move {
+            run_mesh_session_supervised(
+                &runner_client,
+                &url_runner,
+                &identity,
+                &priv_b64,
+                &[],
+                make_device,
+                make_transport,
+                None,
+                &policy,
+                async move {
+                    let _ = stop_rx.await;
+                },
+            )
+            .await
+        });
+
+        // It eventually comes up despite the early build failures.
+        wait_for(Duration::from_secs(5), || {
+            client.status() == ConnectionState::Connected
+        })
+        .await;
+        assert!(
+            tries.load(Ordering::SeqCst) >= 3,
+            "transport should have been retried before succeeding"
+        );
+
+        // Shutdown winds the supervisor down to Disconnected with an Ok result.
+        let _ = stop_tx.send(());
+        let result = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("supervisor did not stop")
+            .expect("task panicked");
+        assert!(
+            result.is_ok(),
+            "clean shutdown should return Ok: {result:?}"
+        );
+        assert_eq!(client.status(), ConnectionState::Disconnected);
+    }
+
+    /// With a bounded retry budget and a build that always fails, the supervisor
+    /// gives up after `max_retries + 1` attempts and returns the last error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn supervised_gives_up_after_exhausting_retries() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let me = ferrum_core::keys::KeyPair::generate();
+        let identity = node_identity(&me);
+        let policy = ReconnectPolicy {
+            max_retries: 2, // 3 attempts total
+            initial_backoff_ms: 5,
+            max_backoff_ms: 5,
+        };
+
+        let tries = Arc::new(AtomicUsize::new(0));
+        let tries_f = tries.clone();
+        let make_transport = move || {
+            let tries = tries_f.clone();
+            async move {
+                tries.fetch_add(1, Ordering::SeqCst);
+                Err::<UdpMeshTransport, Error>(Error::DataPlane("always down".into()))
+            }
+        };
+        let make_device = || async { Ok::<MockTun, Error>(MockTun::default()) };
+
+        let client = FerrumClient::new();
+        // The coordinator is never reached — the transport build fails first.
+        let result = run_mesh_session_supervised(
+            &client,
+            "http://127.0.0.1:1",
+            &identity,
+            &me.private_base64(),
+            &[],
+            make_device,
+            make_transport,
+            None,
+            &policy,
+            std::future::pending::<()>(),
+        )
+        .await;
+
+        assert!(result.is_err(), "exhausted retries should return the error");
+        assert_eq!(
+            tries.load(Ordering::SeqCst),
+            3,
+            "should attempt max_retries + 1 times"
+        );
     }
 
     /// Poll `cond` until it holds or `timeout` elapses.
