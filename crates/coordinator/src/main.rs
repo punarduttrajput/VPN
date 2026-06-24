@@ -7,13 +7,62 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 use ferrum_control_proto::coordinator::coordinator_server::CoordinatorServer;
-use ferrum_coordinator::{CoordinatorService, Policy, Registry};
+use ferrum_coordinator::{CoordinatorService, Metrics, Policy, Registry};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tonic::transport::Server;
-use tracing::info;
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 fn arg_value(flag: &str) -> Option<String> {
     std::env::args().skip_while(|a| a != flag).nth(1)
+}
+
+/// Serve the privacy-preserving metrics (PRD Phase 6 FR4) on a tiny HTTP/1
+/// endpoint at `GET /metrics` — enough for a Prometheus scraper, hand-rolled over
+/// a `TcpListener` so the coordinator gains no HTTP-server dependency. Runs on its
+/// own port (separate from the gRPC `--listen`). `device_count` is sampled from
+/// the registry at scrape time.
+async fn serve_metrics(addr: SocketAddr, metrics: Arc<Metrics>, registry: Arc<Mutex<Registry>>) {
+    let listener = match TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            error!(%addr, error = %e, "failed to bind metrics endpoint");
+            return;
+        }
+    };
+    info!(%addr, "metrics endpoint listening on GET /metrics");
+    loop {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            continue;
+        };
+        let metrics = metrics.clone();
+        let registry = registry.clone();
+        tokio::spawn(async move {
+            // The request is tiny; one read captures the request line we need.
+            let mut buf = [0u8; 1024];
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            let is_metrics_get = buf[..n].starts_with(b"GET /metrics");
+            let response = if is_metrics_get {
+                let device_count = registry
+                    .lock()
+                    .expect("registry mutex poisoned")
+                    .device_count();
+                let body = metrics.render(device_count);
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+            } else {
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_string()
+            };
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+    }
 }
 
 #[tokio::main]
@@ -63,6 +112,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let registry = Registry::with_policy(base, 24, policy);
 
     let registry = Arc::new(Mutex::new(registry));
+    // Clone the registry handle for the metrics endpoint before the service
+    // consumes it (the device-count gauge is sampled from the registry).
+    let metrics_registry = registry.clone();
 
     // OIDC auth: enable when --oidc-issuer/--oidc-audience/--oidc-jwks are all
     // provided. Tokens are then required on every RPC and device tags come from
@@ -104,6 +156,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => svc,
     };
+
+    // Metrics endpoint (PRD Phase 6 FR4): enable with --metrics-listen <ip:port>.
+    // Runs on its own port; serves GET /metrics in the Prometheus text format.
+    if let Some(addr) = arg_value("--metrics-listen") {
+        let addr: SocketAddr = addr
+            .parse()
+            .map_err(|e| format!("--metrics-listen '{addr}': {e}"))?;
+        let metrics = svc.metrics();
+        info!(%addr, "metrics enabled");
+        tokio::spawn(serve_metrics(addr, metrics, metrics_registry));
+    } else {
+        // Avoid an unused-variable warning when the endpoint isn't enabled.
+        let _ = metrics_registry;
+        info!("no --metrics-listen; metrics endpoint disabled");
+    }
 
     #[cfg_attr(not(feature = "mtls"), allow(unused_mut))]
     let mut builder = Server::builder();
