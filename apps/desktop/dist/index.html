@@ -29,6 +29,19 @@
         <label>Listen port
           <input id="listen_port" type="number" value="51820" min="1" max="65535" />
         </label>
+        <label>Transport
+          <select id="transport_mode">
+            <option value="udp" selected>UDP (plain)</option>
+            <option value="quic">QUIC (encrypted)</option>
+            <option value="masque">MASQUE (HTTP/3 proxy)</option>
+          </select>
+        </label>
+        <label id="server_name_field" class="hidden">Server name (TLS / :authority)
+          <input id="server_name" type="text" value="ferrum" placeholder="ferrum" />
+        </label>
+        <label id="masque_proxy_field" class="hidden">MASQUE proxy (ip:port)
+          <input id="masque_proxy" type="text" placeholder="203.0.113.10:443" />
+        </label>
         <div class="actions">
           <button id="connect">Connect</button>
           <button id="disconnect" disabled>Disconnect</button>

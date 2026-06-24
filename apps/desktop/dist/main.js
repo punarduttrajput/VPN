@@ -12,6 +12,17 @@ const connectBtn = $("connect");
 const disconnectBtn = $("disconnect");
 const killSwitchEl = $("kill_switch");
 const killSwitchStateEl = $("kill-switch-state");
+const transportModeEl = $("transport_mode");
+const serverNameField = $("server_name_field");
+const masqueProxyField = $("masque_proxy_field");
+
+// Show the TLS server-name field for QUIC/MASQUE and the proxy field for MASQUE.
+function syncTransportFields() {
+  const mode = transportModeEl.value;
+  serverNameField.classList.toggle("hidden", mode === "udp");
+  masqueProxyField.classList.toggle("hidden", mode !== "masque");
+}
+transportModeEl.addEventListener("change", syncTransportFields);
 
 function setKillSwitchState(blocked) {
   killSwitchStateEl.textContent = blocked ? "blocking" : (killSwitchEl.checked ? "armed" : "off");
@@ -68,6 +79,11 @@ connectBtn.addEventListener("click", async () => {
         tags: [],
       },
       listenPort: Number($("listen_port").value),
+      transport: {
+        mode: transportModeEl.value,
+        server_name: $("server_name").value.trim() || null,
+        masque_proxy: $("masque_proxy").value.trim() || null,
+      },
     });
   } catch (e) {
     log(`connect failed: ${e}`, true);
@@ -107,5 +123,6 @@ listen("client-event", (event) => {
   setState(await invoke("get_status"));
   killSwitchEl.checked = await invoke("kill_switch_enabled");
   setKillSwitchState(false);
+  syncTransportFields();
   refreshPeers();
 })();
