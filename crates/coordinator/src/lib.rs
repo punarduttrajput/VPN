@@ -6,6 +6,7 @@
 //! (`sqlite`), mutual TLS (`mtls`), and OIDC bearer-token auth (`oidc`).
 #![forbid(unsafe_code)]
 
+pub mod metrics;
 pub mod policy;
 pub mod registry;
 pub mod service;
@@ -20,6 +21,7 @@ pub mod pki;
 #[cfg(feature = "oidc")]
 pub mod auth;
 
+pub use metrics::Metrics;
 pub use policy::{AclRule, Policy};
 pub use registry::{Device, Registry, RegistryError};
 pub use service::{CoordinatorService, VerifiedClaims};

@@ -14,6 +14,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
+use crate::metrics::Metrics;
 use crate::registry::{Registry, RegistryError};
 
 /// Compute the current network-map response for a device, advertising `relay`
@@ -61,6 +62,8 @@ pub struct CoordinatorService {
     /// A network-wide relay address (`ip:port`) advertised to every device in the
     /// network map (PRD Phase 4 NAT traversal), or empty for none.
     relay: String,
+    /// Aggregate, privacy-preserving control-plane metrics (PRD Phase 6 FR4).
+    metrics: Arc<Metrics>,
     /// When set (the `oidc` feature + a configured verifier), every RPC requires
     /// a valid bearer token and registration tags come from the token.
     #[cfg(feature = "oidc")]
@@ -75,9 +78,16 @@ impl CoordinatorService {
             registry,
             changes,
             relay: String::new(),
+            metrics: Metrics::new(),
             #[cfg(feature = "oidc")]
             verifier: None,
         }
+    }
+
+    /// A handle to this service's metrics, for the `/metrics` exporter to render.
+    /// Clone it before moving the service into the gRPC server.
+    pub fn metrics(&self) -> Arc<Metrics> {
+        self.metrics.clone()
     }
 
     /// Advertise a network-wide relay address (`ip:port`) to every device in the
@@ -99,6 +109,7 @@ impl CoordinatorService {
             registry,
             changes,
             relay: String::new(),
+            metrics: Metrics::new(),
             verifier: Some(verifier),
         }
     }
@@ -125,6 +136,17 @@ impl CoordinatorService {
     fn authenticate<T>(&self, _request: &Request<T>) -> Result<Option<VerifiedClaims>, Status> {
         Ok(None)
     }
+
+    /// [`authenticate`](Self::authenticate), counting a rejected request in the
+    /// `unauthenticated` metric. Used by every RPC so the count covers them all.
+    #[allow(clippy::result_large_err)] // tonic::Status is the trait-wide error type
+    fn authenticate_metered<T>(
+        &self,
+        request: &Request<T>,
+    ) -> Result<Option<VerifiedClaims>, Status> {
+        self.authenticate(request)
+            .inspect_err(|_| self.metrics.inc_unauthenticated())
+    }
 }
 
 /// Extract the `authorization: Bearer <token>` value from request metadata.
@@ -148,7 +170,8 @@ impl Coordinator for CoordinatorService {
         &self,
         request: Request<RegisterDeviceRequest>,
     ) -> Result<Response<RegisterDeviceResponse>, Status> {
-        let claims = self.authenticate(&request)?;
+        let claims = self.authenticate_metered(&request)?;
+        self.metrics.inc_register();
         let req = request.into_inner();
         // When authenticated, tags come from the verified token (an authorization
         // boundary); otherwise they are the self-declared request tags.
@@ -172,7 +195,8 @@ impl Coordinator for CoordinatorService {
         &self,
         request: Request<NetworkMapRequest>,
     ) -> Result<Response<NetworkMapResponse>, Status> {
-        self.authenticate(&request)?;
+        self.authenticate_metered(&request)?;
+        self.metrics.inc_network_map_request();
         let req = request.into_inner();
         Ok(Response::new(current_map(
             &self.registry,
@@ -188,14 +212,18 @@ impl Coordinator for CoordinatorService {
         &self,
         request: Request<NetworkMapRequest>,
     ) -> Result<Response<Self::WatchNetworkMapStream>, Status> {
-        self.authenticate(&request)?;
+        self.authenticate_metered(&request)?;
         let public_key = request.into_inner().public_key;
         let registry = self.registry.clone();
         let relay = self.relay.clone();
         let mut changes = self.changes.subscribe();
+        // Track this stream in the active-streams gauge; the guard rides into the
+        // serving task and decrements when it ends (disconnect / close / error).
+        let guard = self.metrics.watch_started();
         let (tx, rx) = mpsc::channel(16);
 
         tokio::spawn(async move {
+            let _guard = guard;
             // Push the current map immediately, then on every change.
             if tx
                 .send(Ok(current_map(&registry, &public_key, &relay)))
@@ -225,7 +253,8 @@ impl Coordinator for CoordinatorService {
         &self,
         request: Request<PublishCandidatesRequest>,
     ) -> Result<Response<PublishCandidatesResponse>, Status> {
-        self.authenticate(&request)?;
+        self.authenticate_metered(&request)?;
+        self.metrics.inc_publish_candidates();
         let req = request.into_inner();
         {
             let mut reg = self.registry.lock().expect("registry mutex poisoned");
@@ -242,7 +271,8 @@ impl Coordinator for CoordinatorService {
         &self,
         request: Request<RotateKeyRequest>,
     ) -> Result<Response<RotateKeyResponse>, Status> {
-        self.authenticate(&request)?;
+        self.authenticate_metered(&request)?;
+        self.metrics.inc_rotate_key();
         let req = request.into_inner();
         let ip = {
             let mut reg = self.registry.lock().expect("registry mutex poisoned");
@@ -331,6 +361,49 @@ mod tests {
         assert_eq!(map.peers[0].public_key, "BBB");
         assert_eq!(map.peers[0].endpoint, "2.2.2.2:51820");
         assert_eq!(map.peers[0].allowed_ips, vec!["10.8.0.3/32".to_string()]);
+    }
+
+    /// Calling the RPC handlers directly bumps the matching metrics, and `render`
+    /// reports them (with the device gauge sampled from the registry) (PRD Phase 6).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metrics_count_handled_rpcs() {
+        use ferrum_control_proto::coordinator::coordinator_server::Coordinator;
+
+        let registry = Arc::new(Mutex::new(Registry::new(Ipv4Addr::new(10, 8, 0, 0), 24)));
+        let svc = CoordinatorService::new(registry.clone());
+        let metrics = svc.metrics();
+
+        for (pk, ep) in [("AAA", "1.1.1.1:51820"), ("BBB", "2.2.2.2:51820")] {
+            svc.register_device(Request::new(RegisterDeviceRequest {
+                public_key: pk.into(),
+                name: pk.into(),
+                endpoint: ep.into(),
+                tags: vec![],
+            }))
+            .await
+            .unwrap();
+        }
+        svc.get_network_map(Request::new(NetworkMapRequest {
+            public_key: "AAA".into(),
+        }))
+        .await
+        .unwrap();
+        svc.rotate_key(Request::new(RotateKeyRequest {
+            old_public_key: "AAA".into(),
+            new_public_key: "CCC".into(),
+        }))
+        .await
+        .unwrap();
+
+        let text = metrics.render(registry.lock().unwrap().device_count());
+        assert!(text.contains("ferrum_register_total 2\n"), "{text}");
+        assert!(
+            text.contains("ferrum_network_map_requests_total 1\n"),
+            "{text}"
+        );
+        assert!(text.contains("ferrum_rotate_key_total 1\n"), "{text}");
+        assert!(text.contains("ferrum_devices_registered 2\n"), "{text}");
+        assert!(text.contains("ferrum_unauthenticated_total 0\n"), "{text}");
     }
 
     /// End-to-end over gRPC: a device rotates its key and a peer's network map
