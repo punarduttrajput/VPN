@@ -51,43 +51,43 @@ jobs:
 
       # Phase 2: exercise the QUIC transport (datagram roundtrip etc.).
       - name: Test (quic feature)
-        run: cargo test --workspace --features vpn-cli/quic
+        run: cargo test --workspace --features ferrum-cli/quic
 
       - name: clippy (quic feature)
         if: matrix.os == 'ubuntu-latest'
-        run: cargo clippy --workspace --all-targets --features vpn-cli/quic -- -D warnings
+        run: cargo clippy --workspace --all-targets --features ferrum-cli/quic -- -D warnings
 
       # Phase 2: exercise the MASQUE/HTTP3 transport (CONNECT-UDP roundtrip).
       - name: Test (masque feature)
-        run: cargo test --workspace --features vpn-cli/masque
+        run: cargo test --workspace --features ferrum-cli/masque
 
       - name: clippy (masque feature)
         if: matrix.os == 'ubuntu-latest'
-        run: cargo clippy --workspace --all-targets --features vpn-cli/masque -- -D warnings
+        run: cargo clippy --workspace --all-targets --features ferrum-cli/masque -- -D warnings
 
       # Phase 3: exercise the SQLite-backed coordinator persistence.
       - name: Test (coordinator sqlite feature)
-        run: cargo test -p vpn-coordinator --features sqlite
+        run: cargo test -p ferrum-coordinator --features sqlite
 
       - name: clippy (coordinator sqlite feature)
         if: matrix.os == 'ubuntu-latest'
-        run: cargo clippy -p vpn-coordinator --all-targets --features sqlite -- -D warnings
+        run: cargo clippy -p ferrum-coordinator --all-targets --features sqlite -- -D warnings
 
       # Phase 3: exercise mutual TLS on the coordinator gRPC channel.
       - name: Test (mtls feature)
-        run: cargo test -p vpn-client-core --features mtls
+        run: cargo test -p ferrum-client-core --features mtls
 
       - name: clippy (mtls feature)
         if: matrix.os == 'ubuntu-latest'
-        run: cargo clippy -p vpn-coordinator -p vpn-client-core --all-targets --features vpn-coordinator/mtls,vpn-client-core/mtls -- -D warnings
+        run: cargo clippy -p ferrum-coordinator -p ferrum-client-core --all-targets --features ferrum-coordinator/mtls,ferrum-client-core/mtls -- -D warnings
 
       # Phase 3 FR2: exercise OIDC bearer-token authentication on the coordinator.
       - name: Test (coordinator oidc feature)
-        run: cargo test -p vpn-coordinator --features oidc
+        run: cargo test -p ferrum-coordinator --features oidc
 
       - name: clippy (coordinator oidc feature)
         if: matrix.os == 'ubuntu-latest'
-        run: cargo clippy -p vpn-coordinator --all-targets --features oidc -- -D warnings
+        run: cargo clippy -p ferrum-coordinator --all-targets --features oidc -- -D warnings
 
   # Real-device + benchmark verification (M3 / M5 / M6) on a Linux runner.
   verify-linux:
