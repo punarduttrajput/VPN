@@ -28,9 +28,10 @@ tokio = { version = "1", features = ["sync"] }
 # The shared client core (Phase 5 facade) with the `data-plane` runner enabled:
 # `connect` opens a TUN and drives `run_mesh_session`, so the GUI moves packets.
 ferrum-client-core = { path = "../../../crates/client-core", features = ["data-plane"] }
-# The mesh transport (`UdpMeshTransport`) and TUN device / key helpers the shell
-# wires together when bringing up the data plane.
-ferrum-transport = { path = "../../../crates/transport" }
+# The mesh transports (`UdpMeshTransport`, plus `QuicMeshTransport` /
+# `MasqueMeshTransport` behind the `masque` feature, which pulls in `quic`) and the
+# TUN device / key helpers the shell wires together when bringing up the data plane.
+ferrum-transport = { path = "../../../crates/transport", features = ["masque"] }
 ferrum-tunnel = { path = "../../../crates/tunnel" }
 ferrum-core = { path = "../../../crates/core" }
 

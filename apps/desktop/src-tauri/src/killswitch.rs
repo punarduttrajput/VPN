@@ -85,7 +85,10 @@ impl KillSwitch {
             match run_nft_script(&script) {
                 Ok(()) => {
                     self.applied = true;
-                    log::info!("kill-switch engaged on {iface} ({} allowed)", allow_ips.len());
+                    log::info!(
+                        "kill-switch engaged on {iface} ({} allowed)",
+                        allow_ips.len()
+                    );
                 }
                 Err(e) => log::error!("kill-switch engage failed: {e}"),
             }

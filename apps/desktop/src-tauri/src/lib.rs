@@ -27,7 +27,7 @@ use ferrum_client_core::{
     ClientEvent, ClientIdentity, ConnectionState, FerrumClient, ReconnectPolicy,
 };
 use ferrum_core::config::Cidr;
-use ferrum_transport::UdpMeshTransport;
+use ferrum_transport::{MasqueMeshTransport, MeshTransport, QuicMeshTransport, UdpMeshTransport};
 use ferrum_tunnel::device::{self, TunConfig};
 
 use killswitch::KillSwitch;
@@ -37,6 +37,14 @@ const TUN_IFACE: &str = "ferrum0";
 /// Inner TUN MTU for the UDP transport (leaves headroom under a 1500 B path for
 /// WireGuard + UDP/IP overhead).
 const TUN_MTU: u16 = 1420;
+/// Smaller inner TUN MTU for the QUIC/MASQUE transports — the extra QUIC + TLS
+/// (and, for MASQUE, HTTP/3 CONNECT-UDP) framing eats into the path budget, so
+/// the inner MTU is reduced to keep encapsulated datagrams under a 1500 B path
+/// (mirrors the CLI's `QUIC_TUN_MTU`).
+const QUIC_TUN_MTU: u16 = 1100;
+/// Default TLS / HTTP-3 `:authority` name for the QUIC/MASQUE transports when the
+/// connect form leaves the server-name field blank (mirrors the CLI default).
+const DEFAULT_SERVER_NAME: &str = "ferrum";
 
 /// A handle to the running data-plane task, kept so `disconnect` can stop it.
 struct DataPlaneHandle {
@@ -78,6 +86,44 @@ struct IdentityArg {
     name: String,
     endpoint: String,
     tags: Vec<String>,
+}
+
+/// Mesh wire transport chosen in the connect form. Selects which `MeshTransport`
+/// the data plane binds — UDP (plain), QUIC (encrypted/camouflaged), or MASQUE
+/// (QUIC tunnelled through an HTTP/3 CONNECT-UDP proxy). Mirrors the CLI's
+/// `[transport] mode`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TransportMode {
+    Udp,
+    Quic,
+    Masque,
+}
+
+/// Transport selection received from the webview's connect form. `mode` is the
+/// wire transport; `masque_proxy` (`ip:port`) is required for MASQUE; `server_name`
+/// is the TLS / HTTP-3 `:authority` for QUIC/MASQUE (defaults to `ferrum`).
+#[derive(Deserialize)]
+struct TransportArg {
+    /// `"udp"` | `"quic"` | `"masque"` (case-insensitive).
+    mode: String,
+    #[serde(default)]
+    masque_proxy: Option<String>,
+    #[serde(default)]
+    server_name: Option<String>,
+}
+
+impl TransportArg {
+    /// Parse the form's `mode` string into a [`TransportMode`].
+    fn parse_mode(&self) -> Result<TransportMode, String> {
+        match self.mode.trim().to_ascii_lowercase().as_str() {
+            "udp" => Ok(TransportMode::Udp),
+            "quic" => Ok(TransportMode::Quic),
+            "masque" => Ok(TransportMode::Masque),
+            other => Err(format!(
+                "unknown transport mode '{other}' (expected udp, quic, or masque)"
+            )),
+        }
+    }
 }
 
 /// An event pushed to the webview on the `client-event` channel.
@@ -171,6 +217,57 @@ fn resolve_coordinator_ips(coordinator: &str) -> Vec<IpAddr> {
         .unwrap_or_default()
 }
 
+/// Run the supervised (always-on) mesh session over a chosen transport.
+///
+/// The transport is selected by the caller as a `make_transport` factory so this
+/// stays generic over `UdpMeshTransport` / `QuicMeshTransport` /
+/// `MasqueMeshTransport` (the data-plane runner monomorphizes per concrete type).
+/// The TUN factory is built here from `tun_cfg` — a session consumes and closes
+/// its device, so each reconnect attempt reopens it. `stop_rx` winds the whole
+/// supervisor down (the facade returns to `Disconnected`).
+async fn supervise_session<M, MkM, FutM>(
+    client: FerrumClient,
+    coordinator: String,
+    id: ClientIdentity,
+    private_key: String,
+    tun_cfg: TunConfig,
+    make_transport: MkM,
+    stop_rx: oneshot::Receiver<()>,
+) -> Result<(), ferrum_client_core::Error>
+where
+    M: MeshTransport + Send + 'static,
+    MkM: FnMut() -> FutM + Send,
+    FutM: std::future::Future<Output = Result<M, ferrum_client_core::Error>> + Send,
+{
+    let make_device = move || {
+        let cfg = tun_cfg.clone();
+        async move {
+            device::open(&cfg).map_err(|e| {
+                ferrum_client_core::Error::DataPlane(format!("opening TUN device: {e}"))
+            })
+        }
+    };
+    // No NAT-traversal candidates and no local relay override: the GUI has no
+    // STUN-server field (follow-up, like the CLI's `--stun-server`), so nothing is
+    // gathered/published. The relay arg is `None`, so the mesh uses whatever relay
+    // the coordinator advertises (or runs direct-only if none).
+    run_mesh_session_supervised(
+        &client,
+        &coordinator,
+        &id,
+        &private_key,
+        &[],
+        make_device,
+        make_transport,
+        None,
+        &ReconnectPolicy::default(),
+        async move {
+            let _ = stop_rx.await;
+        },
+    )
+    .await
+}
+
 /// Bring up the data plane: register, open a TUN, and run the mesh session.
 ///
 /// Registers first (out of band) only to learn the coordinator-assigned tunnel
@@ -184,10 +281,36 @@ async fn connect(
     coordinator: String,
     identity: IdentityArg,
     listen_port: u16,
+    transport: TransportArg,
 ) -> Result<(), String> {
     if state.data_plane.lock().unwrap().is_some() {
         return Err("already connected".into());
     }
+
+    // Resolve the transport selection up front so a bad mode / missing-or-malformed
+    // MASQUE proxy fails *now* with a clean UI error rather than inside the
+    // detached supervisor task. The TLS / HTTP-3 `:authority` defaults to `ferrum`.
+    let mode = transport.parse_mode()?;
+    let server_name = transport
+        .server_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_SERVER_NAME)
+        .to_string();
+    let masque_proxy: Option<SocketAddr> = match mode {
+        TransportMode::Masque => Some(
+            transport
+                .masque_proxy
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "MASQUE transport requires a proxy address".to_string())?
+                .parse()
+                .map_err(|e| format!("invalid MASQUE proxy address: {e}"))?,
+        ),
+        TransportMode::Udp | TransportMode::Quic => None,
+    };
 
     // Derive the advertised public key from the private key.
     let public_key = ferrum_core::keys::public_base64_from_private(&identity.private_key)
@@ -212,10 +335,15 @@ async fn connect(
     let cidr: Cidr = address
         .parse()
         .map_err(|e| format!("assigned tunnel address '{address}': {e}"))?;
+    // QUIC/MASQUE add framing overhead, so the inner TUN MTU is reduced for them.
+    let mtu = match mode {
+        TransportMode::Udp => TUN_MTU,
+        TransportMode::Quic | TransportMode::Masque => QUIC_TUN_MTU,
+    };
     let tun_cfg = TunConfig {
         name: TUN_IFACE.to_string(),
         address: cidr,
-        mtu: TUN_MTU,
+        mtu,
     };
     let bind_addr: SocketAddr = format!("0.0.0.0:{listen_port}")
         .parse()
@@ -249,42 +377,68 @@ async fn connect(
     let task_app = app.clone();
     tauri::async_runtime::spawn(async move {
         // Always-on: rerun the whole mesh session (control sync + OS data plane)
-        // with backoff on any drop, rebuilding the TUN + socket each attempt via
-        // these factories (a session consumes them, and an OS TUN is single-use).
-        let device_cfg = tun_cfg.clone();
-        let make_device = move || {
-            let cfg = device_cfg.clone();
-            async move {
-                device::open(&cfg).map_err(|e| {
-                    ferrum_client_core::Error::DataPlane(format!("opening TUN device: {e}"))
-                })
+        // with backoff on any drop. The transport factory (rebuilt per attempt, as
+        // a session consumes it) is chosen by the selected mode — UDP binds a
+        // socket, QUIC binds a quinn endpoint, MASQUE opens CONNECT-UDP sessions
+        // through the proxy. The TUN factory lives in `supervise_session`.
+        let result = match mode {
+            TransportMode::Udp => {
+                let make_transport = move || async move {
+                    UdpMeshTransport::bind(bind_addr)
+                        .await
+                        .map_err(|e| ferrum_client_core::Error::DataPlane(e.to_string()))
+                };
+                supervise_session(
+                    client,
+                    coordinator,
+                    id,
+                    private_key,
+                    tun_cfg,
+                    make_transport,
+                    stop_rx,
+                )
+                .await
+            }
+            TransportMode::Quic => {
+                let make_transport = move || async move {
+                    QuicMeshTransport::bind(bind_addr)
+                        .await
+                        .map_err(|e| ferrum_client_core::Error::DataPlane(e.to_string()))
+                };
+                supervise_session(
+                    client,
+                    coordinator,
+                    id,
+                    private_key,
+                    tun_cfg,
+                    make_transport,
+                    stop_rx,
+                )
+                .await
+            }
+            TransportMode::Masque => {
+                // Validated non-`None` above for MASQUE.
+                let proxy = masque_proxy.expect("masque proxy resolved above");
+                let make_transport = move || {
+                    let authority = server_name.clone();
+                    async move {
+                        Ok::<_, ferrum_client_core::Error>(MasqueMeshTransport::new(
+                            proxy, authority,
+                        ))
+                    }
+                };
+                supervise_session(
+                    client,
+                    coordinator,
+                    id,
+                    private_key,
+                    tun_cfg,
+                    make_transport,
+                    stop_rx,
+                )
+                .await
             }
         };
-        let make_transport = move || async move {
-            UdpMeshTransport::bind(bind_addr)
-                .await
-                .map_err(|e| ferrum_client_core::Error::DataPlane(e.to_string()))
-        };
-
-        // No NAT-traversal candidates and no local relay override: the GUI has no
-        // STUN-server field (follow-up, like the CLI's `--stun-server`), so nothing
-        // is gathered/published. The relay arg is `None`, so the mesh uses whatever
-        // relay the coordinator advertises (or runs direct-only if none).
-        let result = run_mesh_session_supervised(
-            &client,
-            &coordinator,
-            &id,
-            &private_key,
-            &[],
-            make_device,
-            make_transport,
-            None,
-            &ReconnectPolicy::default(),
-            async move {
-                let _ = stop_rx.await;
-            },
-        )
-        .await;
         if let Err(e) = result {
             log::error!("data plane stopped with error: {e}");
             let _ = task_app.emit("client-event", error_event(format!("data plane: {e}")));
