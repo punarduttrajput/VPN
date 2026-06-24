@@ -104,6 +104,18 @@ impl FfiFerrumClient {
     }
 }
 
+/// Our own 32-byte WireGuard public key, derived from the base64 private key —
+/// the routing identity the relay underlay frames us under.
+// `Error` is large (carries `tonic::Status`); boxing only this one sync helper
+// would be inconsistent with the rest of the crate, so allow the lint.
+#[cfg(feature = "data-plane")]
+#[allow(clippy::result_large_err)]
+fn self_public_key(private_key_b64: &str) -> Result<[u8; 32], Error> {
+    let pub_b64 = ferrum_core::keys::public_base64_from_private(private_key_b64)
+        .map_err(|e| Error::DataPlane(e.to_string()))?;
+    ferrum_core::keys::decode_key(&pub_b64).map_err(|e| Error::DataPlane(e.to_string()))
+}
+
 /// Data-plane entry points (the `data-plane` feature): a native shell hands in
 /// the OS TUN file descriptor and this runs the full mesh data plane on it.
 #[cfg(feature = "data-plane")]
@@ -118,8 +130,13 @@ impl FfiFerrumClient {
     /// `private_key` is this device's WireGuard key (used to build peer sessions;
     /// never sent to the coordinator). `stun_server` (`ip:port`), when given,
     /// enables NAT-traversal candidate gathering (host + server-reflexive) which
-    /// is published to the coordinator for peers to probe (PRD Phase 4). Returns
+    /// is published to the coordinator for peers to probe (PRD Phase 4). `relay`
+    /// (`ip:port`), when given, adds a public-key-keyed relay fallback underlay:
+    /// the mesh runs direct + relay at once, preferring direct per peer. Returns
     /// when the tunnel is torn down.
+    // Each parameter is an independent input the foreign shell must supply; a
+    // params struct would only move the noise across the FFI boundary.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run(
         &self,
         tun_fd: i32,
@@ -128,6 +145,7 @@ impl FfiFerrumClient {
         private_key: String,
         listen_port: u16,
         stun_server: Option<String>,
+        relay: Option<String>,
     ) -> Result<(), Error> {
         let device =
             ferrum_tunnel::device::from_fd(tun_fd).map_err(|e| Error::DataPlane(e.to_string()))?;
@@ -155,6 +173,24 @@ impl FfiFerrumClient {
             .await
             .map_err(|e| Error::DataPlane(e.to_string()))?;
 
+        // Optional relay fallback: connect a public-key-keyed relay underlay (its
+        // peer table is aligned from the network map inside the data plane). Our
+        // own public key is derived from the private key for the relay's framing.
+        let relay = match relay {
+            Some(r) => {
+                let relay_addr: std::net::SocketAddr = r
+                    .parse()
+                    .map_err(|e| Error::DataPlane(format!("relay '{r}': {e}")))?;
+                let self_key = self_public_key(&private_key)?;
+                Some(
+                    ferrum_transport::RelayMeshTransport::connect(relay_addr, self_key, &[])
+                        .await
+                        .map_err(|e| Error::DataPlane(e.to_string()))?,
+                )
+            }
+            None => None,
+        };
+
         // Install a fresh shutdown trigger; `stop` fires it.
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         *self.shutdown.lock().expect("shutdown mutex poisoned") = Some(stop_tx);
@@ -167,6 +203,7 @@ impl FfiFerrumClient {
             &candidates,
             device,
             transport,
+            relay,
             async move {
                 let _ = stop_rx.await;
             },

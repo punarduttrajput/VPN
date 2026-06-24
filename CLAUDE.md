@@ -109,10 +109,12 @@ on the new environment before assuming it's still blocked.
   `idle→connecting→relay→direct` **state machine** (`tunnel::path`), and now its
   **automatic relay-fallback wiring with path upgrade/downgrade** (`run_mesh_relayed`
   runs direct + relay underlays at once; the `PathMachine` selects per peer; a peer
-  comes up over the relay and upgrades to direct when punched) are all built. The
-  NAT-traversal *data plane* is complete; remaining is the **bring-up plumbing** —
-  a CLI/coordinator path to advertise a relay and select it (`ferrum up-mesh
-  --relay <addr>` → `run_mesh_relayed`).
+  comes up over the relay and upgrades to direct when punched) are all built — and
+  now **selectable from the binary**: a `transport.relay = "ip:port"` config field
+  routes `ferrum up-mesh` (and `client-core::run_mesh_session` / the `uniffi` FFI)
+  through `run_mesh_relayed`. The NAT-traversal data plane + local bring-up are
+  complete; the remaining piece is **coordinator-advertised relay** (the node
+  learns the relay from the network map instead of local config).
 - **Phase 5 (~30%):** shared `FerrumClient` core (M1) + `uniffi` bindings (Swift/Kotlin
   generate from `FfiFerrumClient`) + data-plane glue (`run_mesh_session`) + the
   TUN-from-fd FFI entry (`device::from_fd` + `FfiFerrumClient::run`/`stop`) + a Tauri
@@ -123,11 +125,12 @@ on the new environment before assuming it's still blocked.
 
 ## Recommended next work (highest-value, buildable in Rust)
 
-1. **Phase 4 — relay bring-up plumbing**: the NAT-traversal data plane is done
-   (signaling, STUN, relay, state machine, automatic fallback via `run_mesh_relayed`).
-   What remains is config/CLI: let the coordinator advertise a relay address and
-   have `ferrum up-mesh --relay <addr>` (and the desktop/client-core bring-up)
-   construct a `RelayMeshTransport` and call `run_mesh_relayed`.
+1. **Phase 4 — coordinator-advertised relay**: NAT-traversal data plane + local
+   bring-up are done (signaling, STUN, relay, state machine, automatic fallback via
+   `run_mesh_relayed`, selectable through `transport.relay` config). What remains is
+   letting the **coordinator advertise** a relay address (extend the proto / network
+   map) so nodes learn it centrally instead of each setting `transport.relay`; the
+   desktop GUI also still needs a relay (and STUN) input field.
 2. **Phase 5 — desktop data plane** ✅ *(done)*: the Tauri shell's "connect" opens a
    TUN (Linux `/dev/net/tun`, root) and runs `run_mesh_session`, so the GUI moves
    packets. Follow-up: a privileged helper so the GUI need not run as root, and

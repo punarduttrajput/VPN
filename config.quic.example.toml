@@ -18,3 +18,8 @@ allowed_ips = ["10.8.0.2/32"]
 mode = "quic"
 role = "client"        # the other peer uses role = "server"
 server_name = "ferrum"    # TLS SNI presented/expected (peer identity is via WireGuard)
+# Optional DERP-style relay fallback for `ferrum up-mesh` (Phase 4 NAT traversal).
+# Independent of `mode`: when set, the mesh runs the direct transport AND a
+# public-key-keyed relay at once, preferring direct and falling back per peer.
+# Run a relay with `ferrum relay --listen <addr>`.
+# relay = "203.0.113.9:3478"
