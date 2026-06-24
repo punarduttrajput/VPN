@@ -133,7 +133,8 @@ on the new environment before assuming it's still blocked.
   allow-listing loopback/tunnel/coordinator; Linux — see `apps/desktop/.../killswitch.rs`).
   Remaining: iOS/Android shells, a privileged-helper for the desktop TUN, and macOS/Windows
   kill-switch enforcement.
-- **Phase 6 (~15%):** `sendmmsg` batching + **observability M1 done (coordinator + relay)**:
+- **Phase 6 (~15%):** `sendmmsg` batching + **UDP GSO send-path** (`UDP_SEGMENT`; Linux,
+  CI-verified — not buildable on this no-WSL/no-rustup host) + **observability M1 done (coordinator + relay)**:
   privacy-preserving Prometheus metrics on a `--metrics-listen` `/metrics` endpoint each
   (aggregate counters/gauges, no per-user/flow labels — NFR5; hand-rolled, dependency-free)
   **and** `#[tracing::instrument(skip_all)]` spans across the coordinator RPC handlers + the
