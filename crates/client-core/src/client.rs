@@ -386,6 +386,32 @@ impl FerrumClient {
         Ok(())
     }
 
+    /// Rotate this device's static key with the coordinator (PRD Phase 3, FR3).
+    ///
+    /// Opens a control channel (carrying the configured bearer token, if any) and
+    /// asks the coordinator to move the device's registration from
+    /// `old_public_key` to `new_public_key` — preserving the assigned tunnel IP,
+    /// name, endpoint, tags, and candidates — returning the unchanged CIDR.
+    ///
+    /// This rotates the *control-plane* identity only. For a graceful
+    /// re-handshake the caller generates a fresh WireGuard keypair, rotates here,
+    /// then rebuilds the OS data plane with the new private key (e.g. by re-running
+    /// its supervised mesh session). Peers learn the new key over their watch
+    /// stream and re-handshake to it. A shell can drive this on any interval it
+    /// chooses to get periodic rotation.
+    pub async fn rotate_key(
+        &self,
+        coordinator: impl Into<String>,
+        old_public_key: &str,
+        new_public_key: &str,
+    ) -> Result<String, Error> {
+        let mut control = ControlClient::connect(coordinator.into()).await?;
+        if let Some(token) = self.token() {
+            control = control.with_token(token);
+        }
+        control.rotate_key(old_public_key, new_public_key).await
+    }
+
     /// Disconnect: tear down the session view and return to `Disconnected`.
     ///
     /// Also cancels any in-flight [`connect_with_retry`](FerrumClient::connect_with_retry)
@@ -632,6 +658,30 @@ mod tests {
         // Clearing it is honoured.
         c.set_token(None);
         assert_eq!(c.token(), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rotate_key_through_the_facade_keeps_the_address() {
+        let url = start_coordinator().await;
+        let a = FerrumClient::new();
+        let b = FerrumClient::new();
+
+        a.connect(url.clone(), &identity("OLD", "laptop", "1.1.1.1:51820"))
+            .await
+            .unwrap();
+        let addr = a.address().unwrap();
+
+        // Rotate A's control-plane key; the assigned CIDR is unchanged.
+        let after = a.rotate_key(url.clone(), "OLD", "NEW").await.unwrap();
+        assert_eq!(after, addr);
+
+        // A peer connecting now sees A under its NEW key.
+        b.connect(url, &identity("BBB", "gateway", "2.2.2.2:51820"))
+            .await
+            .unwrap();
+        let peers = b.peers();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].public_key, "NEW");
     }
 
     fn fast_policy(max_retries: u32) -> ReconnectPolicy {

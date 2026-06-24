@@ -25,6 +25,9 @@ pub enum RegistryError {
     /// An operation referenced a device that is not registered.
     #[error("device not registered")]
     UnknownDevice,
+    /// A key rotation targeted a public key already used by another device.
+    #[error("target public key already in use")]
+    KeyInUse,
     /// The persistence backend failed.
     #[error("persistence error: {0}")]
     Store(String),
@@ -168,6 +171,49 @@ impl Registry {
         Ok(())
     }
 
+    /// Rotate a device's static public key (PRD Phase 3, FR3 — key rotation).
+    ///
+    /// The device's identity in the network is preserved: its assigned tunnel
+    /// IP, name, endpoint, tags, and published candidates all carry over to the
+    /// new key. Only the key (its `by_key` entry, and the persisted row) changes.
+    /// Rotating to the same key is a no-op that returns the current IP. The new
+    /// key must be non-empty and not already used by another device.
+    pub fn rotate_key(&mut self, old: &str, new: &str) -> Result<Ipv4Addr, RegistryError> {
+        if new.trim().is_empty() {
+            return Err(RegistryError::InvalidKey);
+        }
+        if old == new {
+            // No change requested: report the existing assignment (or that the
+            // device is unknown, mirroring the rotate-an-unknown-device case).
+            return self
+                .by_key
+                .get(old)
+                .map(|d| d.tunnel_ip)
+                .ok_or(RegistryError::UnknownDevice);
+        }
+        if self.by_key.contains_key(new) {
+            return Err(RegistryError::KeyInUse);
+        }
+        // Move the record from the old key to the new one, keeping everything
+        // else. `remove` ends the `&mut by_key` borrow before we touch the store.
+        let mut device = self
+            .by_key
+            .remove(old)
+            .ok_or(RegistryError::UnknownDevice)?;
+        device.public_key = new.to_string();
+        let ip = device.tunnel_ip;
+        self.by_key.insert(new.to_string(), device.clone());
+        // Write-through: persist the record under the new key first (so the
+        // device is never absent from the store), then drop the old key's row.
+        self.store
+            .upsert(&device)
+            .map_err(|e| RegistryError::Store(e.to_string()))?;
+        self.store
+            .remove(old)
+            .map_err(|e| RegistryError::Store(e.to_string()))?;
+        Ok(ip)
+    }
+
     /// Allocate the next free host address in the pool (excludes network,
     /// broadcast, and the reserved `.1`).
     fn allocate(&mut self) -> Result<Ipv4Addr, RegistryError> {
@@ -297,6 +343,68 @@ mod tests {
     }
 
     #[test]
+    fn rotate_key_preserves_ip_tags_and_candidates() {
+        let mut r = registry();
+        let ip = r
+            .register("oldkey", "laptop", "1.1.1.1:51820", &tags(&["dev"]))
+            .unwrap();
+        r.set_candidates(
+            "oldkey",
+            &["1.1.1.1:51820".into(), "203.0.113.5:7777".into()],
+        )
+        .unwrap();
+
+        let rotated_ip = r.rotate_key("oldkey", "newkey").unwrap();
+        assert_eq!(rotated_ip, ip, "tunnel IP is preserved across rotation");
+        assert_eq!(r.device_count(), 1, "rotation does not create a new device");
+
+        // The old key is gone; a peer now sees the device under its new key with
+        // everything else intact.
+        let map = r.network_map("peer");
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[0].public_key, "newkey");
+        assert_eq!(map[0].tunnel_ip, ip);
+        assert_eq!(map[0].name, "laptop");
+        assert_eq!(map[0].endpoint, "1.1.1.1:51820");
+        assert_eq!(map[0].tags, tags(&["dev"]));
+        assert_eq!(map[0].candidates.len(), 2);
+    }
+
+    #[test]
+    fn rotate_key_rejects_unknown_device() {
+        let mut r = registry();
+        assert_eq!(
+            r.rotate_key("ghost", "newkey"),
+            Err(RegistryError::UnknownDevice)
+        );
+    }
+
+    #[test]
+    fn rotate_key_rejects_collision_with_existing_key() {
+        let mut r = registry();
+        r.register("a", "A", "", &[]).unwrap();
+        r.register("b", "B", "", &[]).unwrap();
+        assert_eq!(r.rotate_key("a", "b"), Err(RegistryError::KeyInUse));
+        // Both devices are untouched.
+        assert_eq!(r.device_count(), 2);
+    }
+
+    #[test]
+    fn rotate_key_to_same_key_is_noop() {
+        let mut r = registry();
+        let ip = r.register("a", "A", "", &[]).unwrap();
+        assert_eq!(r.rotate_key("a", "a").unwrap(), ip);
+        assert_eq!(r.device_count(), 1);
+    }
+
+    #[test]
+    fn rotate_key_rejects_empty_new_key() {
+        let mut r = registry();
+        r.register("a", "A", "", &[]).unwrap();
+        assert_eq!(r.rotate_key("a", "   "), Err(RegistryError::InvalidKey));
+    }
+
+    #[test]
     fn pool_exhaustion_is_reported() {
         // /30 => offsets 1..3; .1 reserved, so only .2 is allocatable before exhaustion.
         let mut r = Registry::new(Ipv4Addr::new(10, 0, 0, 0), 30);
@@ -375,5 +483,41 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn rotate_key_persists_through_the_store() {
+        use crate::sqlite::SqliteStore;
+
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut r = Registry::with_store(
+            Ipv4Addr::new(10, 8, 0, 0),
+            24,
+            Policy::allow_all(),
+            Box::new(store),
+        )
+        .unwrap();
+        let ip = r
+            .register("oldkey", "laptop", "1.1.1.1:51820", &[])
+            .unwrap();
+        r.rotate_key("oldkey", "newkey").unwrap();
+
+        // A fresh registry over the same store sees only the new key, same IP.
+        let store = r.store;
+        let mut r2 =
+            Registry::with_store(Ipv4Addr::new(10, 8, 0, 0), 24, Policy::allow_all(), store)
+                .unwrap();
+        assert_eq!(r2.device_count(), 1);
+        // The new key keeps the same IP; re-registering it is idempotent.
+        assert_eq!(
+            r2.register("newkey", "laptop", "1.1.1.1:51820", &[])
+                .unwrap(),
+            ip
+        );
+        // The old key is gone.
+        let map = r2.network_map("peer");
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[0].public_key, "newkey");
     }
 }

@@ -86,6 +86,22 @@ impl FfiFerrumClient {
         self.inner.disconnect()
     }
 
+    /// Rotate this device's static key with the coordinator (FR3): move the
+    /// registration from `old_public_key` to `new_public_key`, keeping the tunnel
+    /// IP and metadata, and return the unchanged assigned CIDR. The shell
+    /// generates the new keypair locally, calls this, then re-runs its data plane
+    /// with the new private key so peers re-handshake to it.
+    pub async fn rotate_key(
+        &self,
+        coordinator: String,
+        old_public_key: String,
+        new_public_key: String,
+    ) -> Result<String, Error> {
+        self.inner
+            .rotate_key(coordinator, &old_public_key, &new_public_key)
+            .await
+    }
+
     /// Attach (or clear) an OIDC bearer token applied to every coordinator RPC —
     /// required when the coordinator runs with OIDC auth. Set it before
     /// `connect`/`run`; it is re-read on every reconnect.
