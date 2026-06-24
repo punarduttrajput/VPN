@@ -406,20 +406,27 @@ async fn up_mesh(
     });
 
     // Optional relay fallback underlay (Phase 4): runs alongside the chosen direct
-    // transport, selected per peer by the path state machine. Connect with no
-    // peers — the data plane aligns the relay's key table from the network map.
-    let relay = match config.transport.relay.as_deref() {
+    // transport, selected per peer by the path state machine. A local
+    // `transport.relay` override wins; otherwise use whatever relay the
+    // coordinator advertises for the network. Connect with no peers — the data
+    // plane aligns the relay's key table from the network map.
+    let relay_addr = match config.transport.relay.clone() {
+        Some(r) => Some(r),
+        None => client
+            .advertised_relay(&public_key)
+            .await
+            .context("querying advertised relay")?,
+    };
+    let relay = match relay_addr {
         Some(r) => {
-            let relay_addr: SocketAddr = r
-                .parse()
-                .with_context(|| format!("parsing transport.relay '{r}'"))?;
+            let addr: SocketAddr = r.parse().with_context(|| format!("relay address '{r}'"))?;
             let self_key = ferrum_core::keys::decode_key(&public_key)
                 .context("decoding our public key for the relay")?;
-            info!(relay = %relay_addr, "relay fallback enabled");
+            info!(relay = %addr, "relay fallback enabled");
             Some(
-                ferrum_transport::RelayMeshTransport::connect(relay_addr, self_key, &[])
+                ferrum_transport::RelayMeshTransport::connect(addr, self_key, &[])
                     .await
-                    .with_context(|| format!("connecting to relay at {relay_addr}"))?,
+                    .with_context(|| format!("connecting to relay at {addr}"))?,
             )
         }
         None => None,

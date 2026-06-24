@@ -102,19 +102,20 @@ on the new environment before assuming it's still blocked.
 
 - **Phases 1–3:** functionally complete (tunnel; QUIC/MASQUE transports + migration
   + obfuscation + batch I/O; full control plane with ACL/streaming/SQLite/mTLS/OIDC).
-- **Phase 4 (~60%):** mesh data plane (UDP/QUIC/MASQUE) + crypto-demux + roaming,
-  STUN client + coordinator candidate signaling + candidate gathering/publishing +
-  candidate probing (M1/M2), a **DERP-style public-key-keyed relay** (`RelayServer`
-  + `RelayMeshTransport`, runnable via `ferrum relay`; M3), the per-peer
-  `idle→connecting→relay→direct` **state machine** (`tunnel::path`), and now its
-  **automatic relay-fallback wiring with path upgrade/downgrade** (`run_mesh_relayed`
-  runs direct + relay underlays at once; the `PathMachine` selects per peer; a peer
-  comes up over the relay and upgrades to direct when punched) are all built — and
-  now **selectable from the binary**: a `transport.relay = "ip:port"` config field
-  routes `ferrum up-mesh` (and `client-core::run_mesh_session` / the `uniffi` FFI)
-  through `run_mesh_relayed`. The NAT-traversal data plane + local bring-up are
-  complete; the remaining piece is **coordinator-advertised relay** (the node
-  learns the relay from the network map instead of local config).
+- **Phase 4 (NAT traversal — ✅ functionally complete):** mesh data plane
+  (UDP/QUIC/MASQUE) + crypto-demux + roaming, STUN client + coordinator candidate
+  signaling + candidate gathering/publishing + candidate probing (M1/M2), a
+  **DERP-style public-key-keyed relay** (`RelayServer` + `RelayMeshTransport`,
+  runnable via `ferrum relay`; M3), the per-peer `idle→connecting→relay→direct`
+  **state machine** (`tunnel::path`), its **automatic relay-fallback wiring with
+  path upgrade/downgrade** (`run_mesh_relayed` runs direct + relay underlays at
+  once; the `PathMachine` selects per peer; a peer comes up over the relay and
+  upgrades to direct when punched), and the bring-up to use it — a local
+  `transport.relay = "ip:port"` override *and* **coordinator-advertised relay**
+  (`coordinator --relay <addr>` → `NetworkMapResponse.relay`; clients resolve
+  local-override-else-advertised in `up-mesh` / `run_mesh_session` / the FFI).
+  Remaining is hardening only: fuller ICE pairing/prioritization and a desktop-GUI
+  relay/STUN field.
 - **Phase 5 (~30%):** shared `FerrumClient` core (M1) + `uniffi` bindings (Swift/Kotlin
   generate from `FfiFerrumClient`) + data-plane glue (`run_mesh_session`) + the
   TUN-from-fd FFI entry (`device::from_fd` + `FfiFerrumClient::run`/`stop`) + a Tauri
@@ -125,12 +126,11 @@ on the new environment before assuming it's still blocked.
 
 ## Recommended next work (highest-value, buildable in Rust)
 
-1. **Phase 4 — coordinator-advertised relay**: NAT-traversal data plane + local
-   bring-up are done (signaling, STUN, relay, state machine, automatic fallback via
-   `run_mesh_relayed`, selectable through `transport.relay` config). What remains is
-   letting the **coordinator advertise** a relay address (extend the proto / network
-   map) so nodes learn it centrally instead of each setting `transport.relay`; the
-   desktop GUI also still needs a relay (and STUN) input field.
+1. **Phase 5 — reliability**: kill-switch / always-on / reconnect on the
+   `FerrumClient` facade (Phase 4 NAT traversal is now functionally complete:
+   signaling, STUN, relay, state machine, automatic fallback, and both local +
+   coordinator-advertised relay selection all land). Optional Phase 4 hardening:
+   fuller ICE candidate-pair prioritization; a desktop-GUI relay/STUN field.
 2. **Phase 5 — desktop data plane** ✅ *(done)*: the Tauri shell's "connect" opens a
    TUN (Linux `/dev/net/tun`, root) and runs `run_mesh_session`, so the GUI moves
    packets. Follow-up: a privileged helper so the GUI need not run as root, and

@@ -79,6 +79,30 @@ pub fn build_mesh_peers(private_key_b64: &str, peers: &[PeerSpec]) -> Result<Vec
         .collect()
 }
 
+/// Our own 32-byte WireGuard public key, derived from the base64 private key —
+/// the relay underlay's routing identity for this node.
+// `Error` carries `tonic::Status` (large); boxing only this sync helper would be
+// inconsistent with the rest of the crate, so allow the lint.
+#[allow(clippy::result_large_err)]
+fn self_public_key(private_key_b64: &str) -> Result<[u8; 32], Error> {
+    let pub_b64 = ferrum_core::keys::public_base64_from_private(private_key_b64)
+        .map_err(|e| Error::DataPlane(e.to_string()))?;
+    ferrum_core::keys::decode_key(&pub_b64).map_err(|e| Error::DataPlane(e.to_string()))
+}
+
+/// Connect a public-key-keyed relay underlay at `addr` for this node. The relay's
+/// peer table is aligned from the network map by the mesh runner, so we connect
+/// with no peers here.
+async fn connect_relay(addr: &str, private_key_b64: &str) -> Result<RelayMeshTransport, Error> {
+    let relay_addr: SocketAddr = addr
+        .parse()
+        .map_err(|e| Error::DataPlane(format!("relay '{addr}': {e}")))?;
+    let self_key = self_public_key(private_key_b64)?;
+    RelayMeshTransport::connect(relay_addr, self_key, &[])
+        .await
+        .map_err(|e| Error::DataPlane(e.to_string()))
+}
+
 /// Run the full client data plane until `shutdown` resolves.
 ///
 /// Registers `identity` with the coordinator (driving `client` to `Connected`),
@@ -89,11 +113,13 @@ pub fn build_mesh_peers(private_key_b64: &str, peers: &[PeerSpec]) -> Result<Vec
 ///
 /// `device` is the opened TUN (a shell hands one built from its platform fd);
 /// `transport` is a bound [`MeshTransport`] (`UdpMeshTransport`, or QUIC/MASQUE).
-/// `relay`, when `Some`, is a connected public-key-keyed relay underlay: the mesh
-/// then runs direct + relay at once ([`run_mesh_relayed`]), preferring direct and
-/// falling back per peer (PRD Phase 4). `private_key_b64` is this device's
-/// WireGuard private key, used to build the per-peer sessions (it is never sent to
-/// the coordinator).
+/// `relay` is an optional **local relay-address override** (`ip:port`); when
+/// `None`, the coordinator's advertised relay (if any) is used instead. Whenever a
+/// relay address is resolved, the mesh runs direct + relay at once
+/// ([`run_mesh_relayed`]), preferring direct and falling back per peer (PRD Phase
+/// 4). `private_key_b64` is this device's WireGuard private key, used to build the
+/// per-peer sessions and the relay's routing identity (it is never sent to the
+/// coordinator).
 ///
 /// `candidates` are this device's gathered NAT-traversal candidates (host +
 /// STUN server-reflexive `ip:port`, typically from
@@ -112,7 +138,7 @@ pub async fn run_mesh_session<D, M, F>(
     candidates: &[String],
     device: D,
     transport: M,
-    relay: Option<RelayMeshTransport>,
+    relay: Option<String>,
     shutdown: F,
 ) -> Result<(), Error>
 where
@@ -138,6 +164,21 @@ where
             warn!("publishing NAT-traversal candidates failed: {e}");
         }
     }
+
+    // Resolve the relay underlay: a local override wins, else whatever the
+    // coordinator advertises for this network. Connect it once; the mesh runner
+    // aligns its peer table from the map. `None` => direct-only.
+    let relay = match relay {
+        Some(addr) => Some(addr),
+        None => control
+            .advertised_relay(&identity.public_key)
+            .await
+            .unwrap_or(None),
+    };
+    let relay = match relay {
+        Some(addr) => Some(connect_relay(&addr, private_key_b64).await?),
+        None => None,
+    };
 
     let mut stream = control.watch(&identity.public_key).await?;
     let (tx, rx) = mpsc::channel::<Vec<MeshPeer>>(8);

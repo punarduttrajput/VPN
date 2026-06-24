@@ -196,11 +196,10 @@ async fn connect(
     let private_key = identity.private_key;
     let task_app = app.clone();
     tauri::async_runtime::spawn(async move {
-        // No NAT-traversal candidates and no relay fallback yet: the GUI has no
-        // STUN-server or relay field, so nothing is gathered/published and the
-        // mesh runs direct-only (follow-up: STUN + relay inputs that feed
-        // `gather_candidates` / a `RelayMeshTransport` here, like the CLI's
-        // `--stun-server` and `transport.relay`).
+        // No NAT-traversal candidates and no local relay override: the GUI has no
+        // STUN-server field (follow-up, like the CLI's `--stun-server`), so nothing
+        // is gathered/published. The relay arg is `None`, so the mesh uses whatever
+        // relay the coordinator advertises (or runs direct-only if none).
         let result = run_mesh_session(
             &client,
             &coordinator,

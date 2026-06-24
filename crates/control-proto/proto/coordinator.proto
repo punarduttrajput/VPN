@@ -46,6 +46,10 @@ message PeerInfo {
 
 message NetworkMapResponse {
   repeated PeerInfo peers = 1;
+  // Network-wide DERP-style relay fallback advertised by the coordinator
+  // ("ip:port"), or empty if none. A node uses it as the relay underlay for
+  // NAT traversal (PRD Phase 4) unless it has a local override configured.
+  string relay = 2;
 }
 
 message PublishCandidatesRequest {
