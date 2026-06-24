@@ -9,7 +9,7 @@ pub mod session;
 
 mod runner;
 
-pub use mesh::{run_mesh, MeshPeer};
+pub use mesh::{run_mesh, run_mesh_relayed, MeshPeer};
 pub use path::{Path, PathMachine, PathState};
 pub use runner::{run, RunHandle};
 

@@ -24,12 +24,12 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use ferrum_core::config::Cidr;
-use ferrum_transport::MeshTransport;
+use ferrum_transport::{MeshTransport, RelayMeshTransport};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::device::TunDevice;
-use crate::path::PathMachine;
+use crate::path::{Path, PathMachine};
 use crate::session::{Action, Session, MAX_PACKET};
 use crate::Result;
 
@@ -124,34 +124,201 @@ fn probe_targets(peer: &MeshPeer, confirmed: bool) -> Vec<SocketAddr> {
     targets
 }
 
-/// Kick off a fresh handshake to every peer, fanning each across its candidate
-/// addresses, and move each peer's path machine into the probing state.
-async fn handshake_all<M: MeshTransport>(
-    transport: &M,
-    peers: &mut [MeshPeer],
-    paths: &mut [PathMachine],
-    out: &mut [u8],
+/// Which underlay an inbound datagram arrived on (or an outbound should ride):
+/// the **direct** transport or the **relay** fallback. Drives path confirmation
+/// (direct vs relay liveness) and endpoint roaming (only the direct underlay
+/// carries the peer's real source address).
+#[derive(Debug, Clone, Copy)]
+enum Underlay {
+    Direct,
+    Relay,
+}
+
+/// Each peer's stable relay handle: the [`SocketAddr`] the relay underlay uses to
+/// address it. Captured from the peer's endpoint when the set is (re)built and
+/// kept fixed even as `endpoint` roams on the direct path — the relay addresses
+/// peers by public key behind this handle, so it must not follow direct roaming.
+fn relay_handles(peers: &[MeshPeer]) -> Vec<SocketAddr> {
+    peers.iter().map(|p| p.endpoint).collect()
+}
+
+/// Align the relay transport's `handle <-> key` table with the current peer set
+/// (each peer's stable handle + its WireGuard public key), so relay sends and
+/// inbound attribution track `peers`. A no-op when there is no relay underlay.
+fn align_relay(relay: Option<&RelayMeshTransport>, peers: &[MeshPeer], handles: &[SocketAddr]) {
+    if let Some(r) = relay {
+        let pairs: Vec<(SocketAddr, [u8; 32])> = peers
+            .iter()
+            .zip(handles)
+            .map(|(p, h)| (*h, p.session.peer_public_key()))
+            .collect();
+        r.set_peers(&pairs);
+    }
+}
+
+/// Await the relay underlay's next inbound datagram, or never resolve when there
+/// is no relay (so its `select!` branch stays inert).
+async fn relay_recv(
+    relay: &Option<RelayMeshTransport>,
+    buf: &mut [u8],
+) -> std::result::Result<(usize, SocketAddr), ferrum_transport::TransportError> {
+    match relay {
+        Some(r) => r.recv_from(buf).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Send a *data* datagram for one peer over the underlay its path machine has
+/// chosen: the confirmed direct path, the relay fallback, or — while no path is
+/// confirmed yet — best-effort over the relay if present, else the direct
+/// endpoint.
+async fn send_data<M: MeshTransport>(
+    direct: &M,
+    relay: Option<&RelayMeshTransport>,
+    peer: &MeshPeer,
+    relay_handle: SocketAddr,
+    path: Path,
+    pkt: &[u8],
 ) -> Result<()> {
-    for (i, peer) in peers.iter_mut().enumerate() {
-        paths[i].begin_probing();
-        if let Action::SendToPeer(pkt) = peer.session.start_handshake(out)? {
-            // Probe candidates until a direct path is confirmed.
-            let direct = paths[i].path() == crate::path::Path::Direct;
-            for target in probe_targets(peer, direct) {
-                transport.send_to(target, pkt).await?;
+    match path {
+        Path::Direct => direct.send_to(peer.endpoint, pkt).await?,
+        Path::Relay => {
+            if let Some(r) = relay {
+                r.send_to(relay_handle, pkt).await?;
+            }
+        }
+        Path::None => match relay {
+            Some(r) => r.send_to(relay_handle, pkt).await?,
+            None => direct.send_to(peer.endpoint, pkt).await?,
+        },
+    }
+    Ok(())
+}
+
+/// Send *signaling* (a handshake or keepalive) for one peer. Unlike data, this
+/// keeps probing for a better path: while on the relay (or with no path yet) it
+/// fans the packet across the peer's direct candidates *and* the relay, so a
+/// direct path can come up and trigger an upgrade. Once direct is confirmed it
+/// only refreshes that path.
+async fn send_signaling<M: MeshTransport>(
+    direct: &M,
+    relay: Option<&RelayMeshTransport>,
+    peer: &MeshPeer,
+    relay_handle: SocketAddr,
+    path: Path,
+    pkt: &[u8],
+) -> Result<()> {
+    match path {
+        Path::Direct => direct.send_to(peer.endpoint, pkt).await?,
+        Path::Relay | Path::None => {
+            for target in probe_targets(peer, false) {
+                direct.send_to(target, pkt).await?;
+            }
+            if let Some(r) = relay {
+                r.send_to(relay_handle, pkt).await?;
             }
         }
     }
     Ok(())
 }
 
-/// Run the mesh data plane until `shutdown` resolves.
+/// Kick off a fresh handshake to every peer, fanning each across its direct
+/// candidates (and the relay, if any), and move each peer's path machine into the
+/// probing state.
+async fn handshake_all<M: MeshTransport>(
+    direct: &M,
+    relay: Option<&RelayMeshTransport>,
+    peers: &mut [MeshPeer],
+    paths: &mut [PathMachine],
+    handles: &[SocketAddr],
+    out: &mut [u8],
+) -> Result<()> {
+    for i in 0..peers.len() {
+        paths[i].begin_probing();
+        if let Action::SendToPeer(pkt) = peers[i].session.start_handshake(out)? {
+            let path = paths[i].path();
+            send_signaling(direct, relay, &peers[i], handles[i], path, pkt).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Demux one inbound datagram to the peer whose session decrypts it, confirm the
+/// path it proved (direct vs relay), roam that peer's endpoint on the direct
+/// underlay, and act on the decrypted result (write to TUN, or reply along the
+/// same underlay).
 ///
-/// The mesh is carried over any [`MeshTransport`] — a shared UDP socket today,
-/// a QUIC endpoint multiplexing connections later — so this loop is independent
-/// of the wire protocol. Outbound TUN packets are routed by destination IP to a
-/// peer's session and sent via `transport`; inbound datagrams are demuxed to the
-/// peer they came from (by source address).
+/// Routing is by *which peer's session decrypts the packet* (WireGuard receiver
+/// index / keys), not by source address — a mismatched session rejects the
+/// datagram cheaply, so only the intended peer accepts it. That is what lets the
+/// mesh work when the source address is not the peer's advertised endpoint (NAT
+/// rewrite, MASQUE proxy, or the relay).
+#[allow(clippy::too_many_arguments)]
+async fn handle_inbound<D: TunDevice, M: MeshTransport>(
+    direct: &M,
+    relay: Option<&RelayMeshTransport>,
+    device: &mut D,
+    peers: &mut [MeshPeer],
+    paths: &mut [PathMachine],
+    handles: &[SocketAddr],
+    out: &mut [u8],
+    datagram: &[u8],
+    src: SocketAddr,
+    underlay: Underlay,
+) -> Result<()> {
+    for i in 0..peers.len() {
+        let action = match peers[i].session.decapsulate(datagram, out) {
+            Ok(a) => a,
+            // Not this peer's datagram — try the next session.
+            Err(_) => continue,
+        };
+        // The datagram decrypted for this peer, so the underlay it arrived on
+        // works: confirm/refresh that path. A direct packet upgrades to (or holds)
+        // Direct; a relay packet brings up the relay fallback unless we are
+        // already Direct, where it only keeps the relay a hot standby.
+        let transition = match underlay {
+            Underlay::Direct => paths[i].on_direct_packet(Instant::now()),
+            Underlay::Relay => paths[i].on_relay_packet(Instant::now()),
+        };
+        if let Some(t) = transition {
+            debug!(peer = i, ?underlay, transition = ?t, "peer path state changed");
+        }
+        // Endpoint roaming, but only on the direct underlay: there `src` is the
+        // peer's real reachable address (e.g. a NAT-rewritten port), safe to trust
+        // because we only roam on a packet that decrypts. On the relay underlay
+        // `src` is a synthetic handle, so roaming onto it would break direct
+        // addressing — leave `endpoint` alone.
+        if matches!(underlay, Underlay::Direct) && peers[i].endpoint != src {
+            debug!(old = %peers[i].endpoint, new = %src, "peer endpoint roamed");
+            peers[i].endpoint = src;
+        }
+        match action {
+            Action::WriteToTun(pkt, _ip) => device.write_packet(pkt).await?,
+            // Handshake response / cookie: reply along the underlay it arrived on.
+            Action::SendToPeer(pkt) => match underlay {
+                Underlay::Direct => direct.send_to(peers[i].endpoint, pkt).await?,
+                Underlay::Relay => {
+                    if let Some(r) = relay {
+                        r.send_to(handles[i], pkt).await?;
+                    }
+                }
+            },
+            Action::Done => {}
+        }
+        return Ok(());
+    }
+    debug!(%src, ?underlay, "no peer session accepted inbound datagram; dropping");
+    Ok(())
+}
+
+/// Run the mesh data plane over a single (direct) `transport` until `shutdown`
+/// resolves. See [`run_mesh_relayed`] to add an automatic relay fallback.
+///
+/// The mesh is carried over any [`MeshTransport`] — a shared UDP socket, a QUIC
+/// endpoint, or a MASQUE session — so this loop is independent of the wire
+/// protocol. Outbound TUN packets are routed by destination IP to a peer's
+/// session and sent via `transport`; inbound datagrams are demuxed to the peer
+/// whose session decrypts them.
 ///
 /// `updates` carries replacement peer sets (e.g. from the coordinator's
 /// `WatchNetworkMap` stream): each received set replaces the live mesh and
@@ -159,8 +326,55 @@ async fn handshake_all<M: MeshTransport>(
 /// process. When the sender is dropped the data plane keeps running with its
 /// current peers. Pass a never-sending receiver for a static mesh.
 pub async fn run_mesh<D, M, S>(
+    device: D,
+    transport: M,
+    peers: Vec<MeshPeer>,
+    updates: mpsc::Receiver<Vec<MeshPeer>>,
+    shutdown: S,
+) -> Result<()>
+where
+    D: TunDevice,
+    M: MeshTransport,
+    S: std::future::Future<Output = ()>,
+{
+    run_mesh_core(device, transport, None, peers, updates, shutdown).await
+}
+
+/// Run the mesh data plane with an automatic **relay fallback** underlay
+/// alongside the direct `transport`.
+///
+/// Each peer rides whichever path its `idle → connecting → relay → direct` state
+/// machine has confirmed: a direct (or relay) datagram that decrypts for a peer
+/// proves and refreshes that path. While no direct path is up, handshakes fan
+/// across *both* underlays, so a peer behind a hostile NAT comes up over the relay
+/// and **upgrades** to direct the moment a direct path is punched — and
+/// **downgrades** back to the relay if a confirmed direct path later goes stale.
+///
+/// The `relay` must already be connected to its
+/// [`RelayServer`](ferrum_transport::RelayServer); its `handle <-> key` table is
+/// (re)aligned to the live peer set here, including across `updates`.
+pub async fn run_mesh_relayed<D, M, S>(
+    device: D,
+    transport: M,
+    relay: RelayMeshTransport,
+    peers: Vec<MeshPeer>,
+    updates: mpsc::Receiver<Vec<MeshPeer>>,
+    shutdown: S,
+) -> Result<()>
+where
+    D: TunDevice,
+    M: MeshTransport,
+    S: std::future::Future<Output = ()>,
+{
+    run_mesh_core(device, transport, Some(relay), peers, updates, shutdown).await
+}
+
+/// Shared mesh loop driving the direct `transport` and, when present, a relay
+/// fallback underlay. Underlay selection is per peer, by its [`PathMachine`].
+async fn run_mesh_core<D, M, S>(
     mut device: D,
     transport: M,
+    relay: Option<RelayMeshTransport>,
     mut peers: Vec<MeshPeer>,
     mut updates: mpsc::Receiver<Vec<MeshPeer>>,
     shutdown: S,
@@ -173,22 +387,38 @@ where
     let mut out = vec![0u8; MAX_PACKET];
 
     // Per-peer NAT-traversal path state (`idle → connecting → relay → direct`),
-    // parallel to `peers`. A direct path is confirmed once an inbound datagram
-    // decrypts for that peer; until then handshakes fan out across its candidates
-    // (M2 connectivity check). If a confirmed path later goes stale the machine
-    // downgrades and we resume probing. Rebuilt whenever the peer set is replaced.
+    // parallel to `peers`. A path is confirmed once an inbound datagram decrypts
+    // for that peer over the matching underlay; until then handshakes fan out
+    // across its candidates and the relay. If a confirmed path later goes stale
+    // the machine downgrades and we resume probing. Rebuilt with the peer set.
     let mut paths = vec![PathMachine::new(); peers.len()];
+    // Stable relay handles, parallel to `peers`; align the relay's key table.
+    let mut handles = relay_handles(&peers);
+    align_relay(relay.as_ref(), &peers, &handles);
 
     // Kick off a handshake to every peer we start with.
-    handshake_all(&transport, &mut peers, &mut paths, &mut out).await?;
+    handshake_all(
+        &transport,
+        relay.as_ref(),
+        &mut peers,
+        &mut paths,
+        &handles,
+        &mut out,
+    )
+    .await?;
 
     let mut tun_buf = vec![0u8; MAX_PACKET];
     let mut net_buf = vec![0u8; MAX_PACKET];
+    let mut relay_buf = vec![0u8; MAX_PACKET];
     let mut timer = tokio::time::interval(Duration::from_millis(250));
     let mut updates_open = true;
     tokio::pin!(shutdown);
 
-    info!(peers = peers.len(), "mesh data plane running");
+    info!(
+        peers = peers.len(),
+        relay = relay.is_some(),
+        "mesh data plane running"
+    );
 
     loop {
         tokio::select! {
@@ -203,105 +433,127 @@ where
                     Some(next) => {
                         info!(peers = next.len(), "applying updated network map");
                         peers = next;
-                        // New sessions: fresh path machines, so probe candidates.
+                        // New sessions: fresh path machines + realigned relay table.
                         paths = vec![PathMachine::new(); peers.len()];
-                        handshake_all(&transport, &mut peers, &mut paths, &mut out).await?;
+                        handles = relay_handles(&peers);
+                        align_relay(relay.as_ref(), &peers, &handles);
+                        handshake_all(
+                            &transport,
+                            relay.as_ref(),
+                            &mut peers,
+                            &mut paths,
+                            &handles,
+                            &mut out,
+                        )
+                        .await?;
                     }
                     // Sender dropped: stop polling this branch, keep current peers.
                     None => updates_open = false,
                 }
             }
 
-            // Outbound: TUN -> route by dest IP -> encrypt -> peer.
+            // Outbound: TUN -> route by dest IP -> encrypt -> chosen underlay.
             read = device.read_packet(&mut tun_buf) => {
                 let n = read?;
                 match dest_ip(&tun_buf[..n]).and_then(|ip| peer_for_dest(&peers, ip)) {
                     Some(idx) => {
-                        let peer = &mut peers[idx];
-                        if let Action::SendToPeer(pkt) = peer.session.encapsulate(&tun_buf[..n], &mut out)? {
-                            transport.send_to(peer.endpoint, pkt).await?;
+                        let path = paths[idx].path();
+                        if let Action::SendToPeer(pkt) =
+                            peers[idx].session.encapsulate(&tun_buf[..n], &mut out)?
+                        {
+                            send_data(
+                                &transport,
+                                relay.as_ref(),
+                                &peers[idx],
+                                handles[idx],
+                                path,
+                                pkt,
+                            )
+                            .await?;
                         }
                     }
                     None => debug!("no peer route for outbound packet; dropping"),
                 }
             }
 
-            // Inbound: datagram -> crypto-demux -> decrypt -> TUN.
-            //
-            // Route by *which peer's session decrypts the packet* (WireGuard
-            // receiver index / keys), not by source address. A mismatched
-            // session rejects the datagram cheaply (unknown receiver index, or
-            // peer-key mismatch on a handshake), so only the intended peer
-            // accepts it. This makes the mesh work when the source address is
-            // not the peer's advertised endpoint — e.g. traffic relayed through
-            // a MASQUE proxy, or arriving from a NAT-rewritten port.
+            // Inbound over the direct underlay.
             recv = transport.recv_from(&mut net_buf) => {
                 let (n, src) = recv?;
-                let mut routed = false;
-                for (i, peer) in peers.iter_mut().enumerate() {
-                    let action = match peer.session.decapsulate(&net_buf[..n], &mut out) {
-                        Ok(a) => a,
-                        // Not this peer's datagram — try the next session.
-                        Err(_) => continue,
-                    };
-                    // A datagram decrypted for this peer: the path it arrived on
-                    // works, so confirm/refresh it (and stop fanning handshakes
-                    // across candidates). Single transport today, so this is the
-                    // direct path; the relay underlay is a separate inbound source.
-                    if let Some(t) = paths[i].on_direct_packet(Instant::now()) {
-                        debug!(peer = i, transition = ?t, "peer path state changed");
-                    }
-                    // Endpoint roaming: the datagram authenticated against this
-                    // peer's session, so `src` is the peer's current reachable
-                    // path. Trust it for future sends (the peer is behind a NAT
-                    // that rewrote its port, or reached us via a relay/proxy).
-                    // Safe because we only roam on a packet that decrypts —
-                    // an attacker cannot forge one.
-                    if peer.endpoint != src {
-                        debug!(old = %peer.endpoint, new = %src, "peer endpoint roamed");
-                        peer.endpoint = src;
-                    }
-                    match action {
-                        Action::WriteToTun(pkt, _ip) => device.write_packet(pkt).await?,
-                        // Handshake response / cookie: reply along the roamed path.
-                        Action::SendToPeer(pkt) => transport.send_to(peer.endpoint, pkt).await?,
-                        Action::Done => {}
-                    }
-                    routed = true;
-                    break;
-                }
-                if !routed {
-                    debug!(%src, "no peer session accepted inbound datagram; dropping");
-                }
+                handle_inbound(
+                    &transport,
+                    relay.as_ref(),
+                    &mut device,
+                    &mut peers,
+                    &mut paths,
+                    &handles,
+                    &mut out,
+                    &net_buf[..n],
+                    src,
+                    Underlay::Direct,
+                )
+                .await?;
+            }
+
+            // Inbound over the relay underlay (inert when there is no relay).
+            recv = relay_recv(&relay, &mut relay_buf), if relay.is_some() => {
+                let (n, src) = recv?;
+                handle_inbound(
+                    &transport,
+                    relay.as_ref(),
+                    &mut device,
+                    &mut peers,
+                    &mut paths,
+                    &handles,
+                    &mut out,
+                    &relay_buf[..n],
+                    src,
+                    Underlay::Relay,
+                )
+                .await?;
             }
 
             // Timers: age each peer's path state and service its WireGuard
             // handshake/keepalive. A handshake retransmit for a peer without a
-            // confirmed direct path re-probes all its candidates, so a path can
-            // come up even if it wasn't reachable on the first try.
+            // confirmed direct path re-probes its candidates and the relay, so a
+            // path can come up even if it wasn't reachable on the first try.
             _ = timer.tick() => {
                 let now = Instant::now();
-                for (i, peer) in peers.iter_mut().enumerate() {
+                for i in 0..peers.len() {
                     // Downgrade a confirmed path that has gone stale (peer roamed,
-                    // NAT mapping expired) and immediately re-probe its candidates,
-                    // rather than black-holing on a dead endpoint.
+                    // NAT mapping expired) and immediately re-probe, rather than
+                    // black-holing on a dead path.
                     if let Some(t) = paths[i].tick(now) {
                         info!(peer = i, transition = ?t, "peer path state changed");
                         if t.should_resume_probing() {
-                            if let Action::SendToPeer(pkt) = peer.session.start_handshake(&mut out)? {
-                                for target in probe_targets(peer, false) {
-                                    transport.send_to(target, pkt).await?;
-                                }
+                            if let Action::SendToPeer(pkt) =
+                                peers[i].session.start_handshake(&mut out)?
+                            {
+                                let path = paths[i].path();
+                                send_signaling(
+                                    &transport,
+                                    relay.as_ref(),
+                                    &peers[i],
+                                    handles[i],
+                                    path,
+                                    pkt,
+                                )
+                                .await?;
                             }
                             continue; // already sent a probe this tick
                         }
                     }
-                    match peer.session.update_timers(&mut out) {
+                    match peers[i].session.update_timers(&mut out) {
                         Ok(Action::SendToPeer(pkt)) => {
-                            let direct = paths[i].path() == crate::path::Path::Direct;
-                            for target in probe_targets(peer, direct) {
-                                transport.send_to(target, pkt).await?;
-                            }
+                            let path = paths[i].path();
+                            send_signaling(
+                                &transport,
+                                relay.as_ref(),
+                                &peers[i],
+                                handles[i],
+                                path,
+                                pkt,
+                            )
+                            .await?;
                         }
                         Ok(_) => {}
                         Err(e) => warn!("timer update error: {e}"),

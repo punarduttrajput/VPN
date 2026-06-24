@@ -30,6 +30,9 @@ pub enum Action<'a> {
 /// A WireGuard session bound to one local key and one peer key.
 pub struct Session {
     tunn: Tunn,
+    /// The peer's static public key (WireGuard identity), kept for routing the
+    /// session over a public-key-keyed relay underlay.
+    peer_public: [u8; 32],
 }
 
 impl Session {
@@ -44,6 +47,7 @@ impl Session {
 
     /// Build a session from raw 32-byte keys and a session index.
     pub fn from_bytes(private: [u8; 32], peer_public: [u8; 32], index: u32) -> Result<Self> {
+        let peer_public_bytes = peer_public;
         let static_private = StaticSecret::from(private);
         let peer_public = PublicKey::from(peer_public);
         let tunn = Tunn::new(
@@ -55,7 +59,16 @@ impl Session {
             None, // no rate limiter (single peer)
         )
         .map_err(|e| TunnelError::Session(e.to_string()))?;
-        Ok(Self { tunn })
+        Ok(Self {
+            tunn,
+            peer_public: peer_public_bytes,
+        })
+    }
+
+    /// The peer's static public key (its WireGuard identity), as raw bytes — the
+    /// routing key for a public-key-keyed relay underlay.
+    pub fn peer_public_key(&self) -> [u8; 32] {
+        self.peer_public
     }
 
     /// Produce the initial handshake packet to send to the peer.
