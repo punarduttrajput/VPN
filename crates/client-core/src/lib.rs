@@ -180,6 +180,17 @@ impl ControlClient {
         Ok(resp.peers.into_iter().map(peer_spec_from_info).collect())
     }
 
+    /// The relay fallback address (`ip:port`) the coordinator advertises to this
+    /// network, or `None` if it advertises no relay (PRD Phase 4 NAT traversal).
+    /// A device uses this as its relay underlay unless it has a local override.
+    pub async fn advertised_relay(&mut self, public_key: &str) -> Result<Option<String>, Error> {
+        let req = self.request(NetworkMapRequest {
+            public_key: public_key.to_string(),
+        });
+        let resp = self.inner.get_network_map(req).await?.into_inner();
+        Ok(Some(resp.relay).filter(|r| !r.is_empty()))
+    }
+
     /// Publish this device's ICE candidates (host + STUN server-reflexive
     /// `ip:port` strings) so permitted peers can learn how to reach it for NAT
     /// traversal (PRD Phase 4). The device must already be registered;
@@ -250,8 +261,13 @@ mod tests {
 
     /// Start an in-process coordinator and return its `http://addr` URL.
     async fn start_coordinator() -> String {
+        start_coordinator_with_relay("").await
+    }
+
+    /// Start an in-process coordinator advertising `relay` (empty for none).
+    async fn start_coordinator_with_relay(relay: &str) -> String {
         let registry = Arc::new(Mutex::new(Registry::new(Ipv4Addr::new(10, 8, 0, 0), 24)));
-        let svc = CoordinatorService::new(registry);
+        let svc = CoordinatorService::new(registry).with_relay(relay);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -262,6 +278,29 @@ mod tests {
                 .unwrap();
         });
         format!("http://{addr}")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn advertised_relay_is_surfaced_to_clients() {
+        let url = start_coordinator_with_relay("198.51.100.9:3478").await;
+        let mut a = ControlClient::connect(url).await.unwrap();
+        a.register("AAA", "laptop", "1.1.1.1:51820", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            a.advertised_relay("AAA").await.unwrap(),
+            Some("198.51.100.9:3478".to_string())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn advertised_relay_is_none_when_coordinator_has_no_relay() {
+        let url = start_coordinator().await; // no relay configured
+        let mut a = ControlClient::connect(url).await.unwrap();
+        a.register("AAA", "laptop", "1.1.1.1:51820", &[])
+            .await
+            .unwrap();
+        assert_eq!(a.advertised_relay("AAA").await.unwrap(), None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

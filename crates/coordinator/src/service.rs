@@ -15,8 +15,13 @@ use tonic::{Request, Response, Status};
 
 use crate::registry::Registry;
 
-/// Compute the current network-map response for a device.
-fn current_map(registry: &Arc<Mutex<Registry>>, public_key: &str) -> NetworkMapResponse {
+/// Compute the current network-map response for a device, advertising `relay`
+/// (the coordinator's configured relay address, or empty for none).
+fn current_map(
+    registry: &Arc<Mutex<Registry>>,
+    public_key: &str,
+    relay: &str,
+) -> NetworkMapResponse {
     let reg = registry.lock().expect("registry mutex poisoned");
     let peers = reg
         .network_map(public_key)
@@ -28,7 +33,10 @@ fn current_map(registry: &Arc<Mutex<Registry>>, public_key: &str) -> NetworkMapR
             candidates: d.candidates,
         })
         .collect();
-    NetworkMapResponse { peers }
+    NetworkMapResponse {
+        peers,
+        relay: relay.to_string(),
+    }
 }
 
 /// An authenticated caller identity derived from a verified bearer token.
@@ -49,6 +57,9 @@ pub struct CoordinatorService {
     registry: Arc<Mutex<Registry>>,
     /// Fires after any registry change so watchers can push a fresh map.
     changes: broadcast::Sender<()>,
+    /// A network-wide relay address (`ip:port`) advertised to every device in the
+    /// network map (PRD Phase 4 NAT traversal), or empty for none.
+    relay: String,
     /// When set (the `oidc` feature + a configured verifier), every RPC requires
     /// a valid bearer token and registration tags come from the token.
     #[cfg(feature = "oidc")]
@@ -62,9 +73,18 @@ impl CoordinatorService {
         Self {
             registry,
             changes,
+            relay: String::new(),
             #[cfg(feature = "oidc")]
             verifier: None,
         }
+    }
+
+    /// Advertise a network-wide relay address (`ip:port`) to every device in the
+    /// network map. Devices use it as their relay fallback unless locally
+    /// overridden. An empty string (the default) advertises no relay.
+    pub fn with_relay(mut self, relay: impl Into<String>) -> Self {
+        self.relay = relay.into();
+        self
     }
 
     /// Build a service that requires OIDC bearer tokens on every RPC.
@@ -77,6 +97,7 @@ impl CoordinatorService {
         Self {
             registry,
             changes,
+            relay: String::new(),
             verifier: Some(verifier),
         }
     }
@@ -152,7 +173,11 @@ impl Coordinator for CoordinatorService {
     ) -> Result<Response<NetworkMapResponse>, Status> {
         self.authenticate(&request)?;
         let req = request.into_inner();
-        Ok(Response::new(current_map(&self.registry, &req.public_key)))
+        Ok(Response::new(current_map(
+            &self.registry,
+            &req.public_key,
+            &self.relay,
+        )))
     }
 
     type WatchNetworkMapStream =
@@ -165,13 +190,14 @@ impl Coordinator for CoordinatorService {
         self.authenticate(&request)?;
         let public_key = request.into_inner().public_key;
         let registry = self.registry.clone();
+        let relay = self.relay.clone();
         let mut changes = self.changes.subscribe();
         let (tx, rx) = mpsc::channel(16);
 
         tokio::spawn(async move {
             // Push the current map immediately, then on every change.
             if tx
-                .send(Ok(current_map(&registry, &public_key)))
+                .send(Ok(current_map(&registry, &public_key, &relay)))
                 .await
                 .is_err()
             {
@@ -182,7 +208,7 @@ impl Coordinator for CoordinatorService {
             // client disconnects.
             while let Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) = changes.recv().await {
                 if tx
-                    .send(Ok(current_map(&registry, &public_key)))
+                    .send(Ok(current_map(&registry, &public_key, &relay)))
                     .await
                     .is_err()
                 {

@@ -91,6 +91,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(feature = "oidc"))]
     let svc = CoordinatorService::new(registry);
 
+    // Advertise a network-wide relay fallback (PRD Phase 4): every device learns
+    // it from the network map and uses it as the relay underlay unless locally
+    // overridden. Validated as a socket address so a typo fails fast.
+    let svc = match arg_value("--relay") {
+        Some(relay) => {
+            relay
+                .parse::<SocketAddr>()
+                .map_err(|e| format!("--relay '{relay}': {e}"))?;
+            info!(%relay, "advertising relay fallback to devices");
+            svc.with_relay(relay)
+        }
+        None => svc,
+    };
+
     #[cfg_attr(not(feature = "mtls"), allow(unused_mut))]
     let mut builder = Server::builder();
 
