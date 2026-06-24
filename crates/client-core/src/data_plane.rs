@@ -152,7 +152,12 @@ where
     client.connect(coordinator, identity).await?;
 
     // A second channel carries live map updates into both the mesh and the facade.
+    // It authenticates with the same bearer token as the facade's own channel, so
+    // an OIDC-protected coordinator accepts the watch/publish/relay-lookup RPCs.
     let mut control = ControlClient::connect(coordinator.to_string()).await?;
+    if let Some(token) = client.token() {
+        control = control.with_token(token);
+    }
 
     // Publish our gathered candidates (gather-then-signal, after registration) so
     // peers learn the alternative paths to probe. Best-effort: a failure here

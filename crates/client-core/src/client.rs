@@ -164,6 +164,10 @@ struct Inner {
     /// Last broadcast value of the derived "block traffic" signal, so
     /// [`FerrumClient::refresh_traffic_block`] only emits on a real change.
     traffic_blocked: bool,
+    /// Optional OIDC bearer token applied to every coordinator RPC this client
+    /// makes (via [`FerrumClient::set_token`]). `None` when the coordinator runs
+    /// without auth.
+    token: Option<String>,
 }
 
 /// The shared client core: connection state machine + control-plane sync.
@@ -201,6 +205,26 @@ impl FerrumClient {
     /// once for the current value, then drives off this stream).
     pub fn subscribe(&self) -> broadcast::Receiver<ClientEvent> {
         self.events.subscribe()
+    }
+
+    /// Attach (or clear) an OIDC bearer token applied to every coordinator RPC
+    /// this client makes — registration, network-map fetch/watch, candidate
+    /// publish, and relay lookup. Required when the coordinator runs with OIDC
+    /// auth; pass `None` (the default) otherwise. Set it before `connect`/
+    /// `run_mesh_session`; it is read each time a control channel is opened, so it
+    /// also applies to every reconnect.
+    pub fn set_token(&self, token: Option<String>) {
+        self.inner.lock().expect("client mutex poisoned").token = token;
+    }
+
+    /// The currently configured bearer token, if any (crate-internal: the
+    /// data-plane runner reads it to authenticate its own control channels).
+    pub(crate) fn token(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .expect("client mutex poisoned")
+            .token
+            .clone()
     }
 
     /// The current connection state.
@@ -339,6 +363,9 @@ impl FerrumClient {
         identity: &ClientIdentity,
     ) -> Result<(), Error> {
         let mut control = ControlClient::connect(coordinator).await?;
+        if let Some(token) = self.token() {
+            control = control.with_token(token);
+        }
         let plan = control
             .plan(
                 &identity.public_key,
@@ -585,6 +612,26 @@ mod tests {
             .await;
         assert!(err.is_err());
         assert_eq!(c.status(), ConnectionState::Failed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn set_token_is_applied_and_does_not_break_a_no_auth_coordinator() {
+        let url = start_coordinator().await; // no OIDC
+        let c = FerrumClient::new();
+        assert_eq!(c.token(), None);
+
+        // A token set on the client is carried on every control RPC; a coordinator
+        // without auth simply ignores it, so connect still succeeds.
+        c.set_token(Some("a.b.c".to_string()));
+        assert_eq!(c.token().as_deref(), Some("a.b.c"));
+        c.connect(url, &identity("AAA", "laptop", "1.1.1.1:51820"))
+            .await
+            .unwrap();
+        assert_eq!(c.status(), ConnectionState::Connected);
+
+        // Clearing it is honoured.
+        c.set_token(None);
+        assert_eq!(c.token(), None);
     }
 
     fn fast_policy(max_retries: u32) -> ReconnectPolicy {
