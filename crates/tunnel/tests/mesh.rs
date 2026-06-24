@@ -9,7 +9,7 @@ use ferrum_core::keys::KeyPair;
 use ferrum_transport::{RelayMeshTransport, RelayServer, UdpMeshTransport};
 use ferrum_tunnel::device::mock::MockTun;
 use ferrum_tunnel::session::Session;
-use ferrum_tunnel::{run_mesh, MeshPeer};
+use ferrum_tunnel::{run_mesh, run_mesh_relayed, MeshPeer};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
@@ -867,6 +867,239 @@ async fn relay_connects_two_nodes_by_public_key() {
 
     assert_eq!(
         b_pkt.expect("B should receive A's packet relayed by public key"),
+        to_b
+    );
+}
+
+/// Automatic relay **fallback** (Phase 4): two nodes run the dual-underlay data
+/// plane (`run_mesh_relayed`) with a working relay *and* a direct UDP transport,
+/// but each node's direct endpoint for its peer is a blackhole — so the direct
+/// path can never come up. The per-peer path machine must bring the tunnel up
+/// over the relay instead: handshakes fan across both underlays, the relay
+/// delivers, `on_relay_packet` confirms the relay path, and data then rides it.
+/// Delivery here can *only* have come over the relay (direct is a sink), proving
+/// the fallback is wired, not just modeled. The relay's `handle <-> key` table is
+/// aligned from the peer set by `run_mesh_relayed` (connect with no peers).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_fallback_carries_traffic_when_direct_is_blocked() {
+    let (a, b) = (KeyPair::generate(), KeyPair::generate());
+
+    // Direct UDP sockets for each node's direct underlay.
+    let sock_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sock_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    // Blackhole sinks: each node's *direct* endpoint for its peer points here, so
+    // the direct path never comes up (sends are silently drained — no ICMP reset
+    // on Windows). The only working path is the relay.
+    let sink_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sink_a_addr = sink_a.local_addr().unwrap();
+    let sink_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sink_b_addr = sink_b.local_addr().unwrap();
+    for sink in [sink_a, sink_b] {
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            while sink.recv_from(&mut buf).await.is_ok() {}
+        });
+    }
+
+    // A working public-key-keyed relay both nodes dial out to.
+    let relay = Arc::new(
+        RelayServer::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap(),
+    );
+    let relay_addr = relay.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = relay.serve().await;
+    });
+
+    // Relay transports connect with no peers; run_mesh_relayed aligns their tables
+    // from the peer set (using each peer's blackhole endpoint as a stable handle).
+    let relay_a = RelayMeshTransport::connect(relay_addr, a.public.to_bytes(), &[])
+        .await
+        .unwrap();
+    let relay_b = RelayMeshTransport::connect(relay_addr, b.public.to_bytes(), &[])
+        .await
+        .unwrap();
+
+    // Direct endpoints are blackholes; the tunnel can only come up over the relay.
+    let a_peers = vec![MeshPeer::new(
+        Session::from_bytes(a.private.to_bytes(), b.public.to_bytes(), 1).unwrap(),
+        sink_b_addr,
+        vec![cidr("10.8.0.2/32")],
+    )];
+    let b_peers = vec![MeshPeer::new(
+        Session::from_bytes(b.private.to_bytes(), a.public.to_bytes(), 1).unwrap(),
+        sink_a_addr,
+        vec![cidr("10.8.0.1/32")],
+    )];
+
+    let tun_a = MockTun::default();
+    let tun_b = MockTun::default();
+    let inject_a = tun_a.to_runner.clone();
+    let recv_b = tun_b.from_runner.clone();
+
+    let (stop_a_tx, stop_a_rx) = oneshot::channel();
+    let (stop_b_tx, stop_b_rx) = oneshot::channel();
+    let (_ua_tx, ua_rx) = tokio::sync::mpsc::channel(1);
+    let (_ub_tx, ub_rx) = tokio::sync::mpsc::channel(1);
+
+    let ja = tokio::spawn(async move {
+        run_mesh_relayed(
+            tun_a,
+            UdpMeshTransport::from_socket(sock_a),
+            relay_a,
+            a_peers,
+            ua_rx,
+            async {
+                stop_a_rx.await.ok();
+            },
+        )
+        .await
+    });
+    let jb = tokio::spawn(async move {
+        run_mesh_relayed(
+            tun_b,
+            UdpMeshTransport::from_socket(sock_b),
+            relay_b,
+            b_peers,
+            ub_rx,
+            async {
+                stop_b_rx.await.ok();
+            },
+        )
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(700)).await; // handshake over the relay
+
+    let to_b = ipv4([10, 8, 0, 2]);
+    inject_a.lock().unwrap().push_back(to_b.clone());
+
+    let mut b_pkt = None;
+    for _ in 0..100 {
+        b_pkt = b_pkt.or_else(|| recv_b.lock().unwrap().first().cloned());
+        if b_pkt.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let _ = stop_a_tx.send(());
+    let _ = stop_b_tx.send(());
+    let _ = ja.await;
+    let _ = jb.await;
+
+    assert_eq!(
+        b_pkt.expect("B should receive A's packet over the relay fallback when direct is blocked"),
+        to_b
+    );
+}
+
+/// Direct path is **preferred** over an available relay (Phase 4): the dual
+/// underlay runs with a *non-forwarding* relay (a draining sink that registers
+/// nothing and delivers nothing) but correct direct endpoints. The tunnel comes
+/// up over the direct path and data rides it; since the relay forwards nothing,
+/// delivery proves the traffic went direct — and that a dead relay underlay does
+/// not break the direct path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn direct_path_is_used_when_available_despite_a_relay() {
+    let (a, b) = (KeyPair::generate(), KeyPair::generate());
+
+    let sock_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sock_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = sock_a.local_addr().unwrap();
+    let addr_b = sock_b.local_addr().unwrap();
+
+    // A "relay" that never forwards: a draining sink. The relay underlay exists
+    // (each node connects to it) but delivers nothing, so any delivery must be
+    // direct.
+    let dead_relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dead_relay_addr = dead_relay.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        while dead_relay.recv_from(&mut buf).await.is_ok() {}
+    });
+
+    let relay_a = RelayMeshTransport::connect(dead_relay_addr, a.public.to_bytes(), &[])
+        .await
+        .unwrap();
+    let relay_b = RelayMeshTransport::connect(dead_relay_addr, b.public.to_bytes(), &[])
+        .await
+        .unwrap();
+
+    // Correct direct endpoints: the direct path comes up.
+    let a_peers = vec![MeshPeer::new(
+        Session::from_bytes(a.private.to_bytes(), b.public.to_bytes(), 1).unwrap(),
+        addr_b,
+        vec![cidr("10.8.0.2/32")],
+    )];
+    let b_peers = vec![MeshPeer::new(
+        Session::from_bytes(b.private.to_bytes(), a.public.to_bytes(), 1).unwrap(),
+        addr_a,
+        vec![cidr("10.8.0.1/32")],
+    )];
+
+    let tun_a = MockTun::default();
+    let tun_b = MockTun::default();
+    let inject_a = tun_a.to_runner.clone();
+    let recv_b = tun_b.from_runner.clone();
+
+    let (stop_a_tx, stop_a_rx) = oneshot::channel();
+    let (stop_b_tx, stop_b_rx) = oneshot::channel();
+    let (_ua_tx, ua_rx) = tokio::sync::mpsc::channel(1);
+    let (_ub_tx, ub_rx) = tokio::sync::mpsc::channel(1);
+
+    let ja = tokio::spawn(async move {
+        run_mesh_relayed(
+            tun_a,
+            UdpMeshTransport::from_socket(sock_a),
+            relay_a,
+            a_peers,
+            ua_rx,
+            async {
+                stop_a_rx.await.ok();
+            },
+        )
+        .await
+    });
+    let jb = tokio::spawn(async move {
+        run_mesh_relayed(
+            tun_b,
+            UdpMeshTransport::from_socket(sock_b),
+            relay_b,
+            b_peers,
+            ub_rx,
+            async {
+                stop_b_rx.await.ok();
+            },
+        )
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(500)).await; // direct WG handshake
+
+    let to_b = ipv4([10, 8, 0, 2]);
+    inject_a.lock().unwrap().push_back(to_b.clone());
+
+    let mut b_pkt = None;
+    for _ in 0..80 {
+        b_pkt = b_pkt.or_else(|| recv_b.lock().unwrap().first().cloned());
+        if b_pkt.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let _ = stop_a_tx.send(());
+    let _ = stop_b_tx.send(());
+    let _ = ja.await;
+    let _ = jb.await;
+
+    assert_eq!(
+        b_pkt.expect(
+            "B should receive A's packet over the direct path (the relay forwards nothing)"
+        ),
         to_b
     );
 }

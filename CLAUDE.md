@@ -102,12 +102,17 @@ on the new environment before assuming it's still blocked.
 
 - **Phases 1–3:** functionally complete (tunnel; QUIC/MASQUE transports + migration
   + obfuscation + batch I/O; full control plane with ACL/streaming/SQLite/mTLS/OIDC).
-- **Phase 4 (~45%):** mesh data plane (UDP/QUIC/MASQUE) + crypto-demux + roaming,
+- **Phase 4 (~60%):** mesh data plane (UDP/QUIC/MASQUE) + crypto-demux + roaming,
   STUN client + coordinator candidate signaling + candidate gathering/publishing +
-  candidate probing (M1/M2), and a **DERP-style public-key-keyed relay** (`RelayServer`
-  + `RelayMeshTransport`, runnable via `ferrum relay`; M3 mechanism) are built;
-  **automatic relay fallback wiring, path upgrade/downgrade, and the per-peer
-  `idle→relay→connecting→direct` state machine are not** (the remaining M-piece).
+  candidate probing (M1/M2), a **DERP-style public-key-keyed relay** (`RelayServer`
+  + `RelayMeshTransport`, runnable via `ferrum relay`; M3), the per-peer
+  `idle→connecting→relay→direct` **state machine** (`tunnel::path`), and now its
+  **automatic relay-fallback wiring with path upgrade/downgrade** (`run_mesh_relayed`
+  runs direct + relay underlays at once; the `PathMachine` selects per peer; a peer
+  comes up over the relay and upgrades to direct when punched) are all built. The
+  NAT-traversal *data plane* is complete; remaining is the **bring-up plumbing** —
+  a CLI/coordinator path to advertise a relay and select it (`ferrum up-mesh
+  --relay <addr>` → `run_mesh_relayed`).
 - **Phase 5 (~30%):** shared `FerrumClient` core (M1) + `uniffi` bindings (Swift/Kotlin
   generate from `FfiFerrumClient`) + data-plane glue (`run_mesh_session`) + the
   TUN-from-fd FFI entry (`device::from_fd` + `FfiFerrumClient::run`/`stop`) + a Tauri
@@ -118,10 +123,11 @@ on the new environment before assuming it's still blocked.
 
 ## Recommended next work (highest-value, buildable in Rust)
 
-1. **Phase 4 — NAT traversal**: coordinator signaling for ICE candidate exchange
-   (extend the gRPC streams), STUN client for server-reflexive candidates, a
-   DERP-style relay keyed by public key, and the per-peer `idle→relay→connecting→
-   direct` state machine with path upgrade/downgrade. All expressible in Rust.
+1. **Phase 4 — relay bring-up plumbing**: the NAT-traversal data plane is done
+   (signaling, STUN, relay, state machine, automatic fallback via `run_mesh_relayed`).
+   What remains is config/CLI: let the coordinator advertise a relay address and
+   have `ferrum up-mesh --relay <addr>` (and the desktop/client-core bring-up)
+   construct a `RelayMeshTransport` and call `run_mesh_relayed`.
 2. **Phase 5 — desktop data plane** ✅ *(done)*: the Tauri shell's "connect" opens a
    TUN (Linux `/dev/net/tun`, root) and runs `run_mesh_session`, so the GUI moves
    packets. Follow-up: a privileged helper so the GUI need not run as root, and
