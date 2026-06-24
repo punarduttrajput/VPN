@@ -87,3 +87,5 @@ button:disabled { opacity: .4; cursor: not-allowed; }
 .log { max-height: 160px; overflow-y: auto; }
 .log .ts { color: var(--muted); margin-right: 6px; }
 .log .err { color: var(--err); }
+.toggle { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 13px; color: var(--muted); }
+.toggle input { width: auto; }

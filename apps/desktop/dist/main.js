@@ -10,6 +10,13 @@ const peerCountEl = $("peer-count");
 const logEl = $("log");
 const connectBtn = $("connect");
 const disconnectBtn = $("disconnect");
+const killSwitchEl = $("kill_switch");
+const killSwitchStateEl = $("kill-switch-state");
+
+function setKillSwitchState(blocked) {
+  killSwitchStateEl.textContent = blocked ? "blocking" : (killSwitchEl.checked ? "armed" : "off");
+  killSwitchStateEl.className = "badge" + (blocked ? " err" : "");
+}
 
 const STATES = ["disconnected", "connecting", "connected", "reconnecting", "failed"];
 
@@ -72,6 +79,12 @@ disconnectBtn.addEventListener("click", async () => {
   await invoke("disconnect");
 });
 
+killSwitchEl.addEventListener("change", async () => {
+  await invoke("set_kill_switch", { enabled: killSwitchEl.checked });
+  setKillSwitchState(false);
+  log(`kill-switch ${killSwitchEl.checked ? "armed" : "disarmed"}`);
+});
+
 // Live events from the core: state changes, peer updates, errors.
 listen("client-event", (event) => {
   const e = event.payload;
@@ -83,11 +96,16 @@ listen("client-event", (event) => {
     refreshPeers();
   } else if (e.kind === "error") {
     log(e.message, true);
+  } else if (e.kind === "kill-switch") {
+    setKillSwitchState(e.blocked);
+    log(e.blocked ? "kill-switch: blocking non-tunnel traffic" : "kill-switch: traffic allowed");
   }
 });
 
 // Initial paint from current backend state.
 (async () => {
   setState(await invoke("get_status"));
+  killSwitchEl.checked = await invoke("kill_switch_enabled");
+  setKillSwitchState(false);
   refreshPeers();
 })();
