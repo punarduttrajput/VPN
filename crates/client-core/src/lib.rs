@@ -18,6 +18,7 @@
 pub mod client;
 pub use client::{
     ClientEvent, ClientIdentity, ConnectionState, FerrumClient, PeerPath, PeerStatus,
+    ReconnectPolicy,
 };
 
 #[cfg(feature = "uniffi")]

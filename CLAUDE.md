@@ -116,24 +116,33 @@ on the new environment before assuming it's still blocked.
   local-override-else-advertised in `up-mesh` / `run_mesh_session` / the FFI).
   Remaining is hardening only: fuller ICE pairing/prioritization and a desktop-GUI
   relay/STUN field.
-- **Phase 5 (~30%):** shared `FerrumClient` core (M1) + `uniffi` bindings (Swift/Kotlin
+- **Phase 5 (~35%):** shared `FerrumClient` core (M1) + `uniffi` bindings (Swift/Kotlin
   generate from `FfiFerrumClient`) + data-plane glue (`run_mesh_session`) + the
   TUN-from-fd FFI entry (`device::from_fd` + `FfiFerrumClient::run`/`stop`) + a Tauri
   desktop shell (`apps/desktop`) whose **`connect` now drives the real data plane**
-  (opens a TUN + runs `data_plane::run_mesh_session`). No reliability features yet;
-  iOS/Android shells and a privileged-helper for the desktop TUN remain.
+  (opens a TUN + runs `data_plane::run_mesh_session`) + the **reliability core (FR5)**:
+  `connect_with_retry` (exponential-backoff auto-reconnect via the `Reconnecting`
+  state, cancellable by `disconnect`) and a kill-switch policy
+  (`set_kill_switch`/`traffic_blocked` + a `TrafficBlocked` change event), all FFI-exposed.
+  Remaining: iOS/Android shells, a privileged-helper for the desktop TUN, data-plane
+  auto-restart on drop, and shell-side kill-switch firewall enforcement.
 - **Phase 6 (~5%):** only `sendmmsg` batching; eBPF/XDP, anycast, scale not started.
 
 ## Recommended next work (highest-value, buildable in Rust)
 
-1. **Phase 5 — reliability**: kill-switch / always-on / reconnect on the
-   `FerrumClient` facade (Phase 4 NAT traversal is now functionally complete:
+1. **Phase 5 — reliability (facade core done)** 🟡: `connect_with_retry`
+   (exponential-backoff auto-reconnect) + a kill-switch policy (`set_kill_switch`/
+   `traffic_blocked` + `TrafficBlocked` event) now land on the `FerrumClient` facade
+   and FFI. Remaining: **data-plane auto-restart** (a shell reruns `run_mesh_session`
+   when `connect_with_retry` resolves) and **shell-side kill-switch firewall
+   enforcement** — both per-platform. (Phase 4 NAT traversal is functionally complete:
    signaling, STUN, relay, state machine, automatic fallback, and both local +
-   coordinator-advertised relay selection all land). Optional Phase 4 hardening:
-   fuller ICE candidate-pair prioritization; a desktop-GUI relay/STUN field.
+   coordinator-advertised relay selection all land. Optional Phase 4 hardening: fuller
+   ICE candidate-pair prioritization; a desktop-GUI relay/STUN field.)
 2. **Phase 5 — desktop data plane** ✅ *(done)*: the Tauri shell's "connect" opens a
    TUN (Linux `/dev/net/tun`, root) and runs `run_mesh_session`, so the GUI moves
    packets. Follow-up: a privileged helper so the GUI need not run as root, and
    QUIC/MASQUE transport selection.
-3. **Phase 5 — reliability**: kill-switch / always-on / reconnect on the facade.
+3. **Phase 5 — native shells**: iOS (NetworkExtension + SwiftUI) / Android
+   (FerrumService + Compose) over the existing `uniffi` bindings.
 4. **Phase 6 / NFR1**: real-hardware throughput; UDP GSO/GRO; eBPF/XDP fast path (Linux).

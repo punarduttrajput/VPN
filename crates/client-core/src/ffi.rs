@@ -22,6 +22,7 @@ use tokio::sync::{broadcast, Mutex};
 
 use crate::{
     ClientEvent, ClientIdentity, ConnectionState, Error, FerrumClient, PeerSpec, PeerStatus,
+    ReconnectPolicy,
 };
 
 /// FFI handle to a VPN client. Construct with [`FfiFerrumClient::new`], then drive
@@ -64,9 +65,44 @@ impl FfiFerrumClient {
         self.inner.connect(coordinator, &identity).await
     }
 
-    /// Tear down the session view and return to `Disconnected`.
+    /// Connect with automatic reconnect (FR5): on failure, transition to
+    /// `Reconnecting` and retry with exponential backoff per `policy` rather than
+    /// failing at the first error. Resolves once connected, or errors once the
+    /// retries are exhausted. A `disconnect` cancels an in-flight loop.
+    pub async fn connect_with_retry(
+        &self,
+        coordinator: String,
+        identity: ClientIdentity,
+        policy: ReconnectPolicy,
+    ) -> Result<(), Error> {
+        self.inner
+            .connect_with_retry(coordinator, &identity, &policy)
+            .await
+    }
+
+    /// Tear down the session view and return to `Disconnected`. Also cancels any
+    /// in-flight `connect_with_retry` loop.
     pub fn disconnect(&self) {
         self.inner.disconnect()
+    }
+
+    /// Arm or disarm the kill-switch (FR5). When armed, non-tunnel traffic should
+    /// be blocked whenever the tunnel is not `Connected`; observe the live intent
+    /// via [`traffic_blocked`](FfiFerrumClient::traffic_blocked) and the
+    /// `TrafficBlocked` event, and enforce it in the platform shell's firewall.
+    pub fn set_kill_switch(&self, enabled: bool) {
+        self.inner.set_kill_switch(enabled)
+    }
+
+    /// Whether the kill-switch is armed (the policy choice).
+    pub fn kill_switch_enabled(&self) -> bool {
+        self.inner.kill_switch_enabled()
+    }
+
+    /// Whether non-tunnel traffic should be blocked right now (kill-switch armed
+    /// and tunnel not `Connected`).
+    pub fn traffic_blocked(&self) -> bool {
+        self.inner.traffic_blocked()
     }
 
     /// The current connection state.
