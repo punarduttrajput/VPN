@@ -133,10 +133,11 @@ on the new environment before assuming it's still blocked.
   allow-listing loopback/tunnel/coordinator; Linux — see `apps/desktop/.../killswitch.rs`).
   Remaining: iOS/Android shells, a privileged-helper for the desktop TUN, and macOS/Windows
   kill-switch enforcement.
-- **Phase 6 (~10%):** `sendmmsg` batching + **coordinator observability M1 started**
-  (privacy-preserving Prometheus metrics on `--metrics-listen`'s `/metrics`: aggregate
-  RPC counters + device/active-stream gauges, no per-user/flow labels — NFR5; hand-rolled,
-  dependency-free). eBPF/XDP, anycast, autoscaling, relay metrics + tracing not started.
+- **Phase 6 (~12%):** `sendmmsg` batching + **observability M1 metrics done for coordinator
+  *and* relay** (privacy-preserving Prometheus metrics on a `--metrics-listen` `/metrics`
+  endpoint each: aggregate RPC/forwarding counters + gauges, no per-user/flow labels — NFR5;
+  hand-rolled, dependency-free). eBPF/XDP, anycast, autoscaling, and `tracing`/OTel spans not
+  started.
 
 ## Recommended next work (highest-value, buildable in Rust)
 
@@ -155,7 +156,7 @@ on the new environment before assuming it's still blocked.
    ICE candidate-pair prioritization; a desktop-GUI relay/STUN field.)
 2. **Phase 5 — native shells**: iOS (NetworkExtension + SwiftUI) / Android
    (FerrumService + Compose) over the existing `uniffi` bindings (needs Apple/Android toolchains).
-3. **Phase 6 — observability (M1, buildable here)** 🟡: coordinator Prometheus metrics
-   land (`--metrics-listen` → `/metrics`, aggregate counts only per NFR5). Next: relay
-   metrics (relay-vs-direct, forwarded packet counts) + `tracing`/OpenTelemetry spans.
+3. **Phase 6 — observability (M1, buildable here)** 🟡: coordinator *and* relay Prometheus
+   metrics land (`--metrics-listen` → `/metrics` on each, aggregate counts only per NFR5).
+   Next: `tracing`/OpenTelemetry spans across the coordinator/relay request paths.
 4. **Phase 6 / NFR1**: real-hardware throughput; UDP GSO/GRO; eBPF/XDP fast path (Linux).
