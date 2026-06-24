@@ -11,17 +11,16 @@ use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use tokio::sync::mpsc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use ferrum_client_core::{ControlClient, PeerSpec};
+use ferrum_client_core::data_plane::run_mesh_session_supervised;
+use ferrum_client_core::{ClientIdentity, ControlClient, FerrumClient, ReconnectPolicy};
 use ferrum_core::config::{Cidr, Config, TransportMode};
 use ferrum_core::keys::KeyPair;
 use ferrum_transport::{JitteredTransport, UdpMeshTransport, UdpTransport};
 use ferrum_tunnel::device::{self, TunConfig};
 use ferrum_tunnel::session::Session;
-use ferrum_tunnel::{run_mesh, run_mesh_relayed, MeshPeer};
 
 #[derive(Parser)]
 #[command(name = "ferrum", version, about = "Ferrum — Phase 1 MVP tunnel")]
@@ -298,8 +297,17 @@ async fn up(config_path: &str, iface: &str, mtu: u16) -> Result<()> {
     Ok(())
 }
 
-/// Phase 3 FR6: register with the coordinator, turn the returned network map into
-/// a multi-peer mesh, and run it until interrupted.
+/// Phase 3 FR6 + Phase 5 FR5: join a coordinator-managed mesh and run a
+/// **self-healing** multi-peer data plane until interrupted.
+///
+/// Registers once up front to learn the coordinator-assigned tunnel address (so
+/// the TUN can be configured with it), gathers/publishes NAT-traversal candidates,
+/// then hands a [`FerrumClient`] facade and device/transport *factories* to
+/// [`run_mesh_session_supervised`], which registers, converges the mesh from
+/// `WatchNetworkMap`, and **auto-reconnects with backoff** on any drop (coordinator
+/// outage, transport failure) — re-opening the TUN and rebinding the socket each
+/// attempt. An OIDC bearer token (`--token-file`), when given, authenticates every
+/// coordinator RPC, including each reconnect.
 #[allow(clippy::too_many_arguments)]
 async fn up_mesh(
     config_path: &str,
@@ -317,17 +325,30 @@ async fn up_mesh(
     let public_key = ferrum_core::keys::public_base64_from_private(&config.private_key)
         .context("deriving public key from config private_key")?;
 
+    // Optional OIDC bearer token, read from a file so it stays out of the process
+    // list. Applied to every coordinator RPC the data plane makes (and each
+    // reconnect) via the facade.
+    let token = match token_file {
+        Some(path) => {
+            let raw = std::fs::read_to_string(path)
+                .with_context(|| format!("reading OIDC token from '{path}'"))?;
+            info!("attaching OIDC bearer token to coordinator requests");
+            Some(raw.trim().to_string())
+        }
+        None => None,
+    };
+
+    // Register once up front to learn our coordinator-assigned tunnel address — we
+    // need it to configure the TUN before the data plane runs. The supervised
+    // session re-registers idempotently each attempt; the allocation is stable.
     info!(coordinator, "registering with coordinator");
-    let mut client = ControlClient::connect(coordinator.to_string())
+    let mut control = ControlClient::connect(coordinator.to_string())
         .await
         .with_context(|| format!("connecting to coordinator at {coordinator}"))?;
-    if let Some(path) = token_file {
-        let token = std::fs::read_to_string(path)
-            .with_context(|| format!("reading OIDC token from '{path}'"))?;
-        client = client.with_token(token.trim().to_string());
-        info!("attaching OIDC bearer token to coordinator requests");
+    if let Some(token) = &token {
+        control = control.with_token(token.clone());
     }
-    let address = client
+    let address = control
         .register(&public_key, name, endpoint, tags)
         .await
         .context("registering with coordinator")?;
@@ -351,12 +372,14 @@ async fn up_mesh(
             tracing::warn!("no NAT-traversal candidates gathered (STUN unreachable?)");
         } else {
             info!(?candidates, "publishing NAT-traversal candidates");
-            client
+            control
                 .publish_candidates(&public_key, &candidates)
                 .await
                 .context("publishing candidates to coordinator")?;
         }
     }
+    // The supervised session opens its own (token-carrying) control channels.
+    drop(control);
 
     let iface_cidr: Cidr = address
         .parse()
@@ -371,87 +394,86 @@ async fn up_mesh(
         address: iface_cidr,
         mtu: effective_mtu,
     };
-    let dev = device::open(&tun_cfg)
-        .context("opening TUN device (needs elevated privileges on Linux/macOS)")?;
-    info!(interface = %iface, mtu = effective_mtu, "TUN device up");
-
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", config.listen_port).parse()?;
 
-    // Subscribe to live network-map updates and feed converted peer sets into the
-    // mesh, so membership converges no matter who registered first.
-    let mut stream = client
-        .watch(&public_key)
-        .await
-        .context("subscribing to network-map updates")?;
-    let (tx, rx) = mpsc::channel::<Vec<MeshPeer>>(8);
+    // The shared facade carries the token (so its control channels and every
+    // reconnect authenticate). The relay is resolved inside the session: a local
+    // `transport.relay` override else whatever the coordinator advertises.
+    let client = FerrumClient::new();
+    client.set_token(token);
+    let identity = ClientIdentity {
+        public_key: public_key.clone(),
+        name: name.to_string(),
+        endpoint: endpoint.to_string(),
+        tags: tags.to_vec(),
+    };
+    let policy = ReconnectPolicy::default();
+    let relay = config.transport.relay.clone();
     let priv_b64 = config.private_key.clone();
-    let watcher = tokio::spawn(async move {
-        loop {
-            match stream.next().await {
-                Ok(Some(specs)) => match build_mesh_peers(&priv_b64, &specs) {
-                    Ok(peers) => {
-                        if tx.send(peers).await.is_err() {
-                            break; // data plane stopped
-                        }
-                    }
-                    Err(e) => tracing::warn!("ignoring unusable network map: {e:#}"),
-                },
-                Ok(None) => break, // stream ended
-                Err(e) => {
-                    tracing::warn!("network-map stream error: {e}");
-                    break;
-                }
+
+    // Factory that (re)opens the OS TUN for each session attempt — a session
+    // consumes and closes its device, so a reconnect rebuilds it.
+    let make_device = {
+        let tun_cfg = tun_cfg.clone();
+        move || {
+            let tun_cfg = tun_cfg.clone();
+            async move {
+                device::open(&tun_cfg).map_err(|e| {
+                    ferrum_client_core::Error::DataPlane(format!(
+                        "opening TUN device (needs elevated privileges on Linux/macOS): {e:#}"
+                    ))
+                })
             }
         }
-    });
-
-    // Optional relay fallback underlay (Phase 4): runs alongside the chosen direct
-    // transport, selected per peer by the path state machine. A local
-    // `transport.relay` override wins; otherwise use whatever relay the
-    // coordinator advertises for the network. Connect with no peers — the data
-    // plane aligns the relay's key table from the network map.
-    let relay_addr = match config.transport.relay.clone() {
-        Some(r) => Some(r),
-        None => client
-            .advertised_relay(&public_key)
-            .await
-            .context("querying advertised relay")?,
-    };
-    let relay = match relay_addr {
-        Some(r) => {
-            let addr: SocketAddr = r.parse().with_context(|| format!("relay address '{r}'"))?;
-            let self_key = ferrum_core::keys::decode_key(&public_key)
-                .context("decoding our public key for the relay")?;
-            info!(relay = %addr, "relay fallback enabled");
-            Some(
-                ferrum_transport::RelayMeshTransport::connect(addr, self_key, &[])
-                    .await
-                    .with_context(|| format!("connecting to relay at {addr}"))?,
-            )
-        }
-        None => None,
     };
 
-    info!("starting mesh data plane (Ctrl-C to stop)");
-    // Start with an empty mesh; the watch stream delivers the current peer set
-    // immediately, then updates as the network changes. Pick the mesh transport
-    // from the config's transport mode.
+    info!("starting mesh data plane (auto-reconnect; Ctrl-C to stop)");
+    // Candidates were published above; the supervised session re-resolves the
+    // relay and re-converges peers each attempt. Pick the transport by config mode.
     let result = match config.transport.mode {
         TransportMode::Udp => {
-            let transport = UdpMeshTransport::bind(bind_addr)
-                .await
-                .with_context(|| format!("binding UDP socket on {bind_addr}"))?;
             info!("mesh transport: udp");
-            drive_mesh(dev, transport, relay, rx, shutdown_signal()).await
+            let make_transport = move || async move {
+                UdpMeshTransport::bind(bind_addr)
+                    .await
+                    .map_err(|e| ferrum_client_core::Error::DataPlane(e.to_string()))
+            };
+            run_mesh_session_supervised(
+                &client,
+                coordinator,
+                &identity,
+                &priv_b64,
+                &[],
+                make_device,
+                make_transport,
+                relay,
+                &policy,
+                shutdown_signal(),
+            )
+            .await
         }
         TransportMode::Quic => {
             #[cfg(feature = "quic")]
             {
-                let transport = ferrum_transport::QuicMeshTransport::bind(bind_addr)
-                    .await
-                    .with_context(|| format!("binding QUIC mesh endpoint on {bind_addr}"))?;
                 info!("mesh transport: quic");
-                drive_mesh(dev, transport, relay, rx, shutdown_signal()).await
+                let make_transport = move || async move {
+                    ferrum_transport::QuicMeshTransport::bind(bind_addr)
+                        .await
+                        .map_err(|e| ferrum_client_core::Error::DataPlane(e.to_string()))
+                };
+                run_mesh_session_supervised(
+                    &client,
+                    coordinator,
+                    &identity,
+                    &priv_b64,
+                    &[],
+                    make_device,
+                    make_transport,
+                    relay,
+                    &policy,
+                    shutdown_signal(),
+                )
+                .await
             }
             #[cfg(not(feature = "quic"))]
             {
@@ -481,9 +503,28 @@ async fn up_mesh(
                     .as_deref()
                     .unwrap_or("ferrum")
                     .to_string();
-                let transport = ferrum_transport::MasqueMeshTransport::new(proxy_addr, authority);
                 info!(proxy = %proxy_addr, "mesh transport: masque");
-                drive_mesh(dev, transport, relay, rx, shutdown_signal()).await
+                let make_transport = move || {
+                    let authority = authority.clone();
+                    async move {
+                        Ok::<_, ferrum_client_core::Error>(
+                            ferrum_transport::MasqueMeshTransport::new(proxy_addr, authority),
+                        )
+                    }
+                };
+                run_mesh_session_supervised(
+                    &client,
+                    coordinator,
+                    &identity,
+                    &priv_b64,
+                    &[],
+                    make_device,
+                    make_transport,
+                    relay,
+                    &policy,
+                    shutdown_signal(),
+                )
+                .await
             }
             #[cfg(not(feature = "masque"))]
             {
@@ -494,53 +535,9 @@ async fn up_mesh(
             }
         }
     };
-    watcher.abort();
-    result?;
+    result.context("supervised mesh data plane")?;
     info!("tunnel stopped");
     Ok(())
-}
-
-/// Turn the coordinator's peer list into mesh sessions keyed by our private key.
-///
-/// Each peer gets its own [`Session`] (with a distinct local index) over the one
-/// shared UDP socket; outbound packets are routed to a peer by its `allowed_ips`.
-fn build_mesh_peers(private_key_b64: &str, peers: &[PeerSpec]) -> Result<Vec<MeshPeer>> {
-    let priv_bytes =
-        ferrum_core::keys::decode_key(private_key_b64).context("decoding private key")?;
-    peers
-        .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            let pub_bytes = ferrum_core::keys::decode_key(&p.public_key)
-                .with_context(|| format!("decoding peer public key '{}'", p.public_key))?;
-            let endpoint: SocketAddr = p
-                .endpoint
-                .parse()
-                .with_context(|| format!("parsing peer endpoint '{}'", p.endpoint))?;
-            let allowed_ips = p
-                .allowed_ips
-                .iter()
-                .map(|c| c.parse::<Cidr>())
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .with_context(|| format!("parsing allowed_ips for peer '{}'", p.public_key))?;
-            // ICE candidates (host + STUN reflexive) to probe for a working path;
-            // skip any that don't parse rather than failing the whole peer.
-            let candidates = p
-                .candidates
-                .iter()
-                .filter_map(|c| c.parse::<SocketAddr>().ok())
-                .collect::<Vec<_>>();
-            // Local session indices must be distinct per peer; +1 keeps them non-zero.
-            let session = Session::from_bytes(priv_bytes, pub_bytes, (i as u32) + 1)
-                .with_context(|| format!("building session for peer '{}'", p.public_key))?;
-            Ok(MeshPeer::with_candidates(
-                session,
-                endpoint,
-                allowed_ips,
-                candidates,
-            ))
-        })
-        .collect()
 }
 
 /// Default padded datagram size when `padding` is on but `pad_to` is unset.
@@ -597,32 +594,6 @@ where
     Ok(())
 }
 
-/// Run the mesh data plane, adding a relay fallback underlay when one is
-/// configured (Phase 4 NAT traversal). With a relay both underlays run at once
-/// and the per-peer path machine selects between them; without one it is
-/// direct-only — identical to the prior behavior.
-async fn drive_mesh<D, M>(
-    device: D,
-    transport: M,
-    relay: Option<ferrum_transport::RelayMeshTransport>,
-    updates: mpsc::Receiver<Vec<MeshPeer>>,
-    shutdown: impl std::future::Future<Output = ()>,
-) -> Result<()>
-where
-    D: ferrum_tunnel::device::TunDevice + Send + 'static,
-    M: ferrum_transport::MeshTransport + Send + 'static,
-{
-    match relay {
-        Some(relay) => run_mesh_relayed(device, transport, relay, Vec::new(), updates, shutdown)
-            .await
-            .context("mesh data plane")?,
-        None => run_mesh(device, transport, Vec::new(), updates, shutdown)
-            .await
-            .context("mesh data plane")?,
-    }
-    Ok(())
-}
-
 /// QUIC's conservative initial datagram size is ~1180 B; keep the inner MTU
 /// below it (minus WireGuard's 32 B overhead) so packets are not dropped.
 const QUIC_TUN_MTU: u16 = 1100;
@@ -648,71 +619,5 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn peer(public_key: &str, endpoint: &str, allowed: &[&str]) -> PeerSpec {
-        PeerSpec {
-            public_key: public_key.to_string(),
-            endpoint: endpoint.to_string(),
-            allowed_ips: allowed.iter().map(|s| s.to_string()).collect(),
-            candidates: vec![],
-        }
-    }
-
-    #[test]
-    fn builds_one_mesh_peer_per_plan_peer() {
-        let me = KeyPair::generate();
-        let b = KeyPair::generate();
-        let c = KeyPair::generate();
-
-        let peers = build_mesh_peers(
-            &me.private_base64(),
-            &[
-                peer(&b.public_base64(), "2.2.2.2:51820", &["10.8.0.3/32"]),
-                peer(&c.public_base64(), "3.3.3.3:51820", &["10.8.0.4/32"]),
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(peers.len(), 2);
-        assert_eq!(peers[0].endpoint, "2.2.2.2:51820".parse().unwrap());
-        assert_eq!(peers[0].allowed_ips, vec!["10.8.0.3/32".parse().unwrap()]);
-        assert_eq!(peers[1].endpoint, "3.3.3.3:51820".parse().unwrap());
-        assert_eq!(peers[1].allowed_ips, vec!["10.8.0.4/32".parse().unwrap()]);
-    }
-
-    #[test]
-    fn empty_plan_yields_no_peers() {
-        let me = KeyPair::generate();
-        assert!(build_mesh_peers(&me.private_base64(), &[])
-            .unwrap()
-            .is_empty());
-    }
-
-    #[test]
-    fn rejects_malformed_peer_endpoint() {
-        let me = KeyPair::generate();
-        let b = KeyPair::generate();
-        let err = build_mesh_peers(
-            &me.private_base64(),
-            &[peer(&b.public_base64(), "not-a-socket", &["10.8.0.3/32"])],
-        );
-        assert!(err.is_err());
-    }
-
-    #[test]
-    fn rejects_malformed_allowed_ip() {
-        let me = KeyPair::generate();
-        let b = KeyPair::generate();
-        let err = build_mesh_peers(
-            &me.private_base64(),
-            &[peer(&b.public_base64(), "2.2.2.2:51820", &["not-a-cidr"])],
-        );
-        assert!(err.is_err());
     }
 }

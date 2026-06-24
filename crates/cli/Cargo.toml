@@ -25,7 +25,7 @@ masque = ["ferrum-tunnel/masque"]
 ferrum-core = { path = "../core" }
 ferrum-tunnel = { path = "../tunnel" }
 ferrum-transport = { path = "../transport" }
-ferrum-client-core = { path = "../client-core" }
+ferrum-client-core = { path = "../client-core", features = ["data-plane"] }
 clap.workspace = true
 tokio.workspace = true
 tracing.workspace = true

@@ -20,7 +20,7 @@ traversal, and kernel-level scale work are the remaining frontier.
 | `ferrum-core` | Keys, config, errors. `#![forbid(unsafe_code)]`. |
 | `ferrum-transport` | `Transport` (point-to-point) + `MeshTransport` (multi-peer) traits; UDP, QUIC (`quic`), MASQUE (`masque`) impls, padding + jitter decorators. |
 | `ferrum-tunnel` | boringtun session wrapper, `TunDevice` trait (real on Unix behind `real-tun`, mock otherwise), point-to-point `run` and multi-peer `run_mesh`. |
-| `ferrum-cli` | `ferrum` binary: `keygen`, `up` (point-to-point), `up-mesh` (coordinator mesh). |
+| `ferrum-cli` | `ferrum` binary: `keygen`, `up` (point-to-point), `up-mesh` (coordinator mesh, runs on the supervised `FerrumClient` session → auto-reconnect), `relay`. |
 | `ferrum-control-proto` | gRPC `Coordinator` contract (tonic/prost, vendored `protoc`). |
 | `ferrum-coordinator` | Coordinator: registry, IP allocation, network map, ACL/policy, streaming, SQLite (`sqlite`), mTLS (`mtls`), OIDC (`oidc`). |
 | `ferrum-client-core` | `ControlClient` (gRPC) + `FerrumClient` (Phase 5 facade: connection state machine + event stream). `uniffi` feature exposes `FfiFerrumClient` → generated Swift/Kotlin (incl. `run(tun_fd,…)`/`stop()` with `data-plane`). `data-plane` feature adds `run_mesh_session` (ties the facade to `ferrum-tunnel::run_mesh`; consumes a `device::from_fd` TUN). |
@@ -136,10 +136,12 @@ on the new environment before assuming it's still blocked.
    (exponential-backoff control-plane reconnect) + a kill-switch policy (`set_kill_switch`/
    `traffic_blocked` + `TrafficBlocked` event) + `data_plane::run_mesh_session_supervised`
    (data-plane auto-restart with backoff via device/transport factories) now land on the
-   `FerrumClient` facade / data-plane glue and FFI. Remaining: **adopt the supervisor in
-   the CLI + shells** (each supplies a factory that re-acquires its OS TUN — the FFI's
-   `run` `tun_fd` is single-use since `from_fd` closes it on drop) and **shell-side
-   kill-switch firewall enforcement** — both per-platform. (Phase 4 NAT traversal is functionally complete:
+   `FerrumClient` facade / data-plane glue and FFI, and **`ferrum up-mesh` runs on the
+   supervisor** (always-on auto-reconnect; OIDC token carried via `FerrumClient::set_token`).
+   Remaining: **adopt the supervisor in the desktop/mobile shells** (each supplies a factory
+   that re-acquires its OS TUN — the FFI's `run` `tun_fd` is single-use since `from_fd`
+   closes it on drop) and **shell-side kill-switch firewall enforcement** — both per-platform.
+   (Phase 4 NAT traversal is functionally complete:
    signaling, STUN, relay, state machine, automatic fallback, and both local +
    coordinator-advertised relay selection all land. Optional Phase 4 hardening: fuller
    ICE candidate-pair prioritization; a desktop-GUI relay/STUN field.)

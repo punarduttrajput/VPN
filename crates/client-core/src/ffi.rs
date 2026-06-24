@@ -86,6 +86,13 @@ impl FfiFerrumClient {
         self.inner.disconnect()
     }
 
+    /// Attach (or clear) an OIDC bearer token applied to every coordinator RPC —
+    /// required when the coordinator runs with OIDC auth. Set it before
+    /// `connect`/`run`; it is re-read on every reconnect.
+    pub fn set_token(&self, token: Option<String>) {
+        self.inner.set_token(token)
+    }
+
     /// Arm or disarm the kill-switch (FR5). When armed, non-tunnel traffic should
     /// be blocked whenever the tunnel is not `Connected`; observe the live intent
     /// via [`traffic_blocked`](FfiFerrumClient::traffic_blocked) and the
