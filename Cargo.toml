@@ -56,5 +56,13 @@ anyhow = "1"
 # logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# OpenTelemetry span export (Phase 6 FR4, `otlp` feature). Optional — pulled in
+# only by the binaries' `otlp` feature so default builds stay lean. The OTLP
+# exporter speaks gRPC to a collector (default :4317). Versions kept in lock-step
+# (otel 0.32 / sdk 0.32 / otlp 0.32 / tracing-opentelemetry 0.33).
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace"] }
+tracing-opentelemetry = "0.33"
 # platform-specific (Linux sendmmsg / recvmmsg for UDP batching, NFR1)
 libc = "0.2"

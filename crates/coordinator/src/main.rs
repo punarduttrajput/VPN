@@ -12,7 +12,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tonic::transport::Server;
 use tracing::{error, info};
-use tracing_subscriber::EnvFilter;
 
 fn arg_value(flag: &str) -> Option<String> {
     std::env::args().skip_while(|a| a != flag).nth(1)
@@ -67,11 +66,13 @@ async fn serve_metrics(addr: SocketAddr, metrics: Arc<Metrics>, registry: Arc<Mu
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    // Tracing: stderr logs always; OTLP span export (PRD Phase 6 FR4) when
+    // --otlp-endpoint <url> is given and the `otlp` feature is built. The guard
+    // flushes the exporter on drop, so it must outlive `serve`.
+    let _telemetry = ferrum_coordinator::telemetry::init(
+        arg_value("--otlp-endpoint").as_deref(),
+        "ferrum-coordinator",
+    );
 
     let listen: SocketAddr = arg_value("--listen")
         .unwrap_or_else(|| "0.0.0.0:50051".to_string())

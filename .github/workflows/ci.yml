@@ -89,6 +89,15 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo clippy -p ferrum-coordinator --all-targets --features oidc -- -D warnings
 
+      # Phase 6 FR4: exercise the OTLP span-export wiring on the coordinator + CLI
+      # (compiles the OpenTelemetry exporter stack; export itself needs a collector).
+      - name: Test (otlp feature)
+        run: cargo test -p ferrum-coordinator -p ferrum-cli --features ferrum-coordinator/otlp,ferrum-cli/otlp
+
+      - name: clippy (otlp feature)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo clippy -p ferrum-coordinator -p ferrum-cli --all-targets --features ferrum-coordinator/otlp,ferrum-cli/otlp -- -D warnings
+
   # Real-device + benchmark verification (M3 / M5 / M6) on a Linux runner.
   verify-linux:
     name: verify-linux (M3/M5/M6)

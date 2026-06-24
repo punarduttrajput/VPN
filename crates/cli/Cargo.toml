@@ -20,6 +20,14 @@ default = []
 quic = ["ferrum-tunnel/quic"]
 # Build with the MASQUE / HTTP3 transport available.
 masque = ["ferrum-tunnel/masque"]
+# Export the relay's tracing spans to an OTLP collector (PRD Phase 6 FR4) via
+# `ferrum relay --otlp-endpoint <url>`. Optional so default builds stay lean.
+otlp = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+]
 
 [dependencies]
 ferrum-core = { path = "../core" }
@@ -31,3 +39,7 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
