@@ -34,18 +34,27 @@ pub struct TunConfig {
     pub mtu: u16,
 }
 
-#[cfg(all(unix, feature = "real-tun"))]
+#[cfg(all(any(unix, windows), feature = "real-tun"))]
 mod imp {
     use super::*;
     use tun::AsyncDevice;
 
-    /// Real Unix TUN device backed by the `tun` crate.
-    pub struct UnixTun {
+    /// Real OS TUN device backed by the `tun` crate — `/dev/net/tun` (or the
+    /// macOS utun) on Unix, the **wintun** adapter on Windows. The crate exposes
+    /// the same `AsyncDevice` (impl tokio `AsyncRead`/`AsyncWrite`) on every
+    /// platform, so the I/O path below is shared; only adapter creation differs
+    /// (and the `tun` crate handles that per-platform).
+    ///
+    /// Windows note: the wintun adapter takes an **IPv4** address (the crate sets
+    /// it via `netsh`); an IPv6 tunnel address is not yet supported there and
+    /// fails at [`Self::open`].
+    pub struct RealTun {
         dev: AsyncDevice,
     }
 
-    impl UnixTun {
-        /// Create and bring up the interface (requires elevated privileges).
+    impl RealTun {
+        /// Create and bring up the interface (requires elevated privileges; on
+        /// Windows also requires `wintun.dll` to be loadable at runtime).
         pub fn open(cfg: &TunConfig) -> Result<Self> {
             let mut tcfg = tun::Configuration::default();
             tcfg.name(&cfg.name)
@@ -53,21 +62,17 @@ mod imp {
                 .mtu(cfg.mtu as i32)
                 .up();
             // Netmask derived from prefix for IPv4.
-            if let std::net::IpAddr::V4(_) = cfg.address.addr {
+            if cfg.address.addr.is_ipv4() {
                 let mask = prefix_to_netmask_v4(cfg.address.prefix);
                 tcfg.netmask(mask);
             }
-            let dev = tun::create_as_async(&tcfg).map_err(|e| {
-                crate::TunnelError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
+            let dev = tun::create_as_async(&tcfg)
+                .map_err(|e| crate::TunnelError::Io(std::io::Error::other(e.to_string())))?;
             Ok(Self { dev })
         }
     }
 
-    impl TunDevice for UnixTun {
+    impl TunDevice for RealTun {
         async fn read_packet(&mut self, buf: &mut [u8]) -> Result<usize> {
             use tokio::io::AsyncReadExt as _;
             let n = self.dev.read(buf).await?;
@@ -92,22 +97,25 @@ mod imp {
 }
 
 /// Open the platform TUN device, or fail with [`crate::TunnelError::UnsupportedPlatform`].
-#[cfg(all(unix, feature = "real-tun"))]
+#[cfg(all(any(unix, windows), feature = "real-tun"))]
 pub fn open(cfg: &TunConfig) -> Result<impl TunDevice> {
-    imp::UnixTun::open(cfg)
+    imp::RealTun::open(cfg)
 }
 
-/// Stub when the real device is unavailable (no `real-tun` feature, or non-Unix).
-#[cfg(not(all(unix, feature = "real-tun")))]
+/// Stub when the real device is unavailable (no `real-tun` feature, or a platform
+/// without a real backend).
+#[cfg(not(all(any(unix, windows), feature = "real-tun")))]
 pub fn open(_cfg: &TunConfig) -> Result<NoopTun> {
     Err(crate::TunnelError::UnsupportedPlatform)
 }
 
 /// A do-nothing device type used so builds without a real device still type-check.
-#[cfg(not(all(unix, feature = "real-tun")))]
+/// Returned by [`open`] when no real backend is compiled in, and by [`from_fd`] on
+/// non-Unix (where there is no fd-based TUN). Defined unconditionally — and so
+/// unused on platforms that have a real device — hence `allow(dead_code)`.
+#[allow(dead_code)]
 pub struct NoopTun;
 
-#[cfg(not(all(unix, feature = "real-tun")))]
 impl TunDevice for NoopTun {
     async fn read_packet(&mut self, _buf: &mut [u8]) -> Result<usize> {
         Err(crate::TunnelError::UnsupportedPlatform)

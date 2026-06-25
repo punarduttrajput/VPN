@@ -35,17 +35,19 @@ ferrum-transport = { path = "../../../crates/transport", features = ["masque"] }
 ferrum-tunnel = { path = "../../../crates/tunnel" }
 ferrum-core = { path = "../../../crates/core" }
 
-# The real OS TUN device only exists on Unix (Linux/macOS) and pulls in the
-# `tun` driver crate, so enable it only there. On Windows the dev build still
-# compiles; `device::open` returns `UnsupportedPlatform` and `connect` surfaces
-# a clean error to the UI.
+# The real OS TUN device pulls in the `tun` driver crate: `/dev/net/tun` (or the
+# macOS utun) on Unix, the wintun adapter on Windows. Enabled on both so the
+# desktop drives a real data plane on either; `device::open` requires elevation
+# (and on Windows a loadable `wintun.dll`).
 [target.'cfg(unix)'.dependencies]
 ferrum-tunnel = { path = "../../../crates/tunnel", features = ["real-tun"] }
 
 # The kill-switch (FR5) enforces its leak-block via the Windows Filtering Platform
 # on Windows (see src/killswitch.rs `wfp`). Version pinned to the one already in the
 # tree (pulled transitively by Tauri) so the resolver doesn't add a second copy.
+# `ferrum-tunnel/real-tun` here gives the wintun-backed data plane on Windows.
 [target.'cfg(windows)'.dependencies]
+ferrum-tunnel = { path = "../../../crates/tunnel", features = ["real-tun"] }
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
