@@ -148,9 +148,12 @@ on the new environment before assuming it's still blocked.
   permit filters at the `ALE_AUTH_CONNECT` v4/v6 layers, installed in a transaction and torn
   down by filter-id; see `apps/desktop/.../killswitch.rs`).
   Remaining (current scope): an **Android** shell over the `uniffi` Kotlin bindings, a
-  privileged-helper for the desktop TUN, and Windows wintun **IPv6**. **Deferred to a future
-  version:** the **iOS** (NetworkExtension + SwiftUI) shell and **macOS** (`pf`) kill-switch
-  enforcement — both need an Apple toolchain/host this project doesn't target yet.
+  privileged-helper for the desktop TUN, and full Windows wintun **IPv6** (blocked on the
+  `tun` crate being IPv4-only on Windows — an IPv6 address now fails cleanly instead of
+  panicking; the `netsh`/`wintun` v6 path needs a live elevated Windows box to build safely).
+  **Deferred to a future version:** the **iOS** (NetworkExtension + SwiftUI) shell and
+  **macOS** (`pf`) kill-switch enforcement — both need an Apple toolchain/host this project
+  doesn't target yet.
 - **Phase 6 (~15%):** `sendmmsg` batching + **UDP GSO send-path** (`UDP_SEGMENT`; Linux,
   CI-verified — not buildable on this no-WSL/no-rustup host) + **observability M1 done (coordinator + relay)**:
   privacy-preserving Prometheus metrics on a `--metrics-listen` `/metrics` endpoint each
@@ -181,7 +184,8 @@ on the new environment before assuming it's still blocked.
    desktop run on the supervisor** (always-on auto-reconnect; OIDC token via
    `FerrumClient::set_token`), and the **desktop enforces the kill-switch in the OS firewall**
    (**`nftables` on Linux + WFP on Windows** — `apps/desktop/.../killswitch.rs`). Remaining
-   (current scope): a privileged-helper for the desktop TUN; Windows wintun IPv6.
+   (current scope): a privileged-helper for the desktop TUN; full Windows wintun IPv6
+   (`tun`-crate-blocked — fails cleanly today; needs a live elevated Windows box).
    (Phase 4 NAT traversal is functionally complete:
    signaling, STUN, relay, state machine, automatic fallback, and both local +
    coordinator-advertised relay selection all land. ICE candidate-pair prioritization

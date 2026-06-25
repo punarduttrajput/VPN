@@ -45,9 +45,14 @@ mod imp {
     /// platform, so the I/O path below is shared; only adapter creation differs
     /// (and the `tun` crate handles that per-platform).
     ///
-    /// Windows note: the wintun adapter takes an **IPv4** address (the crate sets
-    /// it via `netsh`); an IPv6 tunnel address is not yet supported there and
-    /// fails at [`Self::open`].
+    /// Windows note: the wintun adapter only takes an **IPv4** address. The `tun`
+    /// crate's Windows backend stores the configured address as an `Ipv4Addr` and
+    /// would *panic* on an IPv6 one, so [`Self::open`] rejects an IPv6 tunnel
+    /// address with a clean error there (see the guard below). Full IPv6 support
+    /// would need the v6 address set out-of-band (e.g. `netsh interface ipv6` on
+    /// the named adapter, or `wintun`'s `set_network_addresses_tuple`, neither of
+    /// which the `tun` crate exposes) and is a documented follow-up. Unix handles
+    /// v4 and v6 alike.
     pub struct RealTun {
         dev: AsyncDevice,
     }
@@ -56,6 +61,17 @@ mod imp {
         /// Create and bring up the interface (requires elevated privileges; on
         /// Windows also requires `wintun.dll` to be loadable at runtime).
         pub fn open(cfg: &TunConfig) -> Result<Self> {
+            // On Windows the wintun backend is IPv4-only; an IPv6 address would
+            // panic inside the `tun` crate (`Ipv4Addr` conversion `unwrap`). Reject
+            // it cleanly before touching the driver (no elevation needed to hit
+            // this path). On Unix the kernel configures either family.
+            #[cfg(windows)]
+            if cfg.address.addr.is_ipv6() {
+                return Err(crate::TunnelError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "IPv6 tunnel addresses are not yet supported on Windows (wintun); use IPv4",
+                )));
+            }
             let mut tcfg = tun::Configuration::default();
             tcfg.name(&cfg.name)
                 .address(cfg.address.addr)
@@ -93,6 +109,48 @@ mod imp {
             u32::MAX << (32 - prefix.min(32))
         };
         std::net::Ipv4Addr::from(bits)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn prefix_to_netmask_v4_is_correct() {
+            assert_eq!(
+                prefix_to_netmask_v4(24),
+                std::net::Ipv4Addr::new(255, 255, 255, 0)
+            );
+            assert_eq!(
+                prefix_to_netmask_v4(16),
+                std::net::Ipv4Addr::new(255, 255, 0, 0)
+            );
+            assert_eq!(
+                prefix_to_netmask_v4(32),
+                std::net::Ipv4Addr::new(255, 255, 255, 255)
+            );
+            assert_eq!(prefix_to_netmask_v4(0), std::net::Ipv4Addr::new(0, 0, 0, 0));
+        }
+
+        /// On Windows, an IPv6 tunnel address must fail with a clean error rather
+        /// than panicking inside the `tun` crate. This returns before any driver
+        /// access, so it needs no elevation / loadable `wintun.dll`.
+        #[cfg(windows)]
+        #[test]
+        fn open_rejects_ipv6_on_windows() {
+            let cfg = TunConfig {
+                name: "ferrum-test".to_string(),
+                address: "fd00::1/64".parse().unwrap(),
+                mtu: 1280,
+            };
+            match RealTun::open(&cfg) {
+                Err(crate::TunnelError::Io(e)) => {
+                    assert_eq!(e.kind(), std::io::ErrorKind::Unsupported)
+                }
+                Err(other) => panic!("expected an Io(Unsupported) error, got {other:?}"),
+                Ok(_) => panic!("IPv6 must be rejected on Windows"),
+            }
+        }
     }
 }
 
