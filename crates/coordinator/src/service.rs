@@ -174,6 +174,7 @@ impl Coordinator for CoordinatorService {
         &self,
         request: Request<RegisterDeviceRequest>,
     ) -> Result<Response<RegisterDeviceResponse>, Status> {
+        let _timer = self.metrics.start_request();
         let claims = self.authenticate_metered(&request)?;
         self.metrics.inc_register();
         let req = request.into_inner();
@@ -201,6 +202,7 @@ impl Coordinator for CoordinatorService {
         &self,
         request: Request<NetworkMapRequest>,
     ) -> Result<Response<NetworkMapResponse>, Status> {
+        let _timer = self.metrics.start_request();
         self.authenticate_metered(&request)?;
         self.metrics.inc_network_map_request();
         let req = request.into_inner();
@@ -217,6 +219,7 @@ impl Coordinator for CoordinatorService {
         &self,
         request: Request<NetworkMapRequest>,
     ) -> Result<Response<Self::WatchNetworkMapStream>, Status> {
+        let _timer = self.metrics.start_request();
         self.authenticate_metered(&request)?;
         let public_key = request.into_inner().public_key;
         let registry = self.registry.clone();
@@ -260,6 +263,7 @@ impl Coordinator for CoordinatorService {
         &self,
         request: Request<PublishCandidatesRequest>,
     ) -> Result<Response<PublishCandidatesResponse>, Status> {
+        let _timer = self.metrics.start_request();
         self.authenticate_metered(&request)?;
         self.metrics.inc_publish_candidates();
         let req = request.into_inner();
@@ -280,6 +284,7 @@ impl Coordinator for CoordinatorService {
         &self,
         request: Request<RotateKeyRequest>,
     ) -> Result<Response<RotateKeyResponse>, Status> {
+        let _timer = self.metrics.start_request();
         self.authenticate_metered(&request)?;
         self.metrics.inc_rotate_key();
         let req = request.into_inner();

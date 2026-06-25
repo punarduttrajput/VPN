@@ -66,6 +66,28 @@ tests:
               summary: "Relay is dropping frames fast (page)"
               description: "Relay frame-drop ratio is 50% over 1h & 5m — >14.4x the 99% forwarding-success budget."
 
+  # --- The coordinator serving every RPC slower than 100ms trips the latency
+  #     fast-burn page (le="0.1" bucket flat while the total count climbs).
+  - name: coordinator latency slow
+    interval: 1m
+    input_series:
+      - series: 'up{job="ferrum-coordinator", instance="c1"}'
+        values: '1+0x70'
+      - series: 'ferrum_request_duration_seconds_bucket{le="0.1", instance="c1"}'
+        values: '0+0x70'
+      - series: 'ferrum_request_duration_seconds_count{instance="c1"}'
+        values: '0+60x70'
+    alert_rule_test:
+      - eval_time: 65m
+        alertname: FerrumCoordinatorLatencyFastBurn
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              slo: coordinator-latency
+            exp_annotations:
+              summary: "Coordinator latency budget burning fast (page)"
+              description: "Share of RPCs slower than 100ms is 100% over 1h & 5m — >14.4x the 99%-under-100ms budget."
+
   # --- A healthy steady state fires none of the burn-rate / down alerts.
   - name: healthy steady state
     interval: 1m
@@ -78,12 +100,20 @@ tests:
         values: '0+100x70'
       - series: 'ferrum_relay_frames_dropped_total{instance="r1"}'
         values: '0+0x70'
+      # Every RPC completes under 100ms: the le="0.1" bucket tracks the count.
+      - series: 'ferrum_request_duration_seconds_bucket{le="0.1", instance="c1"}'
+        values: '0+60x70'
+      - series: 'ferrum_request_duration_seconds_count{instance="c1"}'
+        values: '0+60x70'
     alert_rule_test:
       - eval_time: 65m
         alertname: FerrumAvailabilityFastBurn
         exp_alerts: []
       - eval_time: 65m
         alertname: FerrumRelayForwardFastBurn
+        exp_alerts: []
+      - eval_time: 65m
+        alertname: FerrumCoordinatorLatencyFastBurn
         exp_alerts: []
       - eval_time: 5m
         alertname: FerrumCoordinatorDown

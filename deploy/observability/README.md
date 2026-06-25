@@ -84,8 +84,9 @@ Prometheus loads SLO recording + alerting rules from
 |-----|--------|--------------|-----|
 | Control-plane availability | 99.95% (NFR3) | 0.05% | `1 - avg(up)` per job |
 | Relay forwarding success | 99% | 1% | `dropped / (forwarded + dropped)` |
+| Coordinator latency | 99% of RPCs < 100 ms | 1% | `1 - bucket{le="0.1"} / count` |
 
-Both use **multi-window, multi-burn-rate** alerts (Google SRE Workbook): each
+All use **multi-window, multi-burn-rate** alerts (Google SRE Workbook): each
 alert ANDs a long and a short window so it pages fast on a hard outage but won't
 flap on a blip, and auto-resolves on recovery.
 
@@ -105,9 +106,11 @@ routes `severity: critical` to a `pager` receiver and `warning` to `default`.
 Both receivers ship **without** an external integration so the stack runs with no
 secrets — plug in Slack/PagerDuty/email/a webhook where the comments mark.
 
-> **Latency SLO** is intentionally not defined: the services expose no
-> request-duration histogram SLI yet (the tracing spans carry timing but aren't a
-> Prometheus histogram). Adding one is the follow-up that unlocks a latency SLO.
+The **coordinator latency SLO** is measured from the
+`ferrum_request_duration_seconds` histogram (a `RequestTimer` RAII guard records
+every RPC handler's duration; aggregate-only, no per-user labels per NFR5): the
+SLI is the share of RPCs slower than 100 ms (`1 - bucket{le="0.1"} / count`),
+with the same three burn-rate tiers and `slo: coordinator-latency`.
 
 ### Test the rules
 

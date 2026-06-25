@@ -64,6 +64,16 @@ Real-device/throughput checks live in [scripts/verify-linux.sh](scripts/verify-l
 
 ## ⚠️ Environment note — constraints differ per machine
 
+> **This Windows host actually has network** (verified 2026-06-25 — `curl` to
+> crates.io works). The blocker is a global `~/.cargo/config.toml` with
+> `[net] offline = true`, so cargo *behaves* offline and any dep not already in
+> the local cache fails to resolve (e.g. the coordinator/CLI `otlp` feature's
+> `opentelemetry` deps, added on WSL2). **Override per-command with
+> `CARGO_NET_OFFLINE=false cargo …`** — that fetches the missing crates and the
+> full workspace resolves/builds/tests here. (Without it, `cargo` errors with
+> "no matching package … searched crates.io index" on the whole workspace, even
+> for `-p ferrum-tunnel`.) So `cargo add` and new deps ARE available now.
+
 Most of this codebase was written on an **offline Windows** host. Several
 limitations there are **not fundamental** and should be **re-checked on a
 Linux / online machine** — several "deferred / blocked" items may now be doable:
@@ -155,9 +165,10 @@ on the new environment before assuming it's still blocked.
   Overview" dashboard) **and SLO-based alerting** (multi-window burn-rate rules for
   availability 99.95% + relay-forwarding 99% SLOs, plus hard-down/capacity/security alerts →
   Alertmanager; promtool unit tests + a CI `observability` job; verified live by fault
-  injection — `FerrumCoordinatorDown` fired and routed to the pager receiver). **FR4 is
-  complete** except a latency SLO (needs a request-duration histogram SLI — the documented
-  follow-up). eBPF/XDP, anycast, autoscaling not started.
+  injection — `FerrumCoordinatorDown` fired and routed to the pager receiver) **and a
+  coordinator latency SLO** (a `ferrum_request_duration_seconds` histogram SLI — aggregate-only,
+  NFR5 — feeds a 99%-of-RPCs-under-100ms burn-rate alert; promtool-tested). **FR4 is complete.**
+  eBPF/XDP, anycast, autoscaling not started.
 
 ## Recommended next work (highest-value, buildable in Rust)
 
@@ -183,6 +194,7 @@ on the new environment before assuming it's still blocked.
    (NFR5-guarded by the `tracing_privacy` integration test) + **OTLP span export** (optional
    `otlp` feature; `--otlp-endpoint <url>` → OTLP/gRPC, verified against Jaeger in WSL2) +
    a **committed Prometheus/Grafana/Jaeger/Alertmanager stack** (`deploy/observability/`) with
-   **SLO burn-rate alerting** (promtool-tested + a CI `observability` job). FR4 complete bar a
-   latency SLO (needs a request-duration histogram SLI).
+   **SLO burn-rate alerting** (promtool-tested + a CI `observability` job), including a
+   **coordinator latency SLO** (request-duration histogram SLI → 99%-under-100ms burn-rate).
+   FR4 complete.
 4. **Phase 6 / NFR1**: real-hardware throughput; UDP GSO/GRO; eBPF/XDP fast path (Linux).

@@ -15,6 +15,15 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// Upper bounds (`le`, seconds) of the request-duration histogram buckets — a
+/// fixed ladder from 0.5 ms to 5 s, dense in the sub-100 ms range where a healthy
+/// control-plane RPC lives. The latency SLO is measured at the `0.1` boundary, so
+/// that value MUST stay in this ladder (the recording rule selects `le="0.1"`).
+const REQUEST_DURATION_BUCKETS_SECONDS: [f64; 13] = [
+    0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+];
 
 /// Aggregate counters/gauges for the coordinator. Cheap to update (relaxed
 /// atomics) and safe to share across all request handlers via an [`Arc`].
@@ -27,6 +36,49 @@ pub struct Metrics {
     watch_streams_opened_total: AtomicU64,
     watch_streams_active: AtomicU64,
     unauthenticated_total: AtomicU64,
+    request_duration: DurationHistogram,
+}
+
+/// A Prometheus-style histogram of RPC handler durations — the latency SLI
+/// (PRD Phase 6 FR4). Each observation lands in exactly one bucket (the smallest
+/// boundary `>=` the duration; observations past the largest boundary sit only in
+/// the implicit `+Inf` bucket), plus a running sum and count. Aggregate only — no
+/// per-user labels (NFR5).
+struct DurationHistogram {
+    /// Per-bucket observation counts, parallel to [`REQUEST_DURATION_BUCKETS_SECONDS`].
+    /// Rendered cumulatively (Prometheus histogram buckets are `<= le`).
+    buckets: [AtomicU64; REQUEST_DURATION_BUCKETS_SECONDS.len()],
+    /// Sum of all observed durations, in nanoseconds (rendered as seconds).
+    sum_nanos: AtomicU64,
+    /// Total observations (the implicit `+Inf` bucket).
+    count: AtomicU64,
+}
+
+impl Default for DurationHistogram {
+    fn default() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            sum_nanos: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+        }
+    }
+}
+
+impl DurationHistogram {
+    /// Record one observed duration.
+    fn observe(&self, d: Duration) {
+        self.sum_nanos
+            .fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+        let secs = d.as_secs_f64();
+        for (i, &le) in REQUEST_DURATION_BUCKETS_SECONDS.iter().enumerate() {
+            if secs <= le {
+                self.buckets[i].fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+        // Past the largest finite bucket: counted only in `+Inf` (== count).
+    }
 }
 
 impl Metrics {
@@ -60,6 +112,17 @@ impl Metrics {
     /// An RPC was rejected for failing authentication (OIDC).
     pub fn inc_unauthenticated(&self) {
         self.unauthenticated_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Start timing an RPC handler, returning a guard that records the elapsed
+    /// duration into the latency histogram when it drops (PRD Phase 6 FR4). Drop
+    /// covers every return path — including the `?` early-out on an auth failure —
+    /// so the SLI reflects all served requests regardless of outcome.
+    pub fn start_request(self: &Arc<Self>) -> RequestTimer {
+        RequestTimer {
+            metrics: self.clone(),
+            start: Instant::now(),
+        }
     }
 
     /// Record a new `WatchNetworkMap` stream opening, returning a guard that
@@ -126,7 +189,26 @@ impl Metrics {
             "Total RPCs rejected for failing authentication.",
             self.unauthenticated_total.load(Ordering::Relaxed),
         );
+        histogram(
+            &mut out,
+            "ferrum_request_duration_seconds",
+            "Coordinator RPC handler duration in seconds (latency SLI).",
+            &self.request_duration,
+        );
         out
+    }
+}
+
+/// RAII timer for an RPC handler: records the elapsed duration into the latency
+/// histogram when it drops (covers every return path of the handler).
+pub struct RequestTimer {
+    metrics: Arc<Metrics>,
+    start: Instant,
+}
+
+impl Drop for RequestTimer {
+    fn drop(&mut self) {
+        self.metrics.request_duration.observe(self.start.elapsed());
     }
 }
 
@@ -161,6 +243,23 @@ fn emit(out: &mut String, name: &str, help: &str, typ: &str, value: u64) {
     ));
 }
 
+/// Append one `histogram`-typed metric (HELP + TYPE + cumulative `_bucket` lines +
+/// `_sum` + `_count`) to the exposition text. Bucket counts are accumulated here
+/// because Prometheus buckets are cumulative (`<= le`); the `+Inf` bucket equals
+/// the total count.
+fn histogram(out: &mut String, name: &str, help: &str, hist: &DurationHistogram) {
+    out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} histogram\n"));
+    let mut cumulative = 0u64;
+    for (i, le) in REQUEST_DURATION_BUCKETS_SECONDS.iter().enumerate() {
+        cumulative += hist.buckets[i].load(Ordering::Relaxed);
+        out.push_str(&format!("{name}_bucket{{le=\"{le}\"}} {cumulative}\n"));
+    }
+    let count = hist.count.load(Ordering::Relaxed);
+    out.push_str(&format!("{name}_bucket{{le=\"+Inf\"}} {count}\n"));
+    let sum_seconds = hist.sum_nanos.load(Ordering::Relaxed) as f64 / 1e9;
+    out.push_str(&format!("{name}_sum {sum_seconds}\n{name}_count {count}\n"));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,6 +282,61 @@ mod tests {
         assert!(text.contains("ferrum_rotate_key_total 1\n"));
         assert!(text.contains("ferrum_network_map_requests_total 1\n"));
         assert!(text.contains("ferrum_publish_candidates_total 0\n"));
+    }
+
+    #[test]
+    fn request_histogram_buckets_are_cumulative() {
+        let m = Metrics::new();
+        // Three fast (<=1ms) requests, one slow (~200ms, exceeds the 0.1s SLO).
+        m.request_duration.observe(Duration::from_micros(400));
+        m.request_duration.observe(Duration::from_micros(900));
+        m.request_duration.observe(Duration::from_micros(900));
+        m.request_duration.observe(Duration::from_millis(200));
+
+        let text = m.render(0);
+        assert!(text.contains("# TYPE ferrum_request_duration_seconds histogram"));
+        // 0.0005s bucket holds the one 400µs observation.
+        assert!(
+            text.contains("ferrum_request_duration_seconds_bucket{le=\"0.0005\"} 1\n"),
+            "{text}"
+        );
+        // Cumulative: by le=0.001 all three fast requests are counted.
+        assert!(
+            text.contains("ferrum_request_duration_seconds_bucket{le=\"0.001\"} 3\n"),
+            "{text}"
+        );
+        // The 200ms request is still excluded at the 0.1s SLO boundary...
+        assert!(
+            text.contains("ferrum_request_duration_seconds_bucket{le=\"0.1\"} 3\n"),
+            "{text}"
+        );
+        // ...but included by le=0.25 and in +Inf / count.
+        assert!(
+            text.contains("ferrum_request_duration_seconds_bucket{le=\"0.25\"} 4\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("ferrum_request_duration_seconds_bucket{le=\"+Inf\"} 4\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("ferrum_request_duration_seconds_count 4\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn request_timer_records_on_drop() {
+        let m = Metrics::new();
+        {
+            let _timer = m.start_request();
+            // Dropped at end of scope -> one observation recorded.
+        }
+        assert!(
+            m.render(0)
+                .contains("ferrum_request_duration_seconds_count 1\n"),
+            "timer drop should record exactly one observation"
+        );
     }
 
     #[test]
