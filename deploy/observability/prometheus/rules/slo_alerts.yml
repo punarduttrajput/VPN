@@ -12,6 +12,7 @@
 #
 # SLO targets:  availability 99.95% (budget 0.0005, maps to NFR3)
 #               relay forwarding success 99% (budget 0.01)
+#               coordinator latency: 99% of RPCs < 100ms (budget 0.01)
 
 groups:
   # ---------------------------------------------------------------------------
@@ -95,6 +96,47 @@ groups:
         annotations:
           summary: "Relay slowly eating its forwarding budget (ticket)"
           description: "Relay frame-drop ratio is {{ $value | humanizePercentage }} over 3d & 6h — above the sustainable 99% rate."
+
+  # ---------------------------------------------------------------------------
+  # Coordinator latency SLO — error budget burn (target 99% of RPCs < 100ms).
+  # ---------------------------------------------------------------------------
+  - name: ferrum-slo-coordinator-latency
+    rules:
+      - alert: FerrumCoordinatorLatencyFastBurn
+        expr: |
+          ferrum_coordinator:latency_err_ratio:1h > (14.4 * 0.01)
+          and
+          ferrum_coordinator:latency_err_ratio:5m > (14.4 * 0.01)
+        labels:
+          severity: critical
+          slo: coordinator-latency
+        annotations:
+          summary: "Coordinator latency budget burning fast (page)"
+          description: "Share of RPCs slower than 100ms is {{ $value | humanizePercentage }} over 1h & 5m — >14.4x the 99%-under-100ms budget."
+
+      - alert: FerrumCoordinatorLatencySlowBurn
+        expr: |
+          ferrum_coordinator:latency_err_ratio:6h > (6 * 0.01)
+          and
+          ferrum_coordinator:latency_err_ratio:30m > (6 * 0.01)
+        labels:
+          severity: critical
+          slo: coordinator-latency
+        annotations:
+          summary: "Coordinator latency budget burning (page)"
+          description: "Share of RPCs slower than 100ms is {{ $value | humanizePercentage }} over 6h & 30m — >6x the 99%-under-100ms budget."
+
+      - alert: FerrumCoordinatorLatencyBudgetTicket
+        expr: |
+          ferrum_coordinator:latency_err_ratio:3d > (1 * 0.01)
+          and
+          ferrum_coordinator:latency_err_ratio:6h > (1 * 0.01)
+        labels:
+          severity: warning
+          slo: coordinator-latency
+        annotations:
+          summary: "Coordinator slowly eating its latency budget (ticket)"
+          description: "Share of RPCs slower than 100ms is {{ $value | humanizePercentage }} over 3d & 6h — above the sustainable 99%-under-100ms rate."
 
   # ---------------------------------------------------------------------------
   # Hard availability — a target is down or has disappeared entirely.
