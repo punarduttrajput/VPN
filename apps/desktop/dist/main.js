@@ -83,6 +83,8 @@ connectBtn.addEventListener("click", async () => {
         mode: transportModeEl.value,
         server_name: $("server_name").value.trim() || null,
         masque_proxy: $("masque_proxy").value.trim() || null,
+        stun_server: $("stun_server").value.trim() || null,
+        relay: $("relay").value.trim() || null,
       },
     });
   } catch (e) {

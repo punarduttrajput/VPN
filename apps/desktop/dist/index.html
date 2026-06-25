@@ -42,6 +42,12 @@
         <label id="masque_proxy_field" class="hidden">MASQUE proxy (ip:port)
           <input id="masque_proxy" type="text" placeholder="203.0.113.10:443" />
         </label>
+        <label>STUN server (ip:port, optional)
+          <input id="stun_server" type="text" placeholder="stun.l.google.com:19302" />
+        </label>
+        <label>Relay override (ip:port, optional)
+          <input id="relay" type="text" placeholder="leave empty to use coordinator's" />
+        </label>
         <div class="actions">
           <button id="connect">Connect</button>
           <button id="disconnect" disabled>Disconnect</button>
