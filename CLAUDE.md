@@ -115,8 +115,10 @@ on the new environment before assuming it's still blocked.
   upgrades to direct when punched), and the bring-up to use it — a local
   `transport.relay = "ip:port"` override *and* **coordinator-advertised relay**
   (`coordinator --relay <addr>` → `NetworkMapResponse.relay`; clients resolve
-  local-override-else-advertised in `up-mesh` / `run_mesh_session` / the FFI).
-  Remaining is hardening only: fuller ICE pairing/prioritization and a desktop-GUI
+  local-override-else-advertised in `up-mesh` / `run_mesh_session` / the FFI), and
+  **ICE candidate-pair prioritization** (`tunnel::ice`, RFC 8445: the prober orders
+  probe targets by candidate priority so a reachable LAN/host candidate is tried
+  before the public/server-reflexive endpoint). Remaining hardening: a desktop-GUI
   relay/STUN field.
 - **Phase 5 (~35%):** shared `FerrumClient` core (M1) + `uniffi` bindings (Swift/Kotlin
   generate from `FfiFerrumClient`) + data-plane glue (`run_mesh_session`) + the
@@ -134,8 +136,10 @@ on the new environment before assuming it's still blocked.
   Filtering Platform**: a dedicated WFP provider/sublayer with a default-block + higher-weight
   permit filters at the `ALE_AUTH_CONNECT` v4/v6 layers, installed in a transaction and torn
   down by filter-id; see `apps/desktop/.../killswitch.rs`).
-  Remaining: iOS/Android shells, a privileged-helper for the desktop TUN, and **macOS** (`pf`)
-  kill-switch enforcement.
+  Remaining (current scope): an **Android** shell over the `uniffi` Kotlin bindings, a
+  privileged-helper for the desktop TUN, and Windows wintun **IPv6**. **Deferred to a future
+  version:** the **iOS** (NetworkExtension + SwiftUI) shell and **macOS** (`pf`) kill-switch
+  enforcement — both need an Apple toolchain/host this project doesn't target yet.
 - **Phase 6 (~15%):** `sendmmsg` batching + **UDP GSO send-path** (`UDP_SEGMENT`; Linux,
   CI-verified — not buildable on this no-WSL/no-rustup host) + **observability M1 done (coordinator + relay)**:
   privacy-preserving Prometheus metrics on a `--metrics-listen` `/metrics` endpoint each
@@ -164,14 +168,15 @@ on the new environment before assuming it's still blocked.
    `FerrumClient` facade / data-plane glue and FFI; **both `ferrum up-mesh` and the Tauri
    desktop run on the supervisor** (always-on auto-reconnect; OIDC token via
    `FerrumClient::set_token`), and the **desktop enforces the kill-switch in the OS firewall**
-   (**`nftables` on Linux + WFP on Windows** — `apps/desktop/.../killswitch.rs`). Remaining:
-   macOS (`pf`) kill-switch enforcement; a privileged-helper for the desktop TUN.
+   (**`nftables` on Linux + WFP on Windows** — `apps/desktop/.../killswitch.rs`). Remaining
+   (current scope): a privileged-helper for the desktop TUN; Windows wintun IPv6.
    (Phase 4 NAT traversal is functionally complete:
    signaling, STUN, relay, state machine, automatic fallback, and both local +
-   coordinator-advertised relay selection all land. Optional Phase 4 hardening: fuller
-   ICE candidate-pair prioritization; a desktop-GUI relay/STUN field.)
-2. **Phase 5 — native shells**: iOS (NetworkExtension + SwiftUI) / Android
-   (FerrumService + Compose) over the existing `uniffi` bindings (needs Apple/Android toolchains).
+   coordinator-advertised relay selection all land. ICE candidate-pair prioritization
+   (`tunnel::ice`) now lands too; remaining Phase 4 hardening: a desktop-GUI relay/STUN field.)
+2. **Phase 5 — Android shell**: `FerrumService` + Compose over the existing `uniffi`
+   Kotlin bindings (needs an Android toolchain). *(iOS + macOS deferred to a future version —
+   need an Apple toolchain/host this project doesn't target yet.)*
 3. **Phase 6 — observability (M1)** ✅ *(done)*: coordinator *and* relay
    Prometheus metrics (`--metrics-listen` → `/metrics`, aggregate counts only per NFR5) +
    `#[tracing::instrument(skip_all)]` spans across the coordinator RPC handlers + relay loop
