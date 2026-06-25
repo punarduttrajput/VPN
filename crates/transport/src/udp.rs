@@ -8,10 +8,17 @@
 //! run, which matters under load when the tunnel emits a burst of MTU-sized
 //! WireGuard packets. Anything not GSO-eligible (mixed sizes, a full send buffer,
 //! or a kernel without `UDP_SEGMENT`) falls back to `sendmmsg(2)` (still one
-//! syscall for many datagrams), then to sequential async sends. `try_recv`
-//! exposes a non-blocking receive so the runner can drain the socket between
-//! async yields. On non-Linux platforms all of this falls back to the default
-//! sequential implementations.
+//! syscall for many datagrams), then to sequential async sends.
+//!
+//! The receive side is symmetric: on Linux [`UdpTransport`] enables **UDP generic
+//! receive offload** (GRO, `UDP_GRO`) on its socket, so the kernel coalesces a run
+//! of same-flow datagrams into one `recvmsg` (a `UDP_GRO` control message reports
+//! the per-segment size). That one syscall is split back into individual datagrams
+//! and buffered ([`GroBuffer`]), which `recv`/`try_recv` then drain one at a time
+//! with no further syscalls — amortizing the per-packet receive cost the same way
+//! GSO amortizes the send cost. `try_recv` exposes a non-blocking receive so the
+//! runner can drain the socket between async yields. On non-Linux platforms all of
+//! this falls back to the default sequential implementations.
 
 use std::net::SocketAddr;
 
@@ -27,23 +34,43 @@ const MAX_GSO_BYTES: usize = 65_535;
 /// older `libc` versions don't expose it as a constant.
 #[cfg(target_os = "linux")]
 const UDP_SEGMENT: libc::c_int = 103;
+/// The `UDP_GRO` socket option / control-message type (level `SOL_UDP`). Like
+/// `UDP_SEGMENT`, defined here for libc-version portability.
+#[cfg(target_os = "linux")]
+const UDP_GRO: libc::c_int = 104;
 
 /// Carries datagrams over UDP to a fixed peer endpoint.
 pub struct UdpTransport {
     socket: UdpSocket,
     peer: SocketAddr,
+    /// Segments left over from a coalesced UDP GRO `recvmsg`, drained one per
+    /// `recv`/`try_recv` (Linux only).
+    #[cfg(target_os = "linux")]
+    gro: std::sync::Mutex<GroBuffer>,
 }
 
 impl UdpTransport {
     /// Bind a local UDP socket and target `peer`.
     pub async fn bind(local: SocketAddr, peer: SocketAddr) -> Result<Self, TransportError> {
         let socket = UdpSocket::bind(local).await?;
-        Ok(Self { socket, peer })
+        Ok(Self::wrap(socket, peer))
     }
 
     /// Wrap an already-bound socket targeting `peer` (used by tests).
     pub fn from_socket(socket: UdpSocket, peer: SocketAddr) -> Self {
-        Self { socket, peer }
+        Self::wrap(socket, peer)
+    }
+
+    /// Construct from a bound socket, enabling UDP GRO on Linux (best-effort).
+    fn wrap(socket: UdpSocket, peer: SocketAddr) -> Self {
+        #[cfg(target_os = "linux")]
+        enable_gro(&socket);
+        Self {
+            socket,
+            peer,
+            #[cfg(target_os = "linux")]
+            gro: std::sync::Mutex::new(GroBuffer::default()),
+        }
     }
 }
 
@@ -54,15 +81,29 @@ impl Transport for UdpTransport {
     }
 
     async fn recv(&self, buf: &mut [u8]) -> Result<usize, TransportError> {
-        let (n, _from) = self.socket.recv_from(buf).await?;
-        Ok(n)
+        #[cfg(target_os = "linux")]
+        {
+            self.recv_gro(buf).await
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let (n, _from) = self.socket.recv_from(buf).await?;
+            Ok(n)
+        }
     }
 
     fn try_recv(&self, buf: &mut [u8]) -> Result<Option<usize>, TransportError> {
-        match self.socket.try_recv_from(buf) {
-            Ok((n, _)) => Ok(Some(n)),
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
-            Err(e) => Err(TransportError::Io(e)),
+        #[cfg(target_os = "linux")]
+        {
+            self.try_recv_gro(buf)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            match self.socket.try_recv_from(buf) {
+                Ok((n, _)) => Ok(Some(n)),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+                Err(e) => Err(TransportError::Io(e)),
+            }
         }
     }
 
@@ -185,6 +226,192 @@ fn leading_gso_run(datagrams: &[Vec<u8>]) -> Option<(usize, usize)> {
         count += 1;
     }
     (count >= 2).then_some((count, l))
+}
+
+/// Buffers the segments of one coalesced UDP GRO `recvmsg` so the single-datagram
+/// `recv`/`try_recv` API can hand them out across calls without further syscalls.
+///
+/// A GRO read delivers a run of datagrams as one buffer plus a segment size: every
+/// segment is exactly `seg_size` bytes except possibly the last (mirrors GSO on the
+/// send side). This type owns that buffer and tracks how far it has been drained.
+/// Pure (no I/O), so the split logic is unit-tested on every platform.
+#[derive(Default)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct GroBuffer {
+    pending: Option<Coalesced>,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct Coalesced {
+    /// The coalesced bytes from one `recvmsg`.
+    data: Vec<u8>,
+    /// Per-segment size (all segments but the last are this long).
+    seg_size: usize,
+    /// Offset of the next undrained segment.
+    offset: usize,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl GroBuffer {
+    /// Copy the next buffered segment into `buf`, returning its length, or `None`
+    /// if nothing is buffered (the caller must perform a `recvmsg`).
+    fn take(&mut self, buf: &mut [u8]) -> Option<usize> {
+        let c = self.pending.as_mut()?;
+        let end = (c.offset + c.seg_size).min(c.data.len());
+        let seg = &c.data[c.offset..end];
+        let n = seg.len().min(buf.len());
+        buf[..n].copy_from_slice(&seg[..n]);
+        c.offset = end;
+        if c.offset >= c.data.len() {
+            self.pending = None;
+        }
+        Some(n)
+    }
+
+    /// Ingest a coalesced `recvmsg` result (`data`) with GRO `seg_size` (0 or
+    /// `>= data.len()` means "not coalesced — a single datagram"), copy the first
+    /// segment into `buf`, and buffer any remainder. Returns the first segment's
+    /// length.
+    fn fill(&mut self, data: Vec<u8>, seg_size: usize, buf: &mut [u8]) -> usize {
+        let total = data.len();
+        let seg = if seg_size == 0 || seg_size >= total {
+            total
+        } else {
+            seg_size
+        };
+        // `seg.max(1)` keeps a zero-length datagram from looping; `take` then
+        // returns a single 0-length segment and clears `pending`.
+        self.pending = Some(Coalesced {
+            data,
+            seg_size: seg.max(1),
+            offset: 0,
+        });
+        self.take(buf).unwrap_or(0)
+    }
+}
+
+/// Enable UDP GRO on `socket` (Linux, best-effort). A kernel without `UDP_GRO`
+/// just won't coalesce — receives still work one datagram at a time — so failure
+/// is ignored.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)] // setsockopt FFI; see SAFETY note
+fn enable_gro(socket: &UdpSocket) {
+    use std::os::unix::io::AsRawFd;
+    let on: libc::c_int = 1;
+    // SAFETY: `socket` owns a valid fd for the call; `&on` points to a `c_int`
+    // that outlives the synchronous syscall, and the length matches its size.
+    unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_UDP,
+            UDP_GRO,
+            &on as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl UdpTransport {
+    /// GRO-aware blocking receive: drain a previously coalesced read first, else
+    /// `recvmsg` (awaiting readiness) and split the result into segments.
+    async fn recv_gro(&self, buf: &mut [u8]) -> Result<usize, TransportError> {
+        use tokio::io::Interest;
+        if let Some(n) = self.gro.lock().unwrap().take(buf) {
+            return Ok(n);
+        }
+        // A coalesced GRO read can be up to a full datagram's worth of segments,
+        // so receive into a max-size scratch buffer, not the caller's `buf`.
+        let mut scratch = vec![0u8; MAX_GSO_BYTES];
+        loop {
+            self.socket.readable().await.map_err(TransportError::Io)?;
+            match self.socket.try_io(Interest::READABLE, || {
+                recvmsg_gro(&self.socket, &mut scratch)
+            }) {
+                Ok((total, seg)) => {
+                    scratch.truncate(total);
+                    return Ok(self.gro.lock().unwrap().fill(scratch, seg, buf));
+                }
+                // Spurious readiness: clear it (try_io did) and wait again.
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) => return Err(TransportError::Io(e)),
+            }
+        }
+    }
+
+    /// GRO-aware non-blocking receive (drain buffer, else one `recvmsg`).
+    fn try_recv_gro(&self, buf: &mut [u8]) -> Result<Option<usize>, TransportError> {
+        use tokio::io::Interest;
+        if let Some(n) = self.gro.lock().unwrap().take(buf) {
+            return Ok(Some(n));
+        }
+        let mut scratch = vec![0u8; MAX_GSO_BYTES];
+        match self.socket.try_io(Interest::READABLE, || {
+            recvmsg_gro(&self.socket, &mut scratch)
+        }) {
+            Ok((total, seg)) => {
+                scratch.truncate(total);
+                Ok(Some(self.gro.lock().unwrap().fill(scratch, seg, buf)))
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(TransportError::Io(e)),
+        }
+    }
+}
+
+/// One `recvmsg(2)` reading a (possibly GRO-coalesced) datagram into `scratch`,
+/// returning `(bytes_received, segment_size)`. `segment_size` is the `UDP_GRO`
+/// control message's value when the kernel coalesced a run, else 0 (a single
+/// datagram). Returns a `WouldBlock` error when no datagram is ready, which the
+/// caller's `try_io` translates into "wait for readiness".
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)] // raw recvmsg(2) + cmsg FFI; see SAFETY notes below
+fn recvmsg_gro(socket: &UdpSocket, scratch: &mut [u8]) -> std::io::Result<(usize, usize)> {
+    use std::os::unix::io::AsRawFd;
+
+    let mut iov = libc::iovec {
+        iov_base: scratch.as_mut_ptr() as *mut libc::c_void,
+        iov_len: scratch.len(),
+    };
+    // Control buffer for a single `UDP_GRO` (int) cmsg; 64 bytes is ample.
+    let mut control = [0u8; 64];
+
+    // SAFETY: `msg` is zeroed then populated; `msg_iov`/`msg_control` point to
+    // locals that outlive the synchronous syscall, and `control` is large enough
+    // for one `c_int` cmsg. The cmsg walk uses the kernel's reported lengths.
+    unsafe {
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_iov = &mut iov as *mut _;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = control.len() as _;
+
+        let ret = libc::recvmsg(socket.as_raw_fd(), &mut msg, 0);
+        if ret < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        // Scan control messages for UDP_GRO, whose payload is the segment size
+        // as a `c_int`. Absent → not coalesced (segment size 0).
+        let mut seg_size = 0usize;
+        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == libc::IPPROTO_UDP && (*cmsg).cmsg_type == UDP_GRO {
+                let mut s: libc::c_int = 0;
+                std::ptr::copy_nonoverlapping(
+                    libc::CMSG_DATA(cmsg),
+                    &mut s as *mut libc::c_int as *mut u8,
+                    std::mem::size_of::<libc::c_int>(),
+                );
+                if s > 0 {
+                    seg_size = s as usize;
+                }
+                break;
+            }
+            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+        }
+        Ok((ret as usize, seg_size))
+    }
 }
 
 /// Send one UDP GSO datagram-run (Linux only): `buf` is the concatenation of the
@@ -405,6 +632,65 @@ mod tests {
         assert_eq!(leading_gso_run(&many), Some((MAX_GSO_SEGMENTS, 100)));
     }
 
+    /// Drain a GRO buffer one segment at a time, just as `recv` would.
+    fn drain_all(g: &mut GroBuffer) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 2048];
+        while let Some(n) = g.take(&mut buf) {
+            out.push(buf[..n].to_vec());
+        }
+        out
+    }
+
+    #[test]
+    fn gro_buffer_splits_a_coalesced_read() {
+        // 2500 bytes coalesced at seg_size 1200 → 1200, 1200, 100.
+        let mut data = vec![0u8; 2500];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let mut g = GroBuffer::default();
+        let mut first = [0u8; 2048];
+        let n0 = g.fill(data.clone(), 1200, &mut first);
+        assert_eq!(n0, 1200);
+        assert_eq!(&first[..1200], &data[..1200]);
+        // Remaining two segments come from the buffer with no further `fill`.
+        let rest = drain_all(&mut g);
+        assert_eq!(rest.len(), 2);
+        assert_eq!(rest[0], data[1200..2400]);
+        assert_eq!(rest[1], data[2400..2500]);
+        // Fully drained.
+        assert_eq!(g.take(&mut first), None);
+    }
+
+    #[test]
+    fn gro_buffer_treats_zero_segsize_as_single_datagram() {
+        // seg_size 0 (no UDP_GRO cmsg) → exactly one segment of the whole read.
+        let mut g = GroBuffer::default();
+        let mut buf = [0u8; 2048];
+        let n = g.fill(vec![7u8; 900], 0, &mut buf);
+        assert_eq!(n, 900);
+        assert_eq!(g.take(&mut buf), None);
+    }
+
+    #[test]
+    fn gro_buffer_handles_segsize_at_or_above_total() {
+        // seg_size >= total is also a single datagram (not coalesced).
+        let mut g = GroBuffer::default();
+        let mut buf = [0u8; 2048];
+        assert_eq!(g.fill(vec![1u8; 500], 500, &mut buf), 500);
+        assert_eq!(g.take(&mut buf), None);
+        assert_eq!(g.fill(vec![1u8; 500], 9000, &mut buf), 500);
+        assert_eq!(g.take(&mut buf), None);
+    }
+
+    #[test]
+    fn gro_buffer_empty_take_is_none() {
+        let mut g = GroBuffer::default();
+        let mut buf = [0u8; 16];
+        assert_eq!(g.take(&mut buf), None);
+    }
+
     /// On Linux, a uniform `send_batch` goes out as one GSO `sendmsg` and the
     /// kernel segments it back into individual datagrams the peer receives whole.
     #[cfg(target_os = "linux")]
@@ -442,5 +728,42 @@ mod tests {
         }
         sizes.sort_unstable();
         assert_eq!(sizes, vec![400, 1200, 1200, 1200, 1200]);
+    }
+
+    /// On Linux, a GRO-enabled `UdpTransport` receives a GSO-sent batch correctly
+    /// whether or not the kernel coalesced the datagrams — the GRO-aware `recv`
+    /// drains a coalesced read segment-by-segment, and falls back to one datagram
+    /// per `recvmsg` otherwise. Asserts reassembly, not that coalescing occurred.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gro_recv_reassembles_a_gso_batch() {
+        use std::time::Duration;
+
+        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = a.local_addr().unwrap();
+        let addr_b = b.local_addr().unwrap();
+        let ta = UdpTransport::from_socket(a, addr_b);
+        let tb = UdpTransport::from_socket(b, addr_a); // GRO enabled in `from_socket`
+
+        // Three equal segments + one smaller tail → a GSO run of 4 datagrams.
+        let seg = vec![0x5au8; 1200];
+        let tail = vec![0x5au8; 400];
+        let batch = vec![seg.clone(), seg.clone(), seg.clone(), tail.clone()];
+        ta.send_batch(&batch).await.unwrap();
+
+        // The GRO-aware recv yields the 4 original datagrams (coalesced or not).
+        let mut sizes = Vec::new();
+        let mut buf = vec![0u8; 2048];
+        for _ in 0..4 {
+            let n = tokio::time::timeout(Duration::from_secs(2), tb.recv(&mut buf))
+                .await
+                .expect("expected a datagram")
+                .unwrap();
+            assert!(buf[..n].iter().all(|&x| x == 0x5a), "payload corrupted");
+            sizes.push(n);
+        }
+        sizes.sort_unstable();
+        assert_eq!(sizes, vec![400, 1200, 1200, 1200]);
     }
 }
