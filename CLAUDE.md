@@ -19,7 +19,7 @@ traversal, and kernel-level scale work are the remaining frontier.
 |-------|------|
 | `ferrum-core` | Keys, config, errors. `#![forbid(unsafe_code)]`. |
 | `ferrum-transport` | `Transport` (point-to-point) + `MeshTransport` (multi-peer) traits; UDP, QUIC (`quic`), MASQUE (`masque`) impls, padding + jitter decorators. |
-| `ferrum-tunnel` | boringtun session wrapper, `TunDevice` trait (real on Unix behind `real-tun`, mock otherwise), point-to-point `run` and multi-peer `run_mesh`. |
+| `ferrum-tunnel` | boringtun session wrapper, `TunDevice` trait (real behind `real-tun` — `/dev/net/tun`/utun on Unix, **wintun on Windows**, both via the `tun` crate; mock otherwise), point-to-point `run` and multi-peer `run_mesh`. |
 | `ferrum-cli` | `ferrum` binary: `keygen`, `up` (point-to-point), `up-mesh` (coordinator mesh, runs on the supervised `FerrumClient` session → auto-reconnect), `relay`. |
 | `ferrum-control-proto` | gRPC `Coordinator` contract (tonic/prost, vendored `protoc`). |
 | `ferrum-coordinator` | Coordinator: registry, IP allocation, network map, ACL/policy, streaming, SQLite (`sqlite`), mTLS (`mtls`), OIDC (`oidc`). |
@@ -71,7 +71,7 @@ Linux / online machine** — several "deferred / blocked" items may now be doabl
 | Was blocked on offline-Windows | Re-check on the new box |
 |---|---|
 | **`cargo add <crate>`** — registry was offline-pinned (`--offline`). This forced workarounds (e.g. OIDC JWT verify hand-rolled on the in-tree `ring` instead of `jsonwebtoken`; no `uniffi`). | If cargo is online, new deps (`uniffi`, STUN/ICE crates, etc.) become available — Phase 5 bindings and more open up. |
-| **Real TUN device** — Windows host can't run the OS packet path; tests use a mock and `verify-linux.sh` was run via Codespaces. | On Linux you can run the real data plane + `verify-linux.sh` locally (root). |
+| **Real TUN device** — was assumed Unix-only; tests use a mock and `verify-linux.sh` was run via Codespaces. | The `real-tun` data plane now runs on **Windows too** (wintun via the `tun` crate; `wintun.dll` vendored in `vendor/wintun/`) — see the 2026-06-25 STATUS log. On Linux you can run the real data plane + `verify-linux.sh` locally (root); on Windows, run elevated. |
 | **Real-hardware NFR1 throughput** — only informational on shared CI (~0.52 of a 1 Gbps shaped link vs 0.70 target). | Measure on real/representative hardware with `STRICT_THROUGHPUT=1`. |
 | **Windows UDP gotcha** — sending to a dead port triggers ICMP-unreachable → `WSAECONNRESET` on the next `recv_from`, killing the loop (a test had to use a drained "sink" socket, not a blackhole). | Linux doesn't do this; the workaround is harmless but unnecessary there. |
 | Live **third-party MASQUE proxy** interop — no external proxy available. | Test against a real RFC 9298 proxy if one is reachable. |
