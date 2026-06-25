@@ -128,8 +128,9 @@ on the new environment before assuming it's still blocked.
   local-override-else-advertised in `up-mesh` / `run_mesh_session` / the FFI), and
   **ICE candidate-pair prioritization** (`tunnel::ice`, RFC 8445: the prober orders
   probe targets by candidate priority so a reachable LAN/host candidate is tried
-  before the public/server-reflexive endpoint). Remaining hardening: a desktop-GUI
-  relay/STUN field.
+  before the public/server-reflexive endpoint). The Tauri desktop now also exposes
+  **STUN-server + relay-override fields** in its connect form (gathers/publishes
+  candidates; overrides the advertised relay). **Phase 4 hardening is complete.**
 - **Phase 5 (~35%):** shared `FerrumClient` core (M1) + `uniffi` bindings (Swift/Kotlin
   generate from `FfiFerrumClient`) + data-plane glue (`run_mesh_session`) + the
   TUN-from-fd FFI entry (`device::from_fd` + `FfiFerrumClient::run`/`stop`) + a Tauri
@@ -184,7 +185,7 @@ on the new environment before assuming it's still blocked.
    (Phase 4 NAT traversal is functionally complete:
    signaling, STUN, relay, state machine, automatic fallback, and both local +
    coordinator-advertised relay selection all land. ICE candidate-pair prioritization
-   (`tunnel::ice`) now lands too; remaining Phase 4 hardening: a desktop-GUI relay/STUN field.)
+   (`tunnel::ice`) and the desktop-GUI relay/STUN fields now land too — Phase 4 hardening is complete.)
 2. **Phase 5 — Android shell**: `FerrumService` + Compose over the existing `uniffi`
    Kotlin bindings (needs an Android toolchain). *(iOS + macOS deferred to a future version —
    need an Apple toolchain/host this project doesn't target yet.)*

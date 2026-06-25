@@ -102,6 +102,12 @@ enum TransportMode {
 /// Transport selection received from the webview's connect form. `mode` is the
 /// wire transport; `masque_proxy` (`ip:port`) is required for MASQUE; `server_name`
 /// is the TLS / HTTP-3 `:authority` for QUIC/MASQUE (defaults to `ferrum`).
+///
+/// `stun_server` and `relay` are NAT-traversal settings that apply across all
+/// modes (Phase 4): with a `stun_server` the client gathers host + server-reflexive
+/// candidates and publishes them so peers can punch a direct path; `relay` is a
+/// local `ip:port` override of the coordinator-advertised relay fallback (empty →
+/// use whatever the coordinator advertises, or direct-only if none).
 #[derive(Deserialize)]
 struct TransportArg {
     /// `"udp"` | `"quic"` | `"masque"` (case-insensitive).
@@ -110,6 +116,10 @@ struct TransportArg {
     masque_proxy: Option<String>,
     #[serde(default)]
     server_name: Option<String>,
+    #[serde(default)]
+    stun_server: Option<String>,
+    #[serde(default)]
+    relay: Option<String>,
 }
 
 impl TransportArg {
@@ -225,6 +235,11 @@ fn resolve_coordinator_ips(coordinator: &str) -> Vec<IpAddr> {
 /// The TUN factory is built here from `tun_cfg` — a session consumes and closes
 /// its device, so each reconnect attempt reopens it. `stop_rx` winds the whole
 /// supervisor down (the facade returns to `Disconnected`).
+// Nine independent inputs (identity, keys, TUN config, the transport factory,
+// NAT-traversal candidates + relay, and the shutdown channel). Grouping them into
+// a struct would only move the noise across the boundary, so allow the lint —
+// mirroring `data_plane::run_mesh_session_supervised`.
+#[allow(clippy::too_many_arguments)]
 async fn supervise_session<M, MkM, FutM>(
     client: FerrumClient,
     coordinator: String,
@@ -232,6 +247,8 @@ async fn supervise_session<M, MkM, FutM>(
     private_key: String,
     tun_cfg: TunConfig,
     make_transport: MkM,
+    candidates: Vec<String>,
+    relay: Option<String>,
     stop_rx: oneshot::Receiver<()>,
 ) -> Result<(), ferrum_client_core::Error>
 where
@@ -247,19 +264,19 @@ where
             })
         }
     };
-    // No NAT-traversal candidates and no local relay override: the GUI has no
-    // STUN-server field (follow-up, like the CLI's `--stun-server`), so nothing is
-    // gathered/published. The relay arg is `None`, so the mesh uses whatever relay
-    // the coordinator advertises (or runs direct-only if none).
+    // `candidates` (gathered from the STUN field, if any) are published on each
+    // connect so peers can probe a direct path; `relay` is the local override of
+    // the coordinator-advertised relay fallback (`None` → use the advertised one,
+    // or direct-only if none). Both come from the connect form (Phase 4).
     run_mesh_session_supervised(
         &client,
         &coordinator,
         &id,
         &private_key,
-        &[],
+        &candidates,
         make_device,
         make_transport,
-        None,
+        relay,
         &ReconnectPolicy::default(),
         async move {
             let _ = stop_rx.await;
@@ -312,6 +329,35 @@ async fn connect(
         TransportMode::Udp | TransportMode::Quic => None,
     };
 
+    // NAT-traversal settings (Phase 4), validated up front for a clean UI error.
+    // `relay` is a local override of the coordinator-advertised relay; `stun_server`
+    // turns on candidate gathering. Both apply regardless of transport mode.
+    let relay: Option<String> = match transport
+        .relay
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(r) => {
+            r.parse::<SocketAddr>()
+                .map_err(|e| format!("invalid relay address '{r}': {e}"))?;
+            Some(r.to_string())
+        }
+        None => None,
+    };
+    let stun_server: Option<SocketAddr> = match transport
+        .stun_server
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(s) => Some(
+            s.parse()
+                .map_err(|e| format!("invalid STUN server address '{s}': {e}"))?,
+        ),
+        None => None,
+    };
+
     // Derive the advertised public key from the private key.
     let public_key = ferrum_core::keys::public_base64_from_private(&identity.private_key)
         .map_err(|e| format!("deriving public key from private key: {e}"))?;
@@ -348,6 +394,27 @@ async fn connect(
     let bind_addr: SocketAddr = format!("0.0.0.0:{listen_port}")
         .parse()
         .map_err(|e| format!("invalid listen port {listen_port}: {e}"))?;
+
+    // Phase 4 M2: with a STUN server set, gather host + server-reflexive
+    // candidates on the data-plane port *before* the supervisor binds it (STUN
+    // briefly binds the same port so the mapping matches what peers reach). The
+    // supervised session publishes them on each connect so peers can probe a
+    // direct path. A flaky/unreachable STUN server never blocks bring-up.
+    let candidates: Vec<String> = match stun_server {
+        Some(stun) => {
+            let gathered: Vec<String> =
+                ferrum_transport::stun::gather_candidates(listen_port, Some(stun))
+                    .await
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect();
+            if gathered.is_empty() {
+                log::warn!("no NAT-traversal candidates gathered (STUN unreachable?)");
+            }
+            gathered
+        }
+        None => Vec::new(),
+    };
 
     // Pre-flight the TUN once so an unsupported platform / missing privileges
     // fails *now* with a clean UI error, rather than the always-on supervisor
@@ -395,6 +462,8 @@ async fn connect(
                     private_key,
                     tun_cfg,
                     make_transport,
+                    candidates,
+                    relay,
                     stop_rx,
                 )
                 .await
@@ -412,6 +481,8 @@ async fn connect(
                     private_key,
                     tun_cfg,
                     make_transport,
+                    candidates,
+                    relay,
                     stop_rx,
                 )
                 .await
@@ -434,6 +505,8 @@ async fn connect(
                     private_key,
                     tun_cfg,
                     make_transport,
+                    candidates,
+                    relay,
                     stop_rx,
                 )
                 .await
