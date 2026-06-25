@@ -3,6 +3,7 @@
 #![cfg_attr(not(unix), allow(dead_code))]
 
 pub mod device;
+pub mod ice;
 pub mod mesh;
 pub mod path;
 pub mod session;

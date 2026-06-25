@@ -114,14 +114,10 @@ fn probe_targets(peer: &MeshPeer, confirmed: bool) -> Vec<SocketAddr> {
     if confirmed || peer.candidates.is_empty() {
         return vec![peer.endpoint];
     }
-    let mut targets = Vec::with_capacity(peer.candidates.len() + 1);
-    targets.push(peer.endpoint);
-    for c in &peer.candidates {
-        if !targets.contains(c) {
-            targets.push(*c);
-        }
-    }
-    targets
+    // Order the fan-out by ICE priority (RFC 8445): a reachable LAN (host)
+    // candidate is tried before the public (server-reflexive) endpoint, so peers
+    // on a shared network punch through directly and fast.
+    crate::ice::prioritized_targets(peer.endpoint, &peer.candidates)
 }
 
 /// Which underlay an inbound datagram arrived on (or an outbound should ride):
