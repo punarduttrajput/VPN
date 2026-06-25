@@ -73,6 +73,13 @@ Real-device/throughput checks live in [scripts/verify-linux.sh](scripts/verify-l
 > full workspace resolves/builds/tests here. (Without it, `cargo` errors with
 > "no matching package … searched crates.io index" on the whole workspace, even
 > for `-p ferrum-tunnel`.) So `cargo add` and new deps ARE available now.
+>
+> **Linux-gated code can be compile-checked here without WSL.** The
+> `x86_64-unknown-linux-gnu` rustup cross-target is installed, so
+> `cargo check --target x86_64-unknown-linux-gnu -p <crate>` (and `clippy
+> --all-targets`) compile the `#[cfg(target_os = "linux")]` paths (e.g. the UDP
+> GSO/GRO `unsafe` FFI) — catching type/FFI errors locally. Only *running* Linux
+> tests still needs the CI Linux runner (no cross-execution).
 
 Most of this codebase was written on an **offline Windows** host. Several
 limitations there are **not fundamental** and should be **re-checked on a
@@ -154,8 +161,11 @@ on the new environment before assuming it's still blocked.
   **Deferred to a future version:** the **iOS** (NetworkExtension + SwiftUI) shell and
   **macOS** (`pf`) kill-switch enforcement — both need an Apple toolchain/host this project
   doesn't target yet.
-- **Phase 6 (~15%):** `sendmmsg` batching + **UDP GSO send-path** (`UDP_SEGMENT`; Linux,
-  CI-verified — not buildable on this no-WSL/no-rustup host) + **observability M1 done (coordinator + relay)**:
+- **Phase 6 (~15%):** `sendmmsg` batching + **UDP GSO send-path** (`UDP_SEGMENT`) + **UDP GRO
+  receive-path** (`UDP_GRO`; one `recvmsg` coalesces a run, `GroBuffer` drains it per
+  `recv`/`try_recv`) — Linux; the `unsafe` FFI is now compile-checked here too via the
+  installed `x86_64-unknown-linux-gnu` cross-target (`cargo check --target …`), and CI runs it
+  + **observability M1 done (coordinator + relay)**:
   privacy-preserving Prometheus metrics on a `--metrics-listen` `/metrics` endpoint each
   (aggregate counters/gauges, no per-user/flow labels — NFR5; hand-rolled, dependency-free)
   **and** `#[tracing::instrument(skip_all)]` spans across the coordinator RPC handlers + the
@@ -202,4 +212,5 @@ on the new environment before assuming it's still blocked.
    **SLO burn-rate alerting** (promtool-tested + a CI `observability` job), including a
    **coordinator latency SLO** (request-duration histogram SLI → 99%-under-100ms burn-rate).
    FR4 complete.
-4. **Phase 6 / NFR1**: real-hardware throughput; UDP GSO/GRO; eBPF/XDP fast path (Linux).
+4. **Phase 6 / NFR1**: UDP GSO (send) + GRO (receive) ✅ *(done — `UdpTransport`)*; remaining:
+   real-hardware throughput; eBPF/XDP fast path (Linux).
