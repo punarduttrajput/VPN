@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Ferrum VPN launcher icon — shield shape in brand blue -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Background -->
+    <path
+        android:fillColor="#1A237E"
+        android:pathData="M0,0 L108,0 L108,108 L0,108 Z" />
+
+    <!-- Shield body -->
+    <path
+        android:fillColor="#5C6BC0"
+        android:pathData="M54,18 L82,30 L82,54 C82,70 68,81 54,87 C40,81 26,70 26,54 L26,30 Z" />
+
+    <!-- Shield highlight -->
+    <path
+        android:fillColor="#7986CB"
+        android:pathData="M54,22 L78,33 L78,54 C78,68 66,78 54,83 L54,22 Z" />
+
+    <!-- Lock icon -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,42 C50.7,42 48,44.7 48,48 L48,50 L46,50 L46,62 L62,62 L62,50 L60,50 L60,48 C60,44.7 57.3,42 54,42 Z
+                          M54,44.5 C55.9,44.5 57.5,46.1 57.5,48 L57.5,50 L50.5,50 L50.5,48 C50.5,46.1 52.1,44.5 54,44.5 Z
+                          M54,54 C55.1,54 56,54.9 56,56 C56,56.8 55.5,57.5 54.8,57.8 L55.5,60 L52.5,60 L53.2,57.8 C52.5,57.5 52,56.8 52,56 C52,54.9 52.9,54 54,54 Z" />
+</vector>

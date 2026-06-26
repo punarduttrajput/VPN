@@ -1,4 +1,5 @@
 import java.io.ByteArrayOutputStream
+import java.util.Properties
 
 plugins {
     alias(libs.plugins.android.application)
@@ -15,9 +16,9 @@ val rustTargets = mapOf(
     "i686-linux-android"      to "x86",
 )
 
-val rustWorkspaceDir = rootDir.resolve("../../../").canonicalFile
+val rustWorkspaceDir = rootDir.resolve("../../").canonicalFile
 val jniOutDir = projectDir.resolve("src/main/jniLibs")
-val bindingsKotlinDir = rootDir.resolve("../../../crates/client-core/bindings/kotlin").canonicalFile
+val bindingsKotlinDir = rootDir.resolve("../../crates/client-core/bindings/kotlin").canonicalFile
 
 val buildRustJni by tasks.registering {
     group = "build"
@@ -53,12 +54,10 @@ val buildRustJni by tasks.registering {
                     "--release",
                     "--target", triple,
                 )
-                environment(
-                    "CARGO_NET_OFFLINE", "false",
-                    "CC_${triple.replace('-', '_')}", "$toolchainBin/$clang",
-                    "CARGO_TARGET_${triple.replace('-', '_').uppercase()}_LINKER", "$toolchainBin/$clang",
-                    "ANDROID_NDK_HOME", ndkHome,
-                )
+                environment("CARGO_NET_OFFLINE", "false")
+                environment("CC_${triple.replace('-', '_')}", "$toolchainBin/$clang")
+                environment("CARGO_TARGET_${triple.replace('-', '_').uppercase()}_LINKER", "$toolchainBin/$clang")
+                environment("ANDROID_NDK_HOME", ndkHome)
             }
 
             val soSrc = rustWorkspaceDir.resolve("target/$triple/release/libferrum_client_core.so")
@@ -100,6 +99,12 @@ val generateKotlinBindings by tasks.registering {
 }
 
 // ── Android ───────────────────────────────────────────────────────────────────
+
+// Load signing credentials from keystore.properties (never committed to git).
+val keystoreProps = Properties()
+val keystoreFile = rootDir.resolve("keystore.properties")
+if (keystoreFile.exists()) keystoreProps.load(keystoreFile.inputStream())
+
 android {
     namespace = "com.plasmacomp.ferrum"
     compileSdk = 35
@@ -112,10 +117,23 @@ android {
         versionName = "0.1.0"
     }
 
+    signingConfigs {
+        create("release") {
+            val ksFile = rootDir.resolve(keystoreProps.getProperty("storeFile", "ferrum-release.jks"))
+            if (ksFile.exists()) {
+                storeFile     = ksFile
+                storePassword = keystoreProps.getProperty("storePassword")
+                keyAlias      = keystoreProps.getProperty("keyAlias")
+                keyPassword   = keystoreProps.getProperty("keyPassword")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            signingConfig = signingConfigs.getByName("release")
         }
     }
 

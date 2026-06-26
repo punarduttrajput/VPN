@@ -76,7 +76,7 @@ class FerrumVpnService : VpnService() {
         val identity = ClientIdentity(
             publicKey = publicKey,
             name      = deviceName,
-            endpoint  = null,
+            endpoint  = "",
             tags      = emptyList(),
         )
 
@@ -122,8 +122,9 @@ class FerrumVpnService : VpnService() {
                             _address.value = c.address()
                         }
                         is ClientEvent.TrafficBlocked -> { /* kill-switch: no OS-level enforcement on Android */ }
-                        is ClientEvent.Error          -> updateNotification("Error: ${ev.v1}")
+                        is ClientEvent.Exception      -> updateNotification("Error: ${ev.v1}")
                         null                          -> break
+                        else                          -> { /* future variants */ }
                     }
                 }
             }

@@ -105,7 +105,7 @@ private fun StatusIndicator(state: ConnectionState) {
         ConnectionState.CONNECTING,
         ConnectionState.RECONNECTING -> Icons.Default.Sync
         ConnectionState.FAILED       -> Icons.Default.Error
-        ConnectionState.DISCONNECTED -> Icons.Default.ShieldOutlined
+        ConnectionState.DISCONNECTED -> Icons.Default.Shield
     }
     Icon(imageVector = icon, contentDescription = null, tint = color, modifier = Modifier.size(80.dp))
 }

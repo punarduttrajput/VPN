@@ -12,6 +12,14 @@
 # Android JNI libs (reproducible via scripts/build-android.ps1)
 /clients/android/app/src/main/jniLibs/
 
+# Android release signing — NEVER commit these
+/clients/android/*.jks
+/clients/android/keystore.properties
+
+# Android build output
+/clients/android/.gradle/
+/clients/android/app/build/
+
 # Editor / OS
 .DS_Store
 *.swp
