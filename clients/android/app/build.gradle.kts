@@ -174,7 +174,9 @@ dependencies {
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.androidx.datastore.preferences)
     implementation(libs.androidx.security.crypto)
-    // JNA is required by uniffi's Kotlin runtime
-    implementation(libs.jna)
+    // JNA is required by uniffi's Kotlin runtime. MUST be the @aar artifact:
+    // it bundles libjnidispatch.so for each Android ABI. The plain jar ships only
+    // desktop JVM natives, so the first native call crashes with UnsatisfiedLinkError.
+    implementation("${libs.jna.get().module}:${libs.jna.get().versionConstraint}@aar")
     debugImplementation(libs.androidx.ui.tooling)
 }
