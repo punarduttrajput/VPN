@@ -1,0 +1,35 @@
+# Project-level Cargo config.
+# Overrides the global ~/.cargo/config.toml offline flag so `cargo build` can
+# fetch crates normally. Use `CARGO_NET_OFFLINE=true cargo …` to force offline.
+[net]
+offline = false
+
+# ── Android cross-compilation ──────────────────────────────────────────────────
+# Set ANDROID_NDK_HOME before building, e.g.:
+#   $env:ANDROID_NDK_HOME = "C:\Android\Sdk\ndk\27.2.12479018"
+# Then run: .\scripts\build-android.ps1 [-Release]
+#
+# The linker paths below use the ANDROID_NDK_HOME env var via a wrapper
+# script strategy. When building directly (not via the script), set:
+#   CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=<ndk>/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android35-clang
+# (and similarly for the other triples).
+#
+# The build-android.ps1 script sets all required env vars automatically.
+
+# NDK 27.2.12479018 installed at C:\Android\Sdk\ndk\27.2.12479018
+# The .cmd wrappers are required on Windows (bare clang scripts are for Unix shells).
+[target.aarch64-linux-android]
+linker = "C:\\Android\\Sdk\\ndk\\27.2.12479018\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\aarch64-linux-android35-clang.cmd"
+ar     = "C:\\Android\\Sdk\\ndk\\27.2.12479018\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\llvm-ar.exe"
+
+[target.armv7-linux-androideabi]
+linker = "C:\\Android\\Sdk\\ndk\\27.2.12479018\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\armv7a-linux-androideabi35-clang.cmd"
+ar     = "C:\\Android\\Sdk\\ndk\\27.2.12479018\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\llvm-ar.exe"
+
+[target.x86_64-linux-android]
+linker = "C:\\Android\\Sdk\\ndk\\27.2.12479018\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\x86_64-linux-android35-clang.cmd"
+ar     = "C:\\Android\\Sdk\\ndk\\27.2.12479018\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\llvm-ar.exe"
+
+[target.i686-linux-android]
+linker = "C:\\Android\\Sdk\\ndk\\27.2.12479018\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\i686-linux-android35-clang.cmd"
+ar     = "C:\\Android\\Sdk\\ndk\\27.2.12479018\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\llvm-ar.exe"

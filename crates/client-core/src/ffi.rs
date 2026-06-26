@@ -25,6 +25,30 @@ use crate::{
     ReconnectPolicy,
 };
 
+/// A Curve25519 keypair returned by [`generate_keypair`].
+#[derive(uniffi::Record)]
+pub struct Keypair {
+    pub private_key: String,
+    pub public_key: String,
+}
+
+/// Generate a fresh WireGuard (Curve25519) keypair using the OS CSPRNG.
+///
+/// Returns base64-encoded private and public keys that are immediately usable
+/// with the coordinator registration and the data-plane `run()` call. Native
+/// shells must store the private key securely (Keychain / Android Keystore)
+/// and register the public key with the coordinator.
+#[uniffi::export]
+pub fn generate_keypair() -> Keypair {
+    // ferrum-core is always a direct dependency of client-core; use its
+    // well-tested Curve25519 path rather than duplicating the crypto.
+    let kp = ferrum_core::keys::KeyPair::generate();
+    Keypair {
+        private_key: kp.private_base64(),
+        public_key: kp.public_base64(),
+    }
+}
+
 /// FFI handle to a VPN client. Construct with [`FfiFerrumClient::new`], then drive
 /// the connection and observe state through the exported methods.
 #[derive(uniffi::Object)]
