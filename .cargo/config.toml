@@ -16,14 +16,20 @@ offline = false
 #
 # The build-android.ps1 script sets all required env vars automatically.
 
+# NDK 27.2.12479018 installed at C:\Android\Sdk\ndk\27.2.12479018
+# The .cmd wrappers are required on Windows (bare clang scripts are for Unix shells).
 [target.aarch64-linux-android]
-# Linker set via CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER env var (set by build-android.ps1)
+linker = "C:\\Android\\Sdk\\ndk\\27.2.12479018\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\aarch64-linux-android35-clang.cmd"
+ar     = "C:\\Android\\Sdk\\ndk\\27.2.12479018\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\llvm-ar.exe"
 
 [target.armv7-linux-androideabi]
-# Linker set via CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER env var
+linker = "C:\\Android\\Sdk\\ndk\\27.2.12479018\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\armv7a-linux-androideabi35-clang.cmd"
+ar     = "C:\\Android\\Sdk\\ndk\\27.2.12479018\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\llvm-ar.exe"
 
 [target.x86_64-linux-android]
-# Linker set via CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER env var
+linker = "C:\\Android\\Sdk\\ndk\\27.2.12479018\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\x86_64-linux-android35-clang.cmd"
+ar     = "C:\\Android\\Sdk\\ndk\\27.2.12479018\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\llvm-ar.exe"
 
 [target.i686-linux-android]
-# Linker set via CARGO_TARGET_I686_LINUX_ANDROID_LINKER env var
+linker = "C:\\Android\\Sdk\\ndk\\27.2.12479018\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\i686-linux-android35-clang.cmd"
+ar     = "C:\\Android\\Sdk\\ndk\\27.2.12479018\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\llvm-ar.exe"

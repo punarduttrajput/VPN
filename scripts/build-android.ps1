@@ -73,10 +73,10 @@ $Targets = [ordered]@{
 }
 
 $ClangForTriple = @{
-    "aarch64-linux-android"   = "aarch64-linux-android35-clang"
-    "armv7-linux-androideabi" = "armv7a-linux-androideabi35-clang"
-    "x86_64-linux-android"    = "x86_64-linux-android35-clang"
-    "i686-linux-android"      = "i686-linux-android35-clang"
+    "aarch64-linux-android"   = "aarch64-linux-android35-clang.cmd"
+    "armv7-linux-androideabi" = "armv7a-linux-androideabi35-clang.cmd"
+    "x86_64-linux-android"    = "x86_64-linux-android35-clang.cmd"
+    "i686-linux-android"      = "i686-linux-android35-clang.cmd"
 }
 
 if ($Abi) {

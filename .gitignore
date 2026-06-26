@@ -9,6 +9,9 @@
 /crates/client-core/bindings/swift/
 /crates/client-core/bindings/kotlin/
 
+# Android JNI libs (reproducible via scripts/build-android.ps1)
+/clients/android/app/src/main/jniLibs/
+
 # Editor / OS
 .DS_Store
 *.swp
