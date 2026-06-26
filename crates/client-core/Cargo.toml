@@ -21,10 +21,11 @@ uniffi = ["dep:uniffi"]
 # Data-plane glue (Phase 5): a `FerrumClient`-driven mesh runner that ties the
 # control facade to `ferrum-tunnel::run_mesh`. Pulls in the tunnel/transport/core
 # crates, so it's opt-in — control-plane-only consumers stay lean.
-data-plane = ["dep:ferrum-tunnel", "dep:ferrum-transport", "dep:ferrum-core"]
+data-plane = ["dep:ferrum-tunnel", "dep:ferrum-transport"]
 
 [dependencies]
 ferrum-control-proto = { path = "../control-proto" }
+ferrum-core = { path = "../core" }
 tonic.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
@@ -33,7 +34,6 @@ rustls = { workspace = true, optional = true }
 uniffi = { version = "0.31", features = ["tokio", "cli"], optional = true }
 ferrum-tunnel = { path = "../tunnel", optional = true }
 ferrum-transport = { path = "../transport", optional = true }
-ferrum-core = { path = "../core", optional = true }
 
 [dev-dependencies]
 ferrum-coordinator = { path = "../coordinator", features = ["mtls"] }
