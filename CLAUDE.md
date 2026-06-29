@@ -159,9 +159,14 @@ on the new environment before assuming it's still blocked.
   four ABIs; **signed release APK builds**) + **Windows wintun IPv6** (the `tun` crate is
   IPv4-only on Windows, so a v6 tunnel address is assigned **out-of-band via `netsh interface
   ipv6`** after the adapter comes up — `configure_ipv6_windows` in `crates/tunnel/src/device.rs`;
-  IPv4-on-Windows and both families on Unix keep the in-crate path).
-  Remaining (current scope): a **privileged-helper for the desktop TUN** (so the GUI need not
-  run elevated).
+  IPv4-on-Windows and both families on Unix keep the in-crate path) + a **Windows
+  privileged-helper service** (the GUI runs **unprivileged**: the elevated parts — wintun +
+  WFP — run in a separate `ferrum-helper` LocalSystem service, driven over a named pipe; the
+  GUI ships a `ConnectConfig` and gets an event stream back — `apps/desktop/.../{ipc,service,
+  helper_client}.rs` + the `ferrum-helper` bin; pipe EOF/SCM-stop tears the tunnel + kill-switch
+  down. The Unix desktop keeps the in-process elevated-GUI model).
+  Remaining (current scope): a Unix **polkit-style helper** to also drop the elevated-GUI
+  requirement on Linux/macOS (nice-to-have — the elevated-GUI path works today).
   **Deferred to a future version:** the **iOS** (NetworkExtension + SwiftUI) shell and
   **macOS** (`pf`) kill-switch enforcement — both need an Apple toolchain/host this project
   doesn't target yet.
@@ -199,19 +204,23 @@ on the new environment before assuming it's still blocked.
    `FerrumClient::set_token`), and the **desktop enforces the kill-switch in the OS firewall**
    (**`nftables` on Linux + WFP on Windows** — `apps/desktop/.../killswitch.rs`). Windows
    wintun **IPv6** now lands too (out-of-band `netsh interface ipv6` address assignment —
-   `tun` is IPv4-only on Windows). Remaining (current scope): a **privileged-helper for the
-   desktop TUN** (so the GUI need not run elevated) — the highest-value next build.
+   `tun` is IPv4-only on Windows), and the **Windows privileged-helper service** lands (the GUI
+   runs unprivileged; the elevated wintun + WFP run in a `ferrum-helper` LocalSystem service
+   driven over a named pipe — `apps/desktop/.../{ipc,service,helper_client}.rs` + the
+   `ferrum-helper` bin). Remaining (current scope): a Unix polkit-style helper (nice-to-have).
    (Phase 4 NAT traversal is functionally complete:
    signaling, STUN, relay, state machine, automatic fallback, and both local +
    coordinator-advertised relay selection all land. ICE candidate-pair prioritization
    (`tunnel::ice`) and the desktop-GUI relay/STUN fields now land too — Phase 4 hardening is complete.)
-2. **Phase 5 — privileged-helper for the desktop TUN** *(next, current scope)*: a small
-   elevated helper that owns TUN creation and hands the fd/handle to an unprivileged GUI over
-   local IPC (Windows service + named pipe; Linux polkit-authorized helper passing the tun fd
-   over a Unix socket via `SCM_RIGHTS` — `device::from_fd` already exists). The last remaining
-   in-scope Phase 5 item. *(The **Android shell** already landed — `clients/android/`,
-   `FerrumVpnService` + Compose, signed APK. iOS + macOS deferred to a future version — need an
-   Apple toolchain/host this project doesn't target yet.)*
+2. **Phase 5 — Unix privileged helper** *(next, current scope; nice-to-have)*: a
+   polkit-authorized helper that owns TUN creation and passes the fd to an unprivileged
+   Linux/macOS GUI over a Unix socket via `SCM_RIGHTS` (`device::from_fd` already exists) — the
+   Unix analogue of the **Windows `ferrum-helper` service that already landed** (GUI runs
+   unprivileged; elevated wintun + WFP in a LocalSystem service over a named pipe —
+   `apps/desktop/.../{ipc,service,helper_client}.rs`). The Unix elevated-GUI path works today,
+   so this is a polish item rather than a blocker. *(The **Android shell** already landed —
+   `clients/android/`, `FerrumVpnService` + Compose, signed APK. iOS + macOS deferred to a
+   future version — need an Apple toolchain/host this project doesn't target yet.)*
 3. **Phase 6 — observability (M1)** ✅ *(done)*: coordinator *and* relay
    Prometheus metrics (`--metrics-listen` → `/metrics`, aggregate counts only per NFR5) +
    `#[tracing::instrument(skip_all)]` spans across the coordinator RPC handlers + relay loop
