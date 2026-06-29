@@ -45,14 +45,13 @@ mod imp {
     /// platform, so the I/O path below is shared; only adapter creation differs
     /// (and the `tun` crate handles that per-platform).
     ///
-    /// Windows note: the wintun adapter only takes an **IPv4** address. The `tun`
-    /// crate's Windows backend stores the configured address as an `Ipv4Addr` and
-    /// would *panic* on an IPv6 one, so [`Self::open`] rejects an IPv6 tunnel
-    /// address with a clean error there (see the guard below). Full IPv6 support
-    /// would need the v6 address set out-of-band (e.g. `netsh interface ipv6` on
-    /// the named adapter, or `wintun`'s `set_network_addresses_tuple`, neither of
-    /// which the `tun` crate exposes) and is a documented follow-up. Unix handles
-    /// v4 and v6 alike.
+    /// Windows note: the `tun` crate's Windows (wintun) backend is **IPv4-only** —
+    /// it stores the configured address as an `Ipv4Addr` and would *panic* on an
+    /// IPv6 one. So for an IPv6 tunnel on Windows, [`Self::open`] brings the
+    /// adapter up *without* an address through the crate and then assigns the v6
+    /// address + MTU **out-of-band via `netsh interface ipv6`** on the named
+    /// adapter (see [`configure_ipv6_windows`]). IPv4 on Windows, and both
+    /// families on Unix, are configured by the `tun` crate directly.
     pub struct RealTun {
         dev: AsyncDevice,
     }
@@ -61,31 +60,99 @@ mod imp {
         /// Create and bring up the interface (requires elevated privileges; on
         /// Windows also requires `wintun.dll` to be loadable at runtime).
         pub fn open(cfg: &TunConfig) -> Result<Self> {
-            // On Windows the wintun backend is IPv4-only; an IPv6 address would
-            // panic inside the `tun` crate (`Ipv4Addr` conversion `unwrap`). Reject
-            // it cleanly before touching the driver (no elevation needed to hit
-            // this path). On Unix the kernel configures either family.
-            #[cfg(windows)]
-            if cfg.address.addr.is_ipv6() {
-                return Err(crate::TunnelError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "IPv6 tunnel addresses are not yet supported on Windows (wintun); use IPv4",
-                )));
-            }
             let mut tcfg = tun::Configuration::default();
-            tcfg.name(&cfg.name)
-                .address(cfg.address.addr)
-                .mtu(cfg.mtu as i32)
-                .up();
-            // Netmask derived from prefix for IPv4.
-            if cfg.address.addr.is_ipv4() {
-                let mask = prefix_to_netmask_v4(cfg.address.prefix);
-                tcfg.netmask(mask);
+            tcfg.name(&cfg.name).mtu(cfg.mtu as i32).up();
+
+            // The `tun` crate's Windows (wintun) backend is IPv4-only and panics
+            // on an IPv6 address, so for an IPv6 tunnel on Windows we leave the
+            // address off here and assign it via `netsh` after the adapter exists.
+            // Everywhere else (and for IPv4 on Windows) the crate sets it directly.
+            let v6_out_of_band = cfg!(windows) && cfg.address.addr.is_ipv6();
+            if !v6_out_of_band {
+                tcfg.address(cfg.address.addr);
+                if cfg.address.addr.is_ipv4() {
+                    tcfg.netmask(prefix_to_netmask_v4(cfg.address.prefix));
+                }
             }
+
             let dev = tun::create_as_async(&tcfg)
                 .map_err(|e| crate::TunnelError::Io(std::io::Error::other(e.to_string())))?;
+
+            #[cfg(windows)]
+            if v6_out_of_band {
+                configure_ipv6_windows(cfg)?;
+            }
+
             Ok(Self { dev })
         }
+    }
+
+    /// Assign an IPv6 address (with its on-link prefix) and MTU to the named
+    /// wintun adapter via `netsh`, working around the `tun` crate's IPv4-only
+    /// Windows backend. Called only after the adapter exists; needs elevation.
+    #[cfg(windows)]
+    fn configure_ipv6_windows(cfg: &TunConfig) -> Result<()> {
+        run_netsh(&netsh_add_v6_address_args(
+            &cfg.name,
+            cfg.address.addr,
+            cfg.address.prefix,
+        ))?;
+        run_netsh(&netsh_set_v6_mtu_args(&cfg.name, cfg.mtu))?;
+        Ok(())
+    }
+
+    /// Build the `netsh interface ipv6 add address …` argument vector. Factored
+    /// out (and `IpAddr`-typed) so it is unit-testable without invoking `netsh`.
+    /// The address carries its prefix (`fd00::1/64`), which sets the on-link route
+    /// — the v6 analogue of the IPv4 address+netmask pair.
+    #[cfg(windows)]
+    fn netsh_add_v6_address_args(name: &str, addr: std::net::IpAddr, prefix: u8) -> Vec<String> {
+        vec![
+            "interface".into(),
+            "ipv6".into(),
+            "add".into(),
+            "address".into(),
+            format!("interface={name}"),
+            format!("address={addr}/{prefix}"),
+        ]
+    }
+
+    /// Build the `netsh interface ipv6 set subinterface …` MTU argument vector.
+    #[cfg(windows)]
+    fn netsh_set_v6_mtu_args(name: &str, mtu: u16) -> Vec<String> {
+        vec![
+            "interface".into(),
+            "ipv6".into(),
+            "set".into(),
+            "subinterface".into(),
+            format!("interface={name}"),
+            format!("mtu={mtu}"),
+            "store=active".into(),
+        ]
+    }
+
+    /// Run `netsh` with `args`, mapping a spawn failure or non-zero exit to a
+    /// clear [`crate::TunnelError::Io`].
+    #[cfg(windows)]
+    fn run_netsh(args: &[String]) -> Result<()> {
+        let out = std::process::Command::new("netsh")
+            .args(args)
+            .output()
+            .map_err(|e| {
+                crate::TunnelError::Io(std::io::Error::other(format!("failed to spawn netsh: {e}")))
+            })?;
+        if !out.status.success() {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(crate::TunnelError::Io(std::io::Error::other(format!(
+                "`netsh {}` failed ({}): {} {}",
+                args.join(" "),
+                out.status,
+                stdout.trim(),
+                stderr.trim(),
+            ))));
+        }
+        Ok(())
     }
 
     impl TunDevice for RealTun {
@@ -132,24 +199,44 @@ mod imp {
             assert_eq!(prefix_to_netmask_v4(0), std::net::Ipv4Addr::new(0, 0, 0, 0));
         }
 
-        /// On Windows, an IPv6 tunnel address must fail with a clean error rather
-        /// than panicking inside the `tun` crate. This returns before any driver
-        /// access, so it needs no elevation / loadable `wintun.dll`.
+        /// On Windows an IPv6 tunnel address is assigned out-of-band via `netsh`
+        /// (the `tun` crate is IPv4-only there). These cover the pure arg-building
+        /// — no elevation / driver access — so they run on any Windows host. The
+        /// address carries its `/prefix`, mirroring the IPv4 address+netmask pair.
         #[cfg(windows)]
         #[test]
-        fn open_rejects_ipv6_on_windows() {
-            let cfg = TunConfig {
-                name: "ferrum-test".to_string(),
-                address: "fd00::1/64".parse().unwrap(),
-                mtu: 1280,
-            };
-            match RealTun::open(&cfg) {
-                Err(crate::TunnelError::Io(e)) => {
-                    assert_eq!(e.kind(), std::io::ErrorKind::Unsupported)
-                }
-                Err(other) => panic!("expected an Io(Unsupported) error, got {other:?}"),
-                Ok(_) => panic!("IPv6 must be rejected on Windows"),
-            }
+        fn netsh_v6_address_args_are_correct() {
+            let addr: std::net::IpAddr = "fd00::1".parse().unwrap();
+            let expected: Vec<String> = [
+                "interface",
+                "ipv6",
+                "add",
+                "address",
+                "interface=ferrum0",
+                "address=fd00::1/64",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+            assert_eq!(netsh_add_v6_address_args("ferrum0", addr, 64), expected);
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn netsh_v6_mtu_args_are_correct() {
+            let expected: Vec<String> = [
+                "interface",
+                "ipv6",
+                "set",
+                "subinterface",
+                "interface=ferrum0",
+                "mtu=1280",
+                "store=active",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+            assert_eq!(netsh_set_v6_mtu_args("ferrum0", 1280), expected);
         }
     }
 }
