@@ -88,7 +88,7 @@ Linux / online machine** — several "deferred / blocked" items may now be doabl
 | Was blocked on offline-Windows | Re-check on the new box |
 |---|---|
 | **`cargo add <crate>`** — registry was offline-pinned (`--offline`). This forced workarounds (e.g. OIDC JWT verify hand-rolled on the in-tree `ring` instead of `jsonwebtoken`; no `uniffi`). | If cargo is online, new deps (`uniffi`, STUN/ICE crates, etc.) become available — Phase 5 bindings and more open up. |
-| **Real TUN device** — was assumed Unix-only; tests use a mock and `verify-linux.sh` was run via Codespaces. | The `real-tun` data plane now runs on **Windows too** (wintun via the `tun` crate; `wintun.dll` vendored in `vendor/wintun/`) — see the 2026-06-25 STATUS log. On Linux you can run the real data plane + `verify-linux.sh` locally (root); on Windows, run elevated. |
+| **Real TUN device** — was assumed Unix-only; tests use a mock and `verify-linux.sh` was run via Codespaces. | The `real-tun` data plane now runs on **Windows too** (wintun via the `tun` crate; `wintun.dll` vendored in `vendor/wintun/`; IPv6 on Windows assigned out-of-band via `netsh interface ipv6`) — see the 2026-06-25 + 2026-06-29 STATUS logs. On Linux you can run the real data plane + `verify-linux.sh` locally (root); on Windows, run elevated. |
 | **Real-hardware NFR1 throughput** — only informational on shared CI (~0.52 of a 1 Gbps shaped link vs 0.70 target). | Measure on real/representative hardware with `STRICT_THROUGHPUT=1`. |
 | **Windows UDP gotcha** — sending to a dead port triggers ICMP-unreachable → `WSAECONNRESET` on the next `recv_from`, killing the loop (a test had to use a drained "sink" socket, not a blackhole). | Linux doesn't do this; the workaround is harmless but unnecessary there. |
 | Live **third-party MASQUE proxy** interop — no external proxy available. | Test against a real RFC 9298 proxy if one is reachable. |
@@ -138,7 +138,7 @@ on the new environment before assuming it's still blocked.
   before the public/server-reflexive endpoint). The Tauri desktop now also exposes
   **STUN-server + relay-override fields** in its connect form (gathers/publishes
   candidates; overrides the advertised relay). **Phase 4 hardening is complete.**
-- **Phase 5 (~35%):** shared `FerrumClient` core (M1) + `uniffi` bindings (Swift/Kotlin
+- **Phase 5 (~80%):** shared `FerrumClient` core (M1) + `uniffi` bindings (Swift/Kotlin
   generate from `FfiFerrumClient`) + data-plane glue (`run_mesh_session`) + the
   TUN-from-fd FFI entry (`device::from_fd` + `FfiFerrumClient::run`/`stop`) + a Tauri
   desktop shell (`apps/desktop`) whose **`connect` drives the real data plane on the
@@ -153,11 +153,15 @@ on the new environment before assuming it's still blocked.
   loopback/tunnel/coordinator — **Linux via `nftables`** *and* **Windows via the Windows
   Filtering Platform**: a dedicated WFP provider/sublayer with a default-block + higher-weight
   permit filters at the `ALE_AUTH_CONNECT` v4/v6 layers, installed in a transaction and torn
-  down by filter-id; see `apps/desktop/.../killswitch.rs`).
-  Remaining (current scope): an **Android** shell over the `uniffi` Kotlin bindings, a
-  privileged-helper for the desktop TUN, and full Windows wintun **IPv6** (blocked on the
-  `tun` crate being IPv4-only on Windows — an IPv6 address now fails cleanly instead of
-  panicking; the `netsh`/`wintun` v6 path needs a live elevated Windows box to build safely).
+  down by filter-id; see `apps/desktop/.../killswitch.rs`) + an **Android** shell over the
+  `uniffi` Kotlin bindings (`clients/android/`: `FerrumVpnService` extends `VpnService`,
+  Compose UI, Keystore-backed creds; `build-android.ps1` cross-compiles the cdylib for all
+  four ABIs; **signed release APK builds**) + **Windows wintun IPv6** (the `tun` crate is
+  IPv4-only on Windows, so a v6 tunnel address is assigned **out-of-band via `netsh interface
+  ipv6`** after the adapter comes up — `configure_ipv6_windows` in `crates/tunnel/src/device.rs`;
+  IPv4-on-Windows and both families on Unix keep the in-crate path).
+  Remaining (current scope): a **privileged-helper for the desktop TUN** (so the GUI need not
+  run elevated).
   **Deferred to a future version:** the **iOS** (NetworkExtension + SwiftUI) shell and
   **macOS** (`pf`) kill-switch enforcement — both need an Apple toolchain/host this project
   doesn't target yet.
@@ -193,16 +197,21 @@ on the new environment before assuming it's still blocked.
    `FerrumClient` facade / data-plane glue and FFI; **both `ferrum up-mesh` and the Tauri
    desktop run on the supervisor** (always-on auto-reconnect; OIDC token via
    `FerrumClient::set_token`), and the **desktop enforces the kill-switch in the OS firewall**
-   (**`nftables` on Linux + WFP on Windows** — `apps/desktop/.../killswitch.rs`). Remaining
-   (current scope): a privileged-helper for the desktop TUN; full Windows wintun IPv6
-   (`tun`-crate-blocked — fails cleanly today; needs a live elevated Windows box).
+   (**`nftables` on Linux + WFP on Windows** — `apps/desktop/.../killswitch.rs`). Windows
+   wintun **IPv6** now lands too (out-of-band `netsh interface ipv6` address assignment —
+   `tun` is IPv4-only on Windows). Remaining (current scope): a **privileged-helper for the
+   desktop TUN** (so the GUI need not run elevated) — the highest-value next build.
    (Phase 4 NAT traversal is functionally complete:
    signaling, STUN, relay, state machine, automatic fallback, and both local +
    coordinator-advertised relay selection all land. ICE candidate-pair prioritization
    (`tunnel::ice`) and the desktop-GUI relay/STUN fields now land too — Phase 4 hardening is complete.)
-2. **Phase 5 — Android shell**: `FerrumService` + Compose over the existing `uniffi`
-   Kotlin bindings (needs an Android toolchain). *(iOS + macOS deferred to a future version —
-   need an Apple toolchain/host this project doesn't target yet.)*
+2. **Phase 5 — privileged-helper for the desktop TUN** *(next, current scope)*: a small
+   elevated helper that owns TUN creation and hands the fd/handle to an unprivileged GUI over
+   local IPC (Windows service + named pipe; Linux polkit-authorized helper passing the tun fd
+   over a Unix socket via `SCM_RIGHTS` — `device::from_fd` already exists). The last remaining
+   in-scope Phase 5 item. *(The **Android shell** already landed — `clients/android/`,
+   `FerrumVpnService` + Compose, signed APK. iOS + macOS deferred to a future version — need an
+   Apple toolchain/host this project doesn't target yet.)*
 3. **Phase 6 — observability (M1)** ✅ *(done)*: coordinator *and* relay
    Prometheus metrics (`--metrics-listen` → `/metrics`, aggregate counts only per NFR5) +
    `#[tracing::instrument(skip_all)]` spans across the coordinator RPC handlers + relay loop
