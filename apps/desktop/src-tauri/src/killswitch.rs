@@ -9,12 +9,17 @@
 //!
 //! [`ClientEvent`]: ferrum_client_core::ClientEvent
 //!
-//! On Linux we drive `nftables` (`nft`): a dedicated `inet ferrum_killswitch`
-//! table with an `output` chain whose policy is `drop`, accepting only loopback,
+//! On Linux we drive `nftables` (`nft`) via [`ferrum_tunnel::firewall`] (shared
+//! with the Phase 5 privileged-helper daemon so the rule generation and `nft`
+//! invocation aren't duplicated): a dedicated `inet ferrum_killswitch` table
+//! with an `output` chain whose policy is `drop`, accepting only loopback,
 //! egress over the tunnel interface, and the coordinator endpoint(s) — so the
 //! control plane can still reconnect while everything else is blocked. A dedicated
 //! table makes teardown atomic (`nft delete table …`) and easy to clear by hand if
-//! the app ever dies mid-engage.
+//! the app ever dies mid-engage. **This process tries the privileged helper
+//! daemon first** ([`ask_helper`]), so it doesn't need to be root itself; it
+//! only falls back to running `nft` in-process (needing this process to be
+//! elevated) when the helper isn't reachable.
 //!
 //! On Windows we drive the **Windows Filtering Platform** (WFP) directly via the
 //! `windows` crate: a dedicated provider + sublayer (our "namespace", the analog
@@ -31,53 +36,11 @@
 
 use std::net::IpAddr;
 
-/// The dedicated firewall table/anchor name — namespaced so teardown never
-/// touches unrelated rules and a stale ruleset is obvious and easy to drop.
-pub const TABLE: &str = "ferrum_killswitch";
-
-/// Build the `nft -f -` script that engages the kill-switch on `iface`, allowing
-/// outbound only to loopback, the tunnel interface, and each address in
-/// `allow_ips` (the coordinator/relay endpoints, so reconnect still works).
-///
-/// Pure (no I/O) so the rule logic is unit-testable without root or a live `nft`.
-// Called by `engage` on Linux and by the unit tests on every platform; unused in
-// a non-Linux, non-test build.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub fn engage_script(iface: &str, allow_ips: &[IpAddr]) -> String {
-    let mut allow = String::new();
-    for ip in allow_ips {
-        match ip {
-            IpAddr::V4(v4) => allow.push_str(&format!("    ip daddr {v4} accept\n")),
-            IpAddr::V6(v6) => allow.push_str(&format!("    ip6 daddr {v6} accept\n")),
-        }
-    }
-    // Flush first so re-engaging is idempotent (a prior table is replaced, not
-    // duplicated). Policy `drop` blocks everything not explicitly accepted.
-    format!(
-        "add table inet {TABLE}
-delete table inet {TABLE}
-table inet {TABLE} {{
-  chain output {{
-    type filter hook output priority 0; policy drop;
-    oifname \"lo\" accept
-    oifname \"{iface}\" accept
-{allow}  }}
-}}
-"
-    )
-}
-
-/// Arguments to `nft` that remove the kill-switch table (disengage / teardown).
-// Used by `disengage` on Linux and by the unit tests; unused otherwise.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub fn disengage_args() -> [&'static str; 4] {
-    ["delete", "table", "inet", TABLE]
-}
-
 /// A single platform-neutral firewall rule the kill-switch needs installed. This
-/// is the Windows analog of [`engage_script`]'s text: a declarative description of
-/// the leak-block ruleset that the WFP layer ([`wfp`]) translates into concrete
-/// filters, kept pure so the *rule logic* is unit-testable without WFP or admin.
+/// is the Windows analog of `ferrum_tunnel::firewall::engage_script`'s text: a
+/// declarative description of the leak-block ruleset that the WFP layer
+/// ([`wfp`]) translates into concrete filters, kept pure so the *rule logic*
+/// is unit-testable without WFP or admin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
 pub enum FilterSpec {
@@ -94,8 +57,9 @@ pub enum FilterSpec {
 
 /// Build the ordered set of [`FilterSpec`]s that engage the kill-switch on `iface`,
 /// permitting outbound only to loopback, the tunnel interface, and `allow_ips`.
-/// Mirrors [`engage_script`] (Linux) but in a structured form the WFP layer can
-/// consume. Pure (no I/O), so the rule logic is unit-testable on any platform.
+/// Mirrors `ferrum_tunnel::firewall::engage_script` (Linux) but in a structured
+/// form the WFP layer can consume. Pure (no I/O), so the rule logic is
+/// unit-testable on any platform.
 #[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
 pub fn engage_filters(iface: &str, allow_ips: &[IpAddr]) -> Vec<FilterSpec> {
     let mut specs = vec![
@@ -127,8 +91,17 @@ impl KillSwitch {
     pub fn engage(&mut self, iface: &str, allow_ips: &[IpAddr]) {
         #[cfg(target_os = "linux")]
         {
-            let script = engage_script(iface, allow_ips);
-            match run_nft_script(&script) {
+            let req = ferrum_tunnel::helper_proto::HelperRequest::KillSwitchEngage {
+                iface: iface.to_string(),
+                allow_ips: allow_ips.iter().map(ToString::to_string).collect(),
+            };
+            let result = match ask_helper(req) {
+                Some(r) => r,
+                None => {
+                    ferrum_tunnel::firewall::engage(iface, allow_ips).map_err(|e| e.to_string())
+                }
+            };
+            match result {
                 Ok(()) => {
                     self.applied = true;
                     log::info!(
@@ -171,7 +144,12 @@ impl KillSwitch {
             if !self.applied {
                 return;
             }
-            match run_nft(&disengage_args()) {
+            let result =
+                match ask_helper(ferrum_tunnel::helper_proto::HelperRequest::KillSwitchDisengage) {
+                    Some(r) => r,
+                    None => ferrum_tunnel::firewall::disengage().map_err(|e| e.to_string()),
+                };
+            match result {
                 Ok(()) => log::info!("kill-switch disengaged"),
                 // A missing table on teardown is fine (already gone).
                 Err(e) => log::warn!("kill-switch disengage: {e}"),
@@ -213,49 +191,30 @@ impl Drop for KillSwitch {
     }
 }
 
+/// Ask the privileged helper daemon (Phase 5) to run `req`, if it's reachable.
+///
+/// Returns `None` when the helper's socket can't be connected to at all (no
+/// daemon installed/running) — the caller falls back to doing the privileged
+/// operation in-process. Returns `Some(Err(_))` only when the helper *is*
+/// reachable but the operation itself failed (or the protocol broke), so a
+/// real failure is surfaced rather than silently retried in-process.
 #[cfg(target_os = "linux")]
-fn run_nft_script(script: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
+fn ask_helper(req: ferrum_tunnel::helper_proto::HelperRequest) -> Option<Result<(), String>> {
+    use ferrum_tunnel::helper_proto::{recv_response, send_request, HelperResponse};
+    use std::os::unix::net::UnixStream;
 
-    let mut child = Command::new("nft")
-        .arg("-f")
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    child
-        .stdin
-        .take()
-        .expect("nft stdin piped")
-        .write_all(script.as_bytes())?;
-    let out = child.wait_with_output()?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(format!(
-            "nft exited with {}: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        )))
+    let mut stream = UnixStream::connect(crate::HELPER_SOCK_PATH).ok()?;
+    if let Err(e) = send_request(&mut stream, &req) {
+        return Some(Err(e.to_string()));
     }
-}
-
-#[cfg(target_os = "linux")]
-fn run_nft(args: &[&str]) -> std::io::Result<()> {
-    use std::process::Command;
-
-    let out = Command::new("nft").args(args).output()?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(format!(
-            "nft {args:?} exited with {}: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        )))
-    }
+    Some(match recv_response(&stream) {
+        Ok((HelperResponse::Ok, _)) => Ok(()),
+        Ok((HelperResponse::Err(msg), _)) => Err(msg),
+        Ok((HelperResponse::TunOpened, _)) => {
+            Err("helper sent an unexpected TunOpened response".to_string())
+        }
+        Err(e) => Err(e.to_string()),
+    })
 }
 
 /// Windows Filtering Platform (WFP) enforcement of the kill-switch.
@@ -593,31 +552,6 @@ mod wfp {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn engage_script_blocks_by_default_and_allows_loopback_and_iface() {
-        let s = engage_script("ferrum0", &[]);
-        assert!(s.contains("policy drop"), "default must drop");
-        assert!(s.contains("oifname \"lo\" accept"));
-        assert!(s.contains("oifname \"ferrum0\" accept"));
-        // Replacing any prior table keeps re-engage idempotent.
-        assert!(s.contains(&format!("delete table inet {TABLE}")));
-        assert!(s.contains(&format!("table inet {TABLE}")));
-    }
-
-    #[test]
-    fn engage_script_allowlists_coordinator_addresses() {
-        let v4: IpAddr = "203.0.113.7".parse().unwrap();
-        let v6: IpAddr = "2001:db8::1".parse().unwrap();
-        let s = engage_script("ferrum0", &[v4, v6]);
-        assert!(s.contains("ip daddr 203.0.113.7 accept"));
-        assert!(s.contains("ip6 daddr 2001:db8::1 accept"));
-    }
-
-    #[test]
-    fn disengage_targets_only_our_table() {
-        assert_eq!(disengage_args(), ["delete", "table", "inet", TABLE]);
-    }
 
     #[test]
     fn engage_filters_blocks_by_default_and_allows_loopback_and_iface() {

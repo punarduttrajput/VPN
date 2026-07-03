@@ -8,9 +8,13 @@
 //! to learn the assigned tunnel address, opens a real TUN with it, binds a UDP
 //! mesh transport, and runs [`ferrum_client_core::data_plane::run_mesh_session`] in
 //! a background task — so the GUI actually moves packets. `disconnect` signals
-//! that task to wind down. The real TUN needs elevated privileges on a
-//! Linux/macOS host; on Windows (or without privileges) `connect` surfaces a
-//! clean error and the UI stays disconnected.
+//! that task to wind down. Opening the TUN and enforcing the kill-switch both
+//! need elevated privileges; on Linux this process tries the privileged helper
+//! daemon (Phase 5 — see [`open_tun`], `packaging/systemd/ferrum-helper.service`,
+//! and `apps/desktop/README.md`) first, so the GUI itself can stay unprivileged.
+//! Without the helper (or on Windows/macOS, or without privileges at all), it
+//! falls back to doing the privileged operation in-process, surfacing a clean
+//! error if that also fails.
 
 mod killswitch;
 
@@ -45,6 +49,70 @@ const QUIC_TUN_MTU: u16 = 1100;
 /// Default TLS / HTTP-3 `:authority` name for the QUIC/MASQUE transports when the
 /// connect form leaves the server-name field blank (mirrors the CLI default).
 const DEFAULT_SERVER_NAME: &str = "ferrum";
+/// Unix socket path of the privileged helper daemon (Phase 5), tried before
+/// falling back to an in-process TUN open. See
+/// `packaging/systemd/ferrum-helper.service` and `apps/desktop/README.md`.
+#[cfg(unix)]
+pub(crate) const HELPER_SOCK_PATH: &str = "/run/ferrum/helper.sock";
+
+/// Wraps whichever concrete `TunDevice` [`open_tun`] picked (the
+/// helper-backed device or a direct in-process open) behind one type. Manual
+/// delegation rather than `Box<dyn TunDevice>`: `TunDevice`'s async methods
+/// are return-position `impl Future`, which isn't `dyn`-compatible.
+#[cfg(unix)]
+enum EitherTun<A, B> {
+    ViaHelper(A),
+    Direct(B),
+}
+
+#[cfg(unix)]
+impl<A, B> device::TunDevice for EitherTun<A, B>
+where
+    A: device::TunDevice,
+    B: device::TunDevice,
+{
+    async fn read_packet(&mut self, buf: &mut [u8]) -> ferrum_tunnel::Result<usize> {
+        match self {
+            EitherTun::ViaHelper(d) => d.read_packet(buf).await,
+            EitherTun::Direct(d) => d.read_packet(buf).await,
+        }
+    }
+
+    async fn write_packet(&mut self, packet: &[u8]) -> ferrum_tunnel::Result<()> {
+        match self {
+            EitherTun::ViaHelper(d) => d.write_packet(packet).await,
+            EitherTun::Direct(d) => d.write_packet(packet).await,
+        }
+    }
+}
+
+/// Open the TUN device, preferring the privileged helper daemon (Phase 5) —
+/// so this process doesn't need to be elevated itself — and falling back to
+/// opening it in-process (which does need elevation) if the helper isn't
+/// reachable. On non-Unix (no helper yet) this just opens it in-process.
+#[cfg(unix)]
+fn open_tun(
+    cfg: &TunConfig,
+) -> Result<EitherTun<impl device::TunDevice, impl device::TunDevice>, String> {
+    match device::open_via_helper(HELPER_SOCK_PATH, cfg) {
+        Ok(dev) => Ok(EitherTun::ViaHelper(dev)),
+        Err(helper_err) => match device::open(cfg) {
+            Ok(dev) => Ok(EitherTun::Direct(dev)),
+            Err(direct_err) => Err(format!(
+                "opening TUN device: helper unavailable ({helper_err}); direct open also \
+                 failed ({direct_err}) — install/start ferrum-helper (see \
+                 apps/desktop/README.md) or run this app elevated"
+            )),
+        },
+    }
+}
+
+/// Non-Unix fallback: no helper daemon yet, so this just opens the TUN
+/// in-process (needs elevation).
+#[cfg(not(unix))]
+fn open_tun(cfg: &TunConfig) -> Result<impl device::TunDevice, String> {
+    device::open(cfg).map_err(|e| format!("opening TUN device (needs elevated privileges): {e}"))
+}
 
 /// A handle to the running data-plane task, kept so `disconnect` can stop it.
 struct DataPlaneHandle {
@@ -258,11 +326,7 @@ where
 {
     let make_device = move || {
         let cfg = tun_cfg.clone();
-        async move {
-            device::open(&cfg).map_err(|e| {
-                ferrum_client_core::Error::DataPlane(format!("opening TUN device: {e}"))
-            })
-        }
+        async move { open_tun(&cfg).map_err(ferrum_client_core::Error::DataPlane) }
     };
     // `candidates` (gathered from the STUN field, if any) are published on each
     // connect so peers can probe a direct path; `relay` is the local override of
@@ -417,12 +481,12 @@ async fn connect(
     };
 
     // Pre-flight the TUN once so an unsupported platform / missing privileges
-    // fails *now* with a clean UI error, rather than the always-on supervisor
-    // retrying a never-succeeding open forever. Drop it immediately; the
-    // supervisor's factory reopens a fresh device per attempt (a TUN fd is
-    // single-use). On Linux/macOS with privileges this is a brief re-open.
-    device::open(&tun_cfg)
-        .map_err(|e| format!("opening TUN device (needs privileges on Linux/macOS): {e}"))?;
+    // (and no reachable helper) fails *now* with a clean UI error, rather than
+    // the always-on supervisor retrying a never-succeeding open forever. Drop
+    // it immediately; the supervisor's factory reopens a fresh device per
+    // attempt (a TUN fd is single-use). On Linux with the helper installed —
+    // or with direct privileges — this is a brief re-open.
+    open_tun(&tun_cfg)?;
 
     // Resolve the coordinator so the kill-switch can allow-list it (reconnect
     // while blocked); empty on failure → strict block.

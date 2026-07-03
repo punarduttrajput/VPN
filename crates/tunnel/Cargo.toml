@@ -14,6 +14,11 @@ real-tun = ["dep:tun"]
 quic = ["ferrum-transport/quic"]
 # Forwarded to ferrum-transport for the MASQUE / HTTP3 transport.
 masque = ["ferrum-transport/masque"]
+# The privileged-helper IPC client/server wire protocol (Phase 5): a
+# `UnixStream`-based request/response protocol for handing a TUN fd (and
+# firewall commands) between an unprivileged GUI and a root helper daemon.
+# Independent of `real-tun` — the client side needs no TUN driver at all.
+helper-ipc = ["dep:serde", "dep:serde_json"]
 
 [dependencies]
 ferrum-core = { path = "../core" }
@@ -26,9 +31,13 @@ thiserror.workspace = true
 # Real TUN device — only compiled when the `real-tun` feature is enabled,
 # which is intended for Unix (Phase 1 scope: Linux + macOS).
 tun = { version = "0.6", features = ["async"], optional = true }
+# The helper IPC wire format (`helper-ipc` feature only).
+serde = { workspace = true, optional = true }
+serde_json = { version = "1", optional = true }
 
-# Raw fd I/O for `device::from_fd` (a platform-provided TUN fd, Phase 5). Unix
-# only; needs no driver, so it's not behind `real-tun`.
+# Raw fd I/O for `device::from_fd` (a platform-provided TUN fd, Phase 5) and
+# `fdpass`/`helper_proto`/`firewall` (Phase 5 privileged helper). Unix only;
+# needs no driver, so it's not behind `real-tun`.
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 

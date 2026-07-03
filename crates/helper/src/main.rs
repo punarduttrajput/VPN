@@ -1,0 +1,71 @@
+//! `ferrum-helper` — the Phase 5 privileged helper daemon.
+//!
+//! Splits the two privileged operations the Ferrum desktop shell needs —
+//! opening the real TUN device and installing/removing kill-switch firewall
+//! rules — out of the (unprivileged) GUI process. This daemon runs as root,
+//! listening on a Unix domain socket; the GUI connects to it and speaks the
+//! [`ferrum_tunnel::helper_proto`] request/response protocol instead of
+//! touching `/dev/net/tun` or shelling out to `nft` itself.
+//!
+//! ```text
+//! ferrum-helper --socket /run/ferrum/helper.sock --group ferrum
+//! ```
+//!
+//! The socket is `chown`'d to `--group` and `chmod 0660` (or `0666` with a
+//! warning if the group doesn't exist) — the standard Unix daemon-socket
+//! trust boundary (the same model as `docker.sock`'s `docker` group). See
+//! `packaging/systemd/ferrum-helper.service` for the systemd unit and
+//! `apps/desktop/README.md` for the one-time setup steps.
+//!
+//! **Linux/Unix only for now** (Phase 5 scope): a Windows helper would need a
+//! service host + named-pipe transport, which isn't built yet (the wire
+//! protocol is deliberately transport-agnostic so it can plug in later — see
+//! `ferrum_tunnel::helper_proto`'s module docs). On non-Unix this binary just
+//! reports that it isn't supported, so the crate still builds everywhere.
+
+use clap::Parser;
+
+/// `ferrum-helper` CLI arguments. Kept platform-independent (`clap` has no
+/// Unix-only bits) so the crate builds — inertly — on every target; the
+/// actual daemon logic is `cfg(unix)`-gated in the `unix` module.
+#[derive(Parser)]
+#[command(
+    name = "ferrum-helper",
+    version,
+    about = "Ferrum privileged helper daemon (Phase 5)"
+)]
+struct Cli {
+    /// Unix domain socket path to listen on.
+    #[arg(long, default_value = "/run/ferrum/helper.sock")]
+    socket: String,
+    /// Group the socket is `chown`'d to (mode 0660), so members can connect.
+    /// Falls back to a world-accessible socket (0666, with a warning) if the
+    /// group doesn't exist.
+    #[arg(long, default_value = "ferrum")]
+    group: String,
+}
+
+#[cfg(unix)]
+mod unix;
+
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
+    #[cfg(unix)]
+    {
+        unix::init_tracing();
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(unix::run(&cli.socket, &cli.group))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = cli;
+        anyhow::bail!(
+            "ferrum-helper is Linux/Unix-only for now; a Windows helper service \
+             is a documented follow-up (see STATUS.md)"
+        )
+    }
+}

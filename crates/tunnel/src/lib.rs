@@ -8,6 +8,13 @@ pub mod mesh;
 pub mod path;
 pub mod session;
 
+#[cfg(unix)]
+pub mod fdpass;
+#[cfg(target_os = "linux")]
+pub mod firewall;
+#[cfg(all(unix, feature = "helper-ipc"))]
+pub mod helper_proto;
+
 mod runner;
 
 pub use mesh::{run_mesh, run_mesh_relayed, MeshPeer};
