@@ -1,0 +1,27 @@
+[package]
+name = "ferrum-helper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "ferrum-helper"
+path = "src/main.rs"
+
+# `Cli` (arg parsing) is cross-platform; the daemon itself is Linux/Unix-only
+# for now (Phase 5 scope — see crate docs), so every other dependency is
+# Unix-only. This keeps `cargo build --workspace` green on the Windows CI
+# runner too: the binary just reports "not supported" there instead of failing
+# to compile (mirrors `ferrum-tunnel::device`'s non-Unix stubs).
+[dependencies]
+clap.workspace = true
+anyhow.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+ferrum-core = { path = "../core" }
+ferrum-tunnel = { path = "../tunnel", features = ["real-tun", "helper-ipc"] }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+libc.workspace = true

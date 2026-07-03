@@ -673,6 +673,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrum-helper"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ferrum-core",
+ "ferrum-tunnel",
+ "libc",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "ferrum-transport"
 version = "0.1.0"
 dependencies = [
@@ -698,6 +712,8 @@ dependencies = [
  "ferrum-core",
  "ferrum-transport",
  "libc",
+ "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

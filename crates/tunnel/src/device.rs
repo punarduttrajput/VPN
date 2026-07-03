@@ -53,6 +53,36 @@ mod imp {
     /// the named adapter, or `wintun`'s `set_network_addresses_tuple`, neither of
     /// which the `tun` crate exposes) and is a documented follow-up. Unix handles
     /// v4 and v6 alike.
+    /// Build the `tun` crate's `Configuration` for `cfg`, applying the same
+    /// Windows IPv6 guard either device-construction path needs. Shared by
+    /// [`RealTun::open`] (async, in-process privileged use) and `open_raw`
+    /// (sync, Unix-only — the privileged helper daemon's path, Phase 5) so the
+    /// two never drift apart.
+    fn build_tun_config(cfg: &TunConfig) -> Result<tun::Configuration> {
+        // On Windows the wintun backend is IPv4-only; an IPv6 address would
+        // panic inside the `tun` crate (`Ipv4Addr` conversion `unwrap`). Reject
+        // it cleanly before touching the driver (no elevation needed to hit
+        // this path). On Unix the kernel configures either family.
+        #[cfg(windows)]
+        if cfg.address.addr.is_ipv6() {
+            return Err(crate::TunnelError::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "IPv6 tunnel addresses are not yet supported on Windows (wintun); use IPv4",
+            )));
+        }
+        let mut tcfg = tun::Configuration::default();
+        tcfg.name(&cfg.name)
+            .address(cfg.address.addr)
+            .mtu(cfg.mtu as i32)
+            .up();
+        // Netmask derived from prefix for IPv4.
+        if cfg.address.addr.is_ipv4() {
+            let mask = prefix_to_netmask_v4(cfg.address.prefix);
+            tcfg.netmask(mask);
+        }
+        Ok(tcfg)
+    }
+
     pub struct RealTun {
         dev: AsyncDevice,
     }
@@ -61,31 +91,27 @@ mod imp {
         /// Create and bring up the interface (requires elevated privileges; on
         /// Windows also requires `wintun.dll` to be loadable at runtime).
         pub fn open(cfg: &TunConfig) -> Result<Self> {
-            // On Windows the wintun backend is IPv4-only; an IPv6 address would
-            // panic inside the `tun` crate (`Ipv4Addr` conversion `unwrap`). Reject
-            // it cleanly before touching the driver (no elevation needed to hit
-            // this path). On Unix the kernel configures either family.
-            #[cfg(windows)]
-            if cfg.address.addr.is_ipv6() {
-                return Err(crate::TunnelError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "IPv6 tunnel addresses are not yet supported on Windows (wintun); use IPv4",
-                )));
-            }
-            let mut tcfg = tun::Configuration::default();
-            tcfg.name(&cfg.name)
-                .address(cfg.address.addr)
-                .mtu(cfg.mtu as i32)
-                .up();
-            // Netmask derived from prefix for IPv4.
-            if cfg.address.addr.is_ipv4() {
-                let mask = prefix_to_netmask_v4(cfg.address.prefix);
-                tcfg.netmask(mask);
-            }
+            let tcfg = build_tun_config(cfg)?;
             let dev = tun::create_as_async(&tcfg)
                 .map_err(|e| crate::TunnelError::Io(std::io::Error::other(e.to_string())))?;
             Ok(Self { dev })
         }
+    }
+
+    /// Synchronously create and configure the TUN interface, returning its raw
+    /// fd rather than wrapping it (Unix only). This is what the privileged
+    /// helper daemon (Phase 5) calls: it creates the interface (needing the
+    /// same elevated privileges as [`RealTun::open`]) and hands the fd to the
+    /// unprivileged GUI process via [`crate::fdpass`], instead of driving the
+    /// device's I/O itself.
+    #[cfg(unix)]
+    pub fn open_raw(cfg: &TunConfig) -> Result<std::os::unix::io::RawFd> {
+        use std::os::unix::io::IntoRawFd;
+
+        let tcfg = build_tun_config(cfg)?;
+        let dev = tun::create(&tcfg)
+            .map_err(|e| crate::TunnelError::Io(std::io::Error::other(e.to_string())))?;
+        Ok(dev.into_raw_fd())
     }
 
     impl TunDevice for RealTun {
@@ -158,6 +184,45 @@ mod imp {
 #[cfg(all(any(unix, windows), feature = "real-tun"))]
 pub fn open(cfg: &TunConfig) -> Result<impl TunDevice> {
     imp::RealTun::open(cfg)
+}
+
+/// Synchronously create and configure the TUN device, returning its raw fd
+/// (Unix only). See [`imp::open_raw`] — used by the privileged helper daemon
+/// (Phase 5) to create the interface and hand its fd to an unprivileged caller.
+#[cfg(all(unix, feature = "real-tun"))]
+pub fn open_raw(cfg: &TunConfig) -> Result<std::os::unix::io::RawFd> {
+    imp::open_raw(cfg)
+}
+
+/// Open a TUN device by asking the privileged helper daemon (Phase 5) to
+/// create one and hand back its fd, rather than opening `/dev/net/tun`
+/// in-process. Connects to `socket_path` (the helper's `UnixListener`),
+/// sends an `OpenTun` request, and wraps the returned fd with [`from_fd`] —
+/// so the caller's I/O path is identical to the fd-from-native-shell case.
+#[cfg(all(unix, feature = "helper-ipc"))]
+pub fn open_via_helper(socket_path: &str, cfg: &TunConfig) -> Result<impl TunDevice> {
+    use crate::helper_proto::{self, HelperResponse};
+    use std::os::unix::net::UnixStream;
+
+    let mut stream = UnixStream::connect(socket_path)?;
+    helper_proto::send_request(&mut stream, &helper_proto::open_tun_request(cfg))?;
+    let (resp, fd) = helper_proto::recv_response(&stream)?;
+    match resp {
+        HelperResponse::TunOpened => {
+            let fd = fd.ok_or_else(|| {
+                crate::TunnelError::Io(std::io::Error::other(
+                    "helper reported TunOpened but sent no fd",
+                ))
+            })?;
+            from_fd(fd)
+        }
+        HelperResponse::Err(msg) => Err(crate::TunnelError::Io(std::io::Error::other(format!(
+            "helper: {msg}"
+        )))),
+        HelperResponse::Ok => Err(crate::TunnelError::Io(std::io::Error::other(
+            "helper sent an unexpected Ok response to an OpenTun request",
+        ))),
+    }
 }
 
 /// Stub when the real device is unavailable (no `real-tun` feature, or a platform
