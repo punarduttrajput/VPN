@@ -7,47 +7,56 @@
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
-    <main>
+    <!-- First-run identity setup (GUI PRD FR1): generate or import a key once;
+         saved to OS-backed secure storage so it's never re-typed again. Shown
+         instead of the connect screen until a saved identity exists. -->
+    <main id="setup-screen">
+      <header>
+        <h1>Ferrum</h1>
+      </header>
+      <p class="hint">Set up your identity once — you won't need to enter it again.</p>
+
+      <section class="form">
+        <label>Device name
+          <input id="setup-name" type="text" value="desktop" />
+        </label>
+        <label>Coordinator address
+          <input id="setup-coordinator" type="text" value="http://127.0.0.1:50051" />
+        </label>
+        <label>Advertised endpoint
+          <input id="setup-endpoint" type="text" value="0.0.0.0:51820" />
+        </label>
+
+        <div class="key-choice">
+          <button id="setup-generate" type="button">Generate a new key</button>
+          <span class="or">or</span>
+          <button id="setup-import-toggle" type="button" class="secondary">Import a key</button>
+        </div>
+        <label id="setup-import-field" class="hidden">Private key (base64)
+          <input id="setup-private-key" type="password" placeholder="wg private key" />
+        </label>
+        <label id="setup-generated-field" class="hidden">Public key
+          <span class="hint">share this with peers/the coordinator</span>
+          <input id="setup-public-key" type="text" readonly />
+        </label>
+
+        <button id="setup-save" disabled>Save &amp; continue</button>
+        <p id="setup-error" class="error hidden"></p>
+      </section>
+    </main>
+
+    <!-- Main connect screen — hidden until a saved identity is loaded. -->
+    <main id="app-screen" class="hidden">
       <header>
         <h1>Ferrum</h1>
         <span id="state" class="state disconnected">Disconnected</span>
       </header>
 
-      <section class="form">
-        <label>Coordinator
-          <input id="coordinator" type="text" value="http://127.0.0.1:50051" />
-        </label>
-        <label>Device name
-          <input id="name" type="text" value="desktop" />
-        </label>
-        <label>Private key (base64)
-          <input id="private_key" type="password" placeholder="wg private key" />
-        </label>
-        <label>Advertised endpoint
-          <input id="endpoint" type="text" value="0.0.0.0:51820" />
-        </label>
-        <label>Listen port
-          <input id="listen_port" type="number" value="51820" min="1" max="65535" />
-        </label>
-        <label>Transport
-          <select id="transport_mode">
-            <option value="udp" selected>UDP (plain)</option>
-            <option value="quic">QUIC (encrypted)</option>
-            <option value="masque">MASQUE (HTTP/3 proxy)</option>
-          </select>
-        </label>
-        <label id="server_name_field" class="hidden">Server name (TLS / :authority)
-          <input id="server_name" type="text" value="ferrum" placeholder="ferrum" />
-        </label>
-        <label id="masque_proxy_field" class="hidden">MASQUE proxy (ip:port)
-          <input id="masque_proxy" type="text" placeholder="203.0.113.10:443" />
-        </label>
-        <label>STUN server (ip:port, optional)
-          <input id="stun_server" type="text" placeholder="stun.l.google.com:19302" />
-        </label>
-        <label>Relay override (ip:port, optional)
-          <input id="relay" type="text" placeholder="leave empty to use coordinator's" />
-        </label>
+      <section class="connect-panel">
+        <div class="profile-row">
+          <span id="profile-name" class="profile-name"></span>
+          <button id="change-identity" class="link" type="button">Change identity</button>
+        </div>
         <div class="actions">
           <button id="connect">Connect</button>
           <button id="disconnect" disabled>Disconnect</button>
@@ -56,17 +65,46 @@
           <input id="kill_switch" type="checkbox" />
           Kill-switch <span id="kill-switch-state" class="badge">off</span>
         </label>
+        <p id="privilege-note" class="hint"></p>
       </section>
+
+      <details class="advanced">
+        <summary>Advanced</summary>
+        <div class="form">
+          <label>Listen port
+            <input id="listen_port" type="number" value="51820" min="1" max="65535" />
+          </label>
+          <label>Transport
+            <select id="transport_mode">
+              <option value="udp" selected>UDP (plain)</option>
+              <option value="quic">QUIC (encrypted)</option>
+              <option value="masque">MASQUE (HTTP/3 proxy)</option>
+            </select>
+          </label>
+          <label id="server_name_field" class="hidden">Server name (TLS / :authority)
+            <input id="server_name" type="text" value="ferrum" placeholder="ferrum" />
+          </label>
+          <label id="masque_proxy_field" class="hidden">MASQUE proxy (ip:port)
+            <input id="masque_proxy" type="text" placeholder="203.0.113.10:443" />
+          </label>
+          <label>STUN server (ip:port, optional)
+            <input id="stun_server" type="text" placeholder="stun.l.google.com:19302" />
+          </label>
+          <label>Relay override (ip:port, optional)
+            <input id="relay" type="text" placeholder="leave empty to use coordinator's" />
+          </label>
+        </div>
+      </details>
 
       <section>
         <h2>Peers <span id="peer-count" class="badge">0</span></h2>
         <ul id="peers" class="peers"><li class="empty">No peers</li></ul>
       </section>
 
-      <section>
-        <h2>Activity</h2>
+      <details class="activity">
+        <summary>Activity</summary>
         <ul id="log" class="log"></ul>
-      </section>
+      </details>
     </main>
     <script src="main.js"></script>
   </body>

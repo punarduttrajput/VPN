@@ -34,6 +34,13 @@ ferrum-client-core = { path = "../../../crates/client-core", features = ["data-p
 ferrum-transport = { path = "../../../crates/transport", features = ["masque"] }
 ferrum-tunnel = { path = "../../../crates/tunnel" }
 ferrum-core = { path = "../../../crates/core" }
+# Persisted identity (Phase 5 GUI PRD FR1): the WireGuard private key + profile
+# metadata are generated/imported once and stored in the OS-backed secure
+# storage instead of being re-typed on every connect. Default features cover
+# Windows (Credential Manager) + Linux (Secret Service via the pure-Rust
+# `zbus` backend, no libdbus system dependency); `apple-native-keyring-store`
+# adds macOS Keychain support.
+keyring = { version = "4", features = ["apple-native-keyring-store"] }
 
 # The real OS TUN device pulls in the `tun` driver crate: `/dev/net/tun` (or the
 # macOS utun) on Unix, the wintun adapter on Windows. Enabled on both so the

@@ -16,6 +16,7 @@
 //! falls back to doing the privileged operation in-process, surfacing a clean
 //! error if that also fails.
 
+mod identity;
 mod killswitch;
 
 use std::net::{IpAddr, SocketAddr};
@@ -619,6 +620,34 @@ fn kill_switch_enabled(state: State<'_, AppState>) -> bool {
     state.client.kill_switch_enabled()
 }
 
+/// Generate a fresh WireGuard keypair for first-run identity setup (GUI PRD
+/// FR1). Returns `(private_key, public_key)`, both base64; the caller shows
+/// the public key (safe to display) and saves the private key via
+/// `save_identity` once the user confirms the rest of the profile.
+#[tauri::command]
+fn generate_identity() -> (String, String) {
+    identity::generate_keypair()
+}
+
+/// Persist the identity/profile to OS-backed secure storage (GUI PRD FR1),
+/// overwriting any previously saved one.
+#[tauri::command]
+fn save_identity(profile: identity::Identity) -> Result<(), String> {
+    identity::save(&profile)
+}
+
+/// Load the saved identity/profile, if any (`None` on first run — not an error).
+#[tauri::command]
+fn load_identity() -> Result<Option<identity::Identity>, String> {
+    identity::load()
+}
+
+/// Remove the saved identity ("reset identity" in the UI). Idempotent.
+#[tauri::command]
+fn clear_identity() -> Result<(), String> {
+    identity::clear()
+}
+
 /// The current connection state (for the initial UI paint).
 #[tauri::command]
 fn get_status(state: State<'_, AppState>) -> String {
@@ -690,7 +719,11 @@ pub fn run() {
             get_status,
             get_peers,
             set_kill_switch,
-            kill_switch_enabled
+            kill_switch_enabled,
+            generate_identity,
+            save_identity,
+            load_identity,
+            clear_identity
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
