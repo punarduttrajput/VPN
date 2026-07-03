@@ -8,6 +8,7 @@ members = [
     "crates/control-proto",
     "crates/coordinator",
     "crates/client-core",
+    "crates/helper",
 ]
 # The Tauri desktop shell is its own workspace (heavy webview deps); keep it out
 # of the library workspace so this CI stays lean. See apps/desktop/.

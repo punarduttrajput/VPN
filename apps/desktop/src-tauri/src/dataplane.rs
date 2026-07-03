@@ -6,13 +6,14 @@
 //! * the **privileged Windows service** ([`crate::service`]) runs it on its own
 //!   client and forwards the client's event stream back to the GUI over the pipe;
 //! * the **Unix in-process path** ([`crate::run`]'s `connect`) runs it directly on
-//!   the GUI's client (Linux/macOS keep the existing elevated-GUI model).
+//!   the GUI's client (macOS keeps the existing elevated-GUI model; Linux does too,
+//!   but [`open_tun`] tries the `ferrum-helper` Unix-socket daemon first — Phase 5).
 //!
 //! It performs everything platform-independent about bring-up — parse the
 //! transport selection, derive the advertised public key, pre-register to learn
 //! the coordinator-assigned tunnel address, gather + publish NAT-traversal
 //! candidates (if a STUN server is set), build the [`TunConfig`], pre-flight the
-//! TUN once for a clean early error, then drive
+//! TUN once via [`open_tun`] for a clean early error, then drive
 //! [`run_mesh_session_supervised`] (always-on auto-reconnect) over the chosen
 //! transport until `shutdown` resolves.
 //!
@@ -43,6 +44,67 @@ const TUN_MTU: u16 = 1420;
 const QUIC_TUN_MTU: u16 = 1100;
 /// Default TLS / HTTP-3 `:authority` for QUIC/MASQUE when the form leaves it blank.
 const DEFAULT_SERVER_NAME: &str = "ferrum";
+
+/// Wraps whichever concrete `TunDevice` [`open_tun`] picked (the helper-backed
+/// device or a direct open) behind one type. Manual delegation rather than
+/// `Box<dyn TunDevice>`: `TunDevice`'s async methods are return-position
+/// `impl Future`, which isn't `dyn`-compatible.
+#[cfg(unix)]
+enum EitherTun<A, B> {
+    ViaHelper(A),
+    Direct(B),
+}
+
+#[cfg(unix)]
+impl<A, B> device::TunDevice for EitherTun<A, B>
+where
+    A: device::TunDevice,
+    B: device::TunDevice,
+{
+    async fn read_packet(&mut self, buf: &mut [u8]) -> ferrum_tunnel::Result<usize> {
+        match self {
+            EitherTun::ViaHelper(d) => d.read_packet(buf).await,
+            EitherTun::Direct(d) => d.read_packet(buf).await,
+        }
+    }
+
+    async fn write_packet(&mut self, packet: &[u8]) -> ferrum_tunnel::Result<()> {
+        match self {
+            EitherTun::ViaHelper(d) => d.write_packet(packet).await,
+            EitherTun::Direct(d) => d.write_packet(packet).await,
+        }
+    }
+}
+
+/// Open the TUN device, preferring the privileged helper daemon (Phase 5 —
+/// Linux) — so this process doesn't need to be elevated itself — and falling
+/// back to opening it in-process (which does need elevation) if the daemon
+/// isn't reachable. On Windows this runs *inside* the already-privileged
+/// `ferrum-helper` service ([`crate::service`]), so it always opens directly;
+/// same for macOS, which has no daemon yet.
+#[cfg(unix)]
+fn open_tun(
+    cfg: &TunConfig,
+) -> Result<EitherTun<impl device::TunDevice, impl device::TunDevice>, String> {
+    match device::open_via_helper(crate::HELPER_SOCK_PATH, cfg) {
+        Ok(dev) => Ok(EitherTun::ViaHelper(dev)),
+        Err(helper_err) => match device::open(cfg) {
+            Ok(dev) => Ok(EitherTun::Direct(dev)),
+            Err(direct_err) => Err(format!(
+                "opening TUN device: helper unavailable ({helper_err}); direct open also \
+                 failed ({direct_err}) — install/start ferrum-helper (see \
+                 apps/desktop/README.md) or run this app elevated"
+            )),
+        },
+    }
+}
+
+/// Non-Unix: no daemon indirection needed — Windows runs this inside the
+/// already-privileged `ferrum-helper` service.
+#[cfg(not(unix))]
+fn open_tun(cfg: &TunConfig) -> Result<impl device::TunDevice, String> {
+    device::open(cfg).map_err(|e| format!("opening TUN device (needs elevated privileges): {e}"))
+}
 
 /// Mesh wire transport chosen in the connect form.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -215,10 +277,11 @@ where
         None => Vec::new(),
     };
 
-    // Pre-flight the TUN once so an unsupported platform / missing privileges fails
-    // *now* with a clean error, rather than the supervisor retrying forever. Drop it
-    // immediately; the supervisor's factory reopens a fresh device per attempt.
-    device::open(&tun_cfg).map_err(|e| format!("opening TUN device (needs elevation): {e}"))?;
+    // Pre-flight the TUN once so an unsupported platform / missing privileges (and
+    // no reachable helper) fails *now* with a clean error, rather than the
+    // supervisor retrying forever. Drop it immediately; the supervisor's factory
+    // reopens a fresh device per attempt.
+    open_tun(&tun_cfg)?;
 
     let id = ClientIdentity {
         public_key,
@@ -323,11 +386,7 @@ where
 {
     let make_device = move || {
         let cfg = tun_cfg.clone();
-        async move {
-            device::open(&cfg).map_err(|e| {
-                ferrum_client_core::Error::DataPlane(format!("opening TUN device: {e}"))
-            })
-        }
+        async move { open_tun(&cfg).map_err(ferrum_client_core::Error::DataPlane) }
     };
     run_mesh_session_supervised(
         client,

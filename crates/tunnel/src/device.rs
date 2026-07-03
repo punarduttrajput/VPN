@@ -56,25 +56,38 @@ mod imp {
         dev: AsyncDevice,
     }
 
+    /// Build the `tun` crate's `Configuration` for `cfg`, applying the same
+    /// Windows-IPv6-out-of-band logic either device-construction path needs.
+    /// Shared by [`RealTun::open`] (async, in-process privileged use) and
+    /// `open_raw` (sync, Unix-only — the privileged helper daemon's path,
+    /// Phase 5) so the two never drift apart. Returns whether the address was
+    /// left unset (Windows + IPv6) — the caller then assigns it out-of-band.
+    fn build_tun_config(cfg: &TunConfig) -> (tun::Configuration, bool) {
+        let mut tcfg = tun::Configuration::default();
+        tcfg.name(&cfg.name).mtu(cfg.mtu as i32).up();
+
+        // The `tun` crate's Windows (wintun) backend is IPv4-only and panics
+        // on an IPv6 address, so for an IPv6 tunnel on Windows we leave the
+        // address off here and assign it via `netsh` after the adapter exists.
+        // Everywhere else (and for IPv4 on Windows) the crate sets it directly.
+        // Inert on Unix: `cfg!(windows)` is compile-time `false` there, so the
+        // address is always set in-crate (`open_raw`, Unix-only, never hits
+        // the out-of-band path).
+        let v6_out_of_band = cfg!(windows) && cfg.address.addr.is_ipv6();
+        if !v6_out_of_band {
+            tcfg.address(cfg.address.addr);
+            if cfg.address.addr.is_ipv4() {
+                tcfg.netmask(prefix_to_netmask_v4(cfg.address.prefix));
+            }
+        }
+        (tcfg, v6_out_of_band)
+    }
+
     impl RealTun {
         /// Create and bring up the interface (requires elevated privileges; on
         /// Windows also requires `wintun.dll` to be loadable at runtime).
         pub fn open(cfg: &TunConfig) -> Result<Self> {
-            let mut tcfg = tun::Configuration::default();
-            tcfg.name(&cfg.name).mtu(cfg.mtu as i32).up();
-
-            // The `tun` crate's Windows (wintun) backend is IPv4-only and panics
-            // on an IPv6 address, so for an IPv6 tunnel on Windows we leave the
-            // address off here and assign it via `netsh` after the adapter exists.
-            // Everywhere else (and for IPv4 on Windows) the crate sets it directly.
-            let v6_out_of_band = cfg!(windows) && cfg.address.addr.is_ipv6();
-            if !v6_out_of_band {
-                tcfg.address(cfg.address.addr);
-                if cfg.address.addr.is_ipv4() {
-                    tcfg.netmask(prefix_to_netmask_v4(cfg.address.prefix));
-                }
-            }
-
+            let (tcfg, v6_out_of_band) = build_tun_config(cfg);
             let dev = tun::create_as_async(&tcfg)
                 .map_err(|e| crate::TunnelError::Io(std::io::Error::other(e.to_string())))?;
 
@@ -82,9 +95,28 @@ mod imp {
             if v6_out_of_band {
                 configure_ipv6_windows(cfg)?;
             }
+            #[cfg(not(windows))]
+            let _ = v6_out_of_band;
 
             Ok(Self { dev })
         }
+    }
+
+    /// Synchronously create and configure the TUN interface, returning its raw
+    /// fd rather than wrapping it (Unix only). This is what the privileged
+    /// helper daemon (Phase 5) calls: it creates the interface (needing the
+    /// same elevated privileges as [`RealTun::open`]) and hands the fd to the
+    /// unprivileged GUI process via [`crate::fdpass`], instead of driving the
+    /// device's I/O itself. (Unix always sets the address in-crate, so the
+    /// out-of-band flag from `build_tun_config` is never true here.)
+    #[cfg(unix)]
+    pub fn open_raw(cfg: &TunConfig) -> Result<std::os::unix::io::RawFd> {
+        use std::os::unix::io::IntoRawFd;
+
+        let (tcfg, _) = build_tun_config(cfg);
+        let dev = tun::create(&tcfg)
+            .map_err(|e| crate::TunnelError::Io(std::io::Error::other(e.to_string())))?;
+        Ok(dev.into_raw_fd())
     }
 
     /// Assign an IPv6 address (with its on-link prefix) and MTU to the named
@@ -245,6 +277,45 @@ mod imp {
 #[cfg(all(any(unix, windows), feature = "real-tun"))]
 pub fn open(cfg: &TunConfig) -> Result<impl TunDevice> {
     imp::RealTun::open(cfg)
+}
+
+/// Synchronously create and configure the TUN device, returning its raw fd
+/// (Unix only). See [`imp::open_raw`] — used by the privileged helper daemon
+/// (Phase 5) to create the interface and hand its fd to an unprivileged caller.
+#[cfg(all(unix, feature = "real-tun"))]
+pub fn open_raw(cfg: &TunConfig) -> Result<std::os::unix::io::RawFd> {
+    imp::open_raw(cfg)
+}
+
+/// Open a TUN device by asking the privileged helper daemon (Phase 5) to
+/// create one and hand back its fd, rather than opening `/dev/net/tun`
+/// in-process. Connects to `socket_path` (the helper's `UnixListener`),
+/// sends an `OpenTun` request, and wraps the returned fd with [`from_fd`] —
+/// so the caller's I/O path is identical to the fd-from-native-shell case.
+#[cfg(all(unix, feature = "helper-ipc"))]
+pub fn open_via_helper(socket_path: &str, cfg: &TunConfig) -> Result<impl TunDevice> {
+    use crate::helper_proto::{self, HelperResponse};
+    use std::os::unix::net::UnixStream;
+
+    let mut stream = UnixStream::connect(socket_path)?;
+    helper_proto::send_request(&mut stream, &helper_proto::open_tun_request(cfg))?;
+    let (resp, fd) = helper_proto::recv_response(&stream)?;
+    match resp {
+        HelperResponse::TunOpened => {
+            let fd = fd.ok_or_else(|| {
+                crate::TunnelError::Io(std::io::Error::other(
+                    "helper reported TunOpened but sent no fd",
+                ))
+            })?;
+            from_fd(fd)
+        }
+        HelperResponse::Err(msg) => Err(crate::TunnelError::Io(std::io::Error::other(format!(
+            "helper: {msg}"
+        )))),
+        HelperResponse::Ok => Err(crate::TunnelError::Io(std::io::Error::other(
+            "helper sent an unexpected Ok response to an OpenTun request",
+        ))),
+    }
 }
 
 /// Stub when the real device is unavailable (no `real-tun` feature, or a platform

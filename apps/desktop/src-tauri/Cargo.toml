@@ -48,9 +48,11 @@ ferrum-core = { path = "../../../crates/core" }
 # The real OS TUN device pulls in the `tun` driver crate: `/dev/net/tun` (or the
 # macOS utun) on Unix, the wintun adapter on Windows. Enabled on both so the
 # desktop drives a real data plane on either; `device::open` requires elevation
-# (and on Windows a loadable `wintun.dll`).
+# (and on Windows a loadable `wintun.dll`). `helper-ipc` (Unix only, Phase 5)
+# additionally lets `open_tun` try the privileged helper daemon first, so this
+# process doesn't need to be elevated itself — see `apps/desktop/README.md`.
 [target.'cfg(unix)'.dependencies]
-ferrum-tunnel = { path = "../../../crates/tunnel", features = ["real-tun"] }
+ferrum-tunnel = { path = "../../../crates/tunnel", features = ["real-tun", "helper-ipc"] }
 
 # The kill-switch (FR5) enforces its leak-block via the Windows Filtering Platform
 # on Windows (see src/killswitch.rs `wfp`). Version pinned to the one already in the

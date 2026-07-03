@@ -12,12 +12,19 @@
 //!   [named-pipe](ipc) control client ([`helper_client`]): `connect` ships a
 //!   [`ipc::ConnectConfig`] to the service, which brings the tunnel up and streams
 //!   events back.
-//! * **Unix (Linux/macOS)** — the GUI brings the data plane up **in-process** via
-//!   [`dataplane::bring_up`] (the existing elevated-GUI model); `nft` enforces the
-//!   kill-switch from the same process.
+//! * **Linux** — the GUI brings the data plane up **in-process** via
+//!   [`dataplane::bring_up`], same call shape as Windows/macOS, but
+//!   [`dataplane::open_tun`] tries a privileged **`ferrum-helper` Unix-socket
+//!   daemon** first (Phase 5 — `packaging/systemd/ferrum-helper.service`,
+//!   `apps/desktop/README.md`), so the GUI itself can stay unprivileged there
+//!   too; the kill-switch's `nft` calls do the same (see `killswitch::ask_helper`).
+//!   Without the daemon (or without privileges at all), both fall back to doing
+//!   the privileged operation in-process, surfacing a clean error if that also fails.
+//! * **macOS** — the GUI brings the data plane up **in-process** (the existing
+//!   elevated-GUI model); kill-switch enforcement (`pf`) is a follow-up.
 //!
-//! Both share [`dataplane`] for the actual bring-up and [`ipc::ConnectConfig`] as
-//! the parameter bundle.
+//! Both privilege models share [`dataplane`] for the actual bring-up and
+//! [`ipc::ConnectConfig`] as the parameter bundle.
 
 pub mod dataplane;
 pub mod ipc;
@@ -60,6 +67,13 @@ enum Session {
     #[cfg(windows)]
     Helper(helper_client::HelperSession),
 }
+
+/// Unix socket path of the privileged helper daemon (Phase 5 — Linux), tried by
+/// [`dataplane::open_tun`] and `killswitch::ask_helper` before falling back to
+/// an in-process TUN open / direct `nft` call. See
+/// `packaging/systemd/ferrum-helper.service` and `apps/desktop/README.md`.
+#[cfg(unix)]
+pub(crate) const HELPER_SOCK_PATH: &str = "/run/ferrum/helper.sock";
 
 /// Shared application state.
 struct AppState {

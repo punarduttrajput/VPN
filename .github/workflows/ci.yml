@@ -98,6 +98,17 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo clippy -p ferrum-coordinator -p ferrum-cli --all-targets --features ferrum-coordinator/otlp,ferrum-cli/otlp -- -D warnings
 
+      # Phase 5: exercise the privileged-helper IPC (fd-passing, wire protocol,
+      # firewall rule generation) — already unified into the base Build/Test
+      # above via `ferrum-helper`'s unconditional Unix deps, but pinned here
+      # explicitly so a manifest change can't silently drop the coverage.
+      - name: Test (tunnel real-tun + helper-ipc features)
+        run: cargo test -p ferrum-tunnel --features real-tun,helper-ipc
+
+      - name: clippy (tunnel real-tun + helper-ipc features)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo clippy -p ferrum-tunnel --all-targets --features real-tun,helper-ipc -- -D warnings
+
   # Real-device + benchmark verification (M3 / M5 / M6) on a Linux runner.
   verify-linux:
     name: verify-linux (M3/M5/M6)

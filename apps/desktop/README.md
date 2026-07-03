@@ -34,9 +34,10 @@ is in that workspace's `exclude` list.
   not up, a leak-block is installed (dropping non-tunnel egress, allow-listing
   loopback, the tunnel interface, and the coordinator so reconnect still works) and
   removed when the tunnel comes back or on exit. Enforced on **Linux via `nftables`**
-  and **Windows via WFP** — on Windows by the helper service (which has the
-  elevation). macOS `pf` is a follow-up; the UI reflects the intent everywhere. See
-  [`src-tauri/src/killswitch.rs`](src-tauri/src/killswitch.rs).
+  (tried through the [privileged helper daemon](#privileged-helper-linux) first, then
+  falling back in-process) and **Windows via WFP** — on Windows by the helper service
+  (which has the elevation). macOS `pf` is a follow-up; the UI reflects the intent
+  everywhere. See [`src-tauri/src/killswitch.rs`](src-tauri/src/killswitch.rs).
 - Live connection state and the peer list, driven through the shared facade.
   Core events (`StateChanged` / `PeersUpdated` / `Error` / `TrafficBlocked`) are
   pushed to the UI as `client-event` (on Windows, relayed from the service).
@@ -46,10 +47,57 @@ derived from it and advertised to the coordinator; the private key never leaves 
 local processes — on Windows it travels only over the local pipe) and a UDP listen
 port.
 
+> The real TUN needs **elevated privileges on a Linux/macOS host** (`/dev/net/tun`),
+> or **a Windows Administrator** (wintun) — unless a privileged helper is installed.
+> On Linux, `connect` and the kill-switch both try the [privileged helper
+> daemon](#privileged-helper-linux) first, so the desktop app itself can run
+> unprivileged once it's installed; without it (or without privileges at all),
+> `connect` falls back to opening the TUN in-process and returns a clean error if
+> that also fails. On Windows, the GUI **always** runs unprivileged against the
+> [`ferrum-helper` service](#the-ferrum-helper-service-windows) — see below. macOS
+> elevated-helper packaging is a follow-up.
+
+## Privileged helper (Linux)
+
+Opening a TUN device and changing firewall rules both need root. Rather than
+running the whole GUI as root, a small daemon — [`ferrum-helper`](../../crates/helper)
+— does just those two things and hands results back over a Unix domain socket;
+the desktop app (`apps/desktop`) tries that socket first and only falls back to
+doing the privileged operation in-process (which still needs the app itself to
+run elevated) if the helper isn't reachable.
+
+One-time setup:
+
+```sh
+sudo groupadd -f ferrum
+sudo usermod -aG ferrum "$USER"     # log out/in (or `newgrp ferrum`) to pick it up
+cargo build -p ferrum-helper --release
+sudo install -m 0755 target/release/ferrum-helper /usr/local/bin/ferrum-helper
+sudo install -m 0644 ../../packaging/systemd/ferrum-helper.service \
+    /etc/systemd/system/ferrum-helper.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now ferrum-helper
+```
+
+The daemon listens on `/run/ferrum/helper.sock`, `chown`'d to the `ferrum` group
+(mode `0660`) — membership in that group is the entire trust boundary (anyone who
+can reach the socket can ask it to create a TUN device or change firewall rules),
+so only add users who run the Ferrum desktop app. Without this setup the desktop
+still works exactly as before: run it elevated, and it falls back to doing both
+privileged operations in-process.
+
+A macOS equivalent (a `pf` helper) is a documented follow-up — the wire protocol
+([`ferrum_tunnel::helper_proto`](../../crates/tunnel/src/helper_proto.rs)) is
+transport-agnostic, though the Windows service below ended up using its own
+named-pipe protocol ([`src-tauri/src/ipc.rs`](src-tauri/src/ipc.rs)) since a
+Windows service's session model (one long-lived pipe connection = one tunnel
+session) fits that platform better than fd-passing over a request/response socket.
+
 ### The `ferrum-helper` service (Windows)
 
-A second binary in this crate. Install it once (elevated), then run the GUI
-unprivileged:
+A second binary in this crate (unrelated to — but named the same as, and serving
+the same role for — the Linux daemon above: each platform builds only its own).
+Install it once (elevated), then run the GUI unprivileged:
 
 ```powershell
 # from an elevated shell, after `cargo build`:
