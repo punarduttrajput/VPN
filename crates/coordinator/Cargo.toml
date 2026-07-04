@@ -28,6 +28,10 @@ otlp = [
     "dep:opentelemetry-otlp",
     "dep:tracing-opentelemetry",
 ]
+# Admin HTTP API + static panel (device list/revoke, live ACL policy view/edit).
+# Implies `oidc`: the admin surface has no other auth mode — it reuses the same
+# OidcVerifier, gated on an "admin" tag/claim, and fails closed with no verifier.
+admin-api = ["oidc", "dep:axum"]
 
 [dependencies]
 ferrum-control-proto = { path = "../control-proto" }
@@ -50,6 +54,8 @@ opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
+axum = { version = "0.7", optional = true }
 
 [dev-dependencies]
 tokio-stream = { version = "0.1", features = ["net"] }
+tower = { version = "0.5", features = ["util"] }

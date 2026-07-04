@@ -90,6 +90,15 @@ impl CoordinatorService {
         self.metrics.clone()
     }
 
+    /// A handle to the change-notification channel this service fires after
+    /// every registry mutation, so an external surface (the admin API) can
+    /// trigger the same "push a fresh network map to watchers" behavior after
+    /// its own mutations (revoke, policy edit). Clone it before moving the
+    /// service into the gRPC server.
+    pub fn changes(&self) -> broadcast::Sender<()> {
+        self.changes.clone()
+    }
+
     /// Advertise a network-wide relay address (`ip:port`) to every device in the
     /// network map. Devices use it as their relay fallback unless locally
     /// overridden. An empty string (the default) advertises no relay.

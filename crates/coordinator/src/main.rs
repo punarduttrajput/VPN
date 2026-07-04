@@ -116,6 +116,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Clone the registry handle for the metrics endpoint before the service
     // consumes it (the device-count gauge is sampled from the registry).
     let metrics_registry = registry.clone();
+    // Same, for the admin API (device list/revoke, policy view/edit) — it
+    // shares the live registry rather than reading the store independently.
+    #[cfg(feature = "admin-api")]
+    let admin_registry = registry.clone();
 
     // OIDC auth: enable when --oidc-issuer/--oidc-audience/--oidc-jwks are all
     // provided. Tokens are then required on every RPC and device tags come from
@@ -144,6 +148,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(feature = "oidc"))]
     let svc = CoordinatorService::new(registry);
 
+    // Grab the change-notification handle for the admin API before `svc` is
+    // reassigned below — a getter, so this doesn't consume `svc`.
+    #[cfg(feature = "admin-api")]
+    let admin_changes = svc.changes();
+
     // Advertise a network-wide relay fallback (PRD Phase 4): every device learns
     // it from the network map and uses it as the relay underlay unless locally
     // overridden. Validated as a socket address so a typo fails fast.
@@ -171,6 +180,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Avoid an unused-variable warning when the endpoint isn't enabled.
         let _ = metrics_registry;
         info!("no --metrics-listen; metrics endpoint disabled");
+    }
+
+    // Admin API + panel (device list/revoke, live ACL policy view/edit):
+    // enable with --admin-listen <ip:port>. Has no auth mode of its own — it
+    // requires --oidc-issuer/--oidc-audience/--oidc-jwks to already be set, and
+    // refuses to start otherwise (fail-closed: never served unauthenticated).
+    // Builds its own `OidcVerifier` from the same JWKS file rather than
+    // threading the gRPC path's verifier through, keeping this block isolated
+    // from the OIDC branch above.
+    #[cfg(feature = "admin-api")]
+    if let Some(addr) = arg_value("--admin-listen") {
+        let addr: SocketAddr = addr
+            .parse()
+            .map_err(|e| format!("--admin-listen '{addr}': {e}"))?;
+        let (issuer, audience, jwks_path) = match (
+            arg_value("--oidc-issuer"),
+            arg_value("--oidc-audience"),
+            arg_value("--oidc-jwks"),
+        ) {
+            (Some(i), Some(a), Some(j)) => (i, a, j),
+            _ => {
+                return Err(
+                    "--admin-listen requires --oidc-issuer, --oidc-audience, and --oidc-jwks \
+                     (the admin API has no other auth mode)"
+                        .into(),
+                )
+            }
+        };
+        let jwks_doc = std::fs::read_to_string(&jwks_path)?;
+        let jwks = ferrum_coordinator::Jwks::from_json(&jwks_doc)?;
+        let verifier = Arc::new(ferrum_coordinator::OidcVerifier::new(
+            &issuer, &audience, jwks,
+        ));
+        let router = ferrum_coordinator::admin::router(admin_registry, admin_changes, verifier);
+        info!(%addr, "admin API + panel listening");
+        tokio::spawn(async move {
+            if let Err(e) = ferrum_coordinator::admin::serve(addr, router).await {
+                error!(%addr, error = %e, "admin API server failed");
+            }
+        });
     }
 
     #[cfg_attr(not(feature = "mtls"), allow(unused_mut))]

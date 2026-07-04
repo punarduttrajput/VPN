@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::policy::Policy;
@@ -34,7 +35,7 @@ pub enum RegistryError {
 }
 
 /// A registered device.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Device {
     /// Base64 Curve25519 public key (the device's identity).
     pub public_key: String,
@@ -255,6 +256,44 @@ impl Registry {
     pub fn device_count(&self) -> usize {
         self.by_key.len()
     }
+
+    /// All registered devices, for an operator surface to list. Unlike
+    /// `network_map`, this is not filtered by policy — it's the full registry,
+    /// not one device's view of its peers. Sorted by `(name, public_key)` for a
+    /// stable display order.
+    pub fn devices(&self) -> Vec<Device> {
+        let mut list: Vec<Device> = self.by_key.values().cloned().collect();
+        list.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| a.public_key.cmp(&b.public_key))
+        });
+        list
+    }
+
+    /// Revoke a device: evict it from the registry and the backing store.
+    /// `allocate` never revisits addresses below `next_host`, so the freed
+    /// tunnel IP is not immediately reused by a subsequent registration.
+    pub fn remove(&mut self, public_key: &str) -> Result<(), RegistryError> {
+        self.by_key
+            .remove(public_key)
+            .ok_or(RegistryError::UnknownDevice)?;
+        self.store
+            .remove(public_key)
+            .map_err(|e| RegistryError::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    /// The current ACL policy, for an operator surface to inspect.
+    pub fn policy(&self) -> Policy {
+        self.policy.clone()
+    }
+
+    /// Replace the ACL policy at runtime. Not persisted: a coordinator restart
+    /// reverts to the `--policy` file (or allow-all if none was given).
+    pub fn set_policy(&mut self, policy: Policy) {
+        self.policy = policy;
+    }
 }
 
 #[cfg(test)]
@@ -435,6 +474,51 @@ mod tests {
 
         // server is not permitted to initiate to dev -> sees nobody.
         assert!(r.network_map("srvkey").is_empty());
+    }
+
+    #[test]
+    fn devices_lists_everyone_unfiltered_and_sorted() {
+        let mut r = registry();
+        r.register("bbb", "zeta", "", &tags(&["dev"])).unwrap();
+        r.register("aaa", "alpha", "", &tags(&["server"])).unwrap();
+        let devices = r.devices();
+        assert_eq!(devices.len(), 2);
+        // Sorted by name, not registration order.
+        assert_eq!(devices[0].name, "alpha");
+        assert_eq!(devices[1].name, "zeta");
+    }
+
+    #[test]
+    fn remove_evicts_a_device() {
+        let mut r = registry();
+        r.register("a", "A", "", &[]).unwrap();
+        r.register("b", "B", "", &[]).unwrap();
+        assert_eq!(r.device_count(), 2);
+        r.remove("a").unwrap();
+        assert_eq!(r.device_count(), 1);
+        let map = r.network_map("peer");
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[0].public_key, "b");
+    }
+
+    #[test]
+    fn remove_rejects_unknown_device() {
+        let mut r = registry();
+        assert_eq!(r.remove("ghost"), Err(RegistryError::UnknownDevice));
+    }
+
+    #[test]
+    fn policy_get_and_set_round_trip() {
+        let policy = Policy::from_rules(vec![crate::policy::AclRule {
+            src: tags(&["dev"]),
+            dst: tags(&["server"]),
+        }]);
+        let mut r = Registry::with_policy(Ipv4Addr::new(10, 8, 0, 0), 24, policy.clone());
+        assert_eq!(r.policy(), policy);
+
+        let replacement = Policy::allow_all();
+        r.set_policy(replacement.clone());
+        assert_eq!(r.policy(), replacement);
     }
 
     #[cfg(feature = "sqlite")]

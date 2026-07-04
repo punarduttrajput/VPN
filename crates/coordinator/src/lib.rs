@@ -3,7 +3,8 @@
 //!
 //! Covers device registration, tunnel-IP allocation, full-mesh network map with
 //! ACL/policy filtering, live `WatchNetworkMap` streaming, SQLite persistence
-//! (`sqlite`), mutual TLS (`mtls`), and OIDC bearer-token auth (`oidc`).
+//! (`sqlite`), mutual TLS (`mtls`), OIDC bearer-token auth (`oidc`), and an
+//! admin HTTP API + panel for device/ACL management (`admin-api`).
 #![forbid(unsafe_code)]
 
 pub mod metrics;
@@ -21,6 +22,9 @@ pub mod pki;
 
 #[cfg(feature = "oidc")]
 pub mod auth;
+
+#[cfg(feature = "admin-api")]
+pub mod admin;
 
 pub use metrics::Metrics;
 pub use policy::{AclRule, Policy};
