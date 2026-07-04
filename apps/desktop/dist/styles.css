@@ -84,9 +84,67 @@ button:disabled { opacity: .4; cursor: not-allowed; }
 .peers .key { font-family: ui-monospace, monospace; color: var(--text); }
 .peers .endpoint { color: var(--muted); }
 .peers .path { float: right; font-size: 11px; color: var(--accent); }
+.path-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; }
+.path-dot.direct { background: var(--ok); }
+.path-dot.relay { background: var(--warn); }
 .empty { color: var(--muted); font-style: italic; }
 .log { max-height: 160px; overflow-y: auto; }
 .log .ts { color: var(--muted); margin-right: 6px; }
 .log .err { color: var(--err); }
-.toggle { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 13px; color: var(--muted); }
+.toggle { display: flex; flex-direction: row; align-items: center; gap: 8px; margin-top: 10px; font-size: 13px; color: var(--muted); }
 .toggle input { width: auto; }
+
+/* First-run identity setup + shared secondary/link controls (GUI PRD FR1/FR8). */
+.hint { font-size: 12px; color: var(--muted); margin: 0 0 12px; }
+label .hint { margin: 0; font-size: 11px; }
+.error { font-size: 12px; color: var(--err); margin: 4px 0 0; }
+
+.key-choice { display: flex; align-items: center; gap: 10px; margin-top: 4px; }
+.key-choice .or { font-size: 11px; color: var(--muted); }
+button.secondary, button.link {
+  flex: none;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-weight: 500;
+}
+button.link {
+  border: none;
+  padding: 0;
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 500;
+  background: none;
+}
+
+#setup-save { margin-top: 4px; }
+
+/* Connect screen: profile summary + collapsible Advanced/Activity sections. */
+.profile-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 10px;
+  font-size: 12px;
+}
+.profile-name { color: var(--muted); }
+
+.connect-panel { margin-bottom: 4px; }
+
+details.advanced, details.activity {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin-top: 14px;
+  padding: 8px 10px;
+}
+details.advanced summary, details.activity summary {
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+details.advanced[open] summary, details.activity[open] summary { margin-bottom: 8px; }
+details.advanced .form { margin-top: 4px; }
+details.activity .log { margin-top: 4px; }

@@ -9,8 +9,23 @@ It is a **standalone workspace** (its own `Cargo.lock`/`target`) so the webview
 dependency tree stays out of the main library workspace — `apps/desktop/src-tauri`
 is in that workspace's `exclude` list.
 
+See [PRD/phase-5-desktop-gui.md](../../PRD/phase-5-desktop-gui.md) for the GUI/UX
+product spec this section is tracking against.
+
 ## What it does today
 
+- **Identity setup, once.** First run shows a setup screen: generate a fresh
+  WireGuard keypair or import an existing private key, plus the device name /
+  coordinator / advertised endpoint. Saved to OS-backed secure storage
+  (Keychain / Credential Manager / Secret Service, via the `keyring` crate —
+  see [`src-tauri/src/identity.rs`](src-tauri/src/identity.rs)), so it's never
+  re-typed again; the Connect screen loads it automatically on launch. A
+  "Change identity" link clears it and returns to setup.
+- **Streamlined Connect screen.** The default view is just the coordinator/
+  profile summary and a Connect/Disconnect control — every protocol-level
+  field (transport mode, STUN server, relay override, listen port,
+  MASQUE/server-name) lives behind a collapsed **Advanced** disclosure,
+  off by default.
 - **Connect moves packets, and stays up.** `connect` brings up the data plane via
   the shared `dataplane::bring_up` (register → learn the assigned tunnel address →
   gather/publish STUN candidates → open the TUN → run
