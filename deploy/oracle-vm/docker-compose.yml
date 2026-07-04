@@ -1,0 +1,88 @@
+# Ferrum on a single VM (written for Oracle Cloud's Always-Free Ampere A1, but
+# works on any VPS with a public IP and open UDP). Brings up:
+#   coordinator -> gRPC control plane (50051/tcp) + admin panel (behind Caddy)
+#   relay       -> DERP-style NAT-traversal fallback (51821/udp)
+#   caddy       -> automatic HTTPS in front of the admin panel only
+#
+# `ferrum-coordinator`'s own argv parser expects `--flag value` as two separate
+# tokens (see arg_value() in crates/coordinator/src/main.rs) — not `--flag=value`
+# — so keep each flag and its value on its own line below.
+#
+# First run: fill in .env (copy from .env.example) and generate secrets/jwks.json
+# via scripts/mint-token.py init — see README.md.
+
+name: ferrum-oracle
+
+services:
+  coordinator:
+    build:
+      context: ../..
+      dockerfile: deploy/oracle-vm/Dockerfile
+    image: ferrum:local
+    container_name: ferrum-coordinator
+    restart: unless-stopped
+    entrypoint: ["/usr/local/bin/ferrum-coordinator"]
+    command:
+      - --listen
+      - 0.0.0.0:50051
+      - --admin-listen
+      - 0.0.0.0:9090
+      - --metrics-listen
+      - 0.0.0.0:9095
+      - --store
+      - /data/coordinator.db
+      - --oidc-issuer
+      - ${OIDC_ISSUER}
+      - --oidc-audience
+      - ${OIDC_AUDIENCE}
+      - --oidc-jwks
+      - /secrets/jwks.json
+      - --relay
+      - ${RELAY_ADVERTISE}
+    volumes:
+      - coordinator-data:/data
+      - ./secrets/jwks.json:/secrets/jwks.json:ro
+    ports:
+      - "50051:50051" # gRPC — clients (desktop/Android) connect here directly
+    networks: [ferrum]
+
+  relay:
+    image: ferrum:local # same image as coordinator; just a different entrypoint
+    container_name: ferrum-relay
+    restart: unless-stopped
+    depends_on: [coordinator] # image build order only; runs independently
+    entrypoint: ["/usr/local/bin/ferrum"]
+    command:
+      - relay
+      - --listen
+      - 0.0.0.0:51821
+      - --metrics-listen
+      - 0.0.0.0:9096
+    ports:
+      - "51821:51821/udp"
+    networks: [ferrum]
+
+  caddy:
+    image: caddy:2.9-alpine
+    container_name: ferrum-caddy
+    restart: unless-stopped
+    depends_on: [coordinator]
+    environment:
+      - DOMAIN=${DOMAIN:-}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp" # HTTP/3
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks: [ferrum]
+
+networks:
+  ferrum:
+
+volumes:
+  coordinator-data:
+  caddy-data:
+  caddy-config:

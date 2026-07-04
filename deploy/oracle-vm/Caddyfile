@@ -1,0 +1,12 @@
+# Fronts the admin panel with TLS. If $DOMAIN is set (and its DNS A record
+# points at this VM), Caddy gets you a real Let's Encrypt certificate
+# automatically. Left unset, it falls back to listening on :443 for any host
+# and self-signs via its internal CA (fine for a raw-IP test — your browser
+# will show a one-time "not trusted" warning to click through).
+#
+# Optional: add `email you@example.com` as its own global-options block above
+# the site block below if you want Let's Encrypt renewal notices.
+
+{$DOMAIN:":443"} {
+	reverse_proxy coordinator:9090
+}
