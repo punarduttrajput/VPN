@@ -6,6 +6,10 @@ authors = ["Plasma Comp"]
 license = "MIT OR Apache-2.0"
 edition = "2021"
 rust-version = "1.77.2"
+# Disambiguates the app binary from `src/bin/ferrum-helper.rs` (an
+# auto-discovered second bin target) for tools like `cargo tauri build`
+# that need to know which one is "the app" to bundle.
+default-run = "ferrum-desktop"
 
 # Standalone workspace: keeps the heavy Tauri/webview dependency tree out of the
 # main library workspace so its CI (clippy/test matrix) stays lean and fast.
@@ -16,13 +20,13 @@ name = "app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2.6.3" }
+tauri-build = { version = "2.6.3", features = [] }
 
 [dependencies]
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
-tauri = { version = "2.11.3" }
+tauri = { version = "2.11.3", features = [] }
 tauri-plugin-log = "2"
 # `sync` for the facade's channels; `io-util`/`net` for the helper-service named
 # pipe (Windows) and its framing codec; `rt-multi-thread`/`macros`/`signal` for the
