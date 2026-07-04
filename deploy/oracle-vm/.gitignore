@@ -1,0 +1,3 @@
+# Signing key + JWKS are generated locally by scripts/mint-token.py — never commit.
+secrets/
+.env
