@@ -9,10 +9,10 @@
 //! registration, so policy here is structural, not yet an authorization
 //! boundary. Tag authorization arrives with auth in a later increment.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// A single allow-rule: any `src` tag may reach any `dst` tag.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AclRule {
     /// Source tags (or `*`).
     pub src: Vec<String>,
@@ -21,7 +21,7 @@ pub struct AclRule {
 }
 
 /// The access policy: a set of allow-rules, or allow-all (full mesh).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 pub struct Policy {
     /// When true, every device may reach every other (Phase 3 M1 default).
     #[serde(default)]
@@ -108,6 +108,29 @@ mod tests {
         assert!(p.allows(&tags(&["admin"]), &tags(&["anything"])));
         assert!(p.allows(&tags(&["admin"]), &[])); // `*` matches even no tags
         assert!(!p.allows(&tags(&["user"]), &tags(&["anything"])));
+    }
+
+    // `serde_json` is optional (pulled in by `sqlite`/`oidc`/`admin-api`); this
+    // exercises the JSON round-trip an admin API needs, so it only needs to run
+    // under a feature that has `serde_json` available.
+    #[cfg(feature = "oidc")]
+    #[test]
+    fn serializes_and_deserializes_as_json() {
+        // An admin surface round-trips a Policy through JSON (view + edit).
+        let p = Policy::from_rules(vec![
+            AclRule {
+                src: tags(&["dev"]),
+                dst: tags(&["server"]),
+            },
+            AclRule {
+                src: tags(&["admin"]),
+                dst: tags(&["*"]),
+            },
+        ]);
+        let json = serde_json::to_string(&p).unwrap();
+        let back: Policy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.allow_all, p.allow_all);
+        assert_eq!(back.rules, p.rules);
     }
 
     #[test]
