@@ -24,7 +24,17 @@ serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
 tauri = { version = "2.11.3" }
 tauri-plugin-log = "2"
-tokio = { version = "1", features = ["sync"] }
+# `sync` for the facade's channels; `io-util`/`net` for the helper-service named
+# pipe (Windows) and its framing codec; `rt-multi-thread`/`macros`/`signal` for the
+# `ferrum-helper` service binary's runtime + Ctrl-C handling and the IPC tests.
+tokio = { version = "1", features = [
+    "sync",
+    "io-util",
+    "net",
+    "rt-multi-thread",
+    "macros",
+    "signal",
+] }
 # The shared client core (Phase 5 facade) with the `data-plane` runner enabled:
 # `connect` opens a TUN and drives `run_mesh_session`, so the GUI moves packets.
 ferrum-client-core = { path = "../../../crates/client-core", features = ["data-plane"] }
@@ -65,3 +75,7 @@ windows = { version = "0.61", features = [
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_WindowsFilteringPlatform",
 ] }
+# The `ferrum-helper` binary runs as a Windows service (SCM integration: install /
+# uninstall / dispatcher / control handler). `windows-service` wraps the raw SCM
+# FFI in a safe API.
+windows-service = "0.7"

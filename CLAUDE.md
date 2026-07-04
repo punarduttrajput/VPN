@@ -142,7 +142,7 @@ on the new environment before assuming it's still blocked.
   before the public/server-reflexive endpoint). The Tauri desktop now also exposes
   **STUN-server + relay-override fields** in its connect form (gathers/publishes
   candidates; overrides the advertised relay). **Phase 4 hardening is complete.**
-- **Phase 5 (~90%):** shared `FerrumClient` core (M1) + `uniffi` bindings (Swift/Kotlin
+- **Phase 5 (~95%, current scope):** shared `FerrumClient` core (M1) + `uniffi` bindings (Swift/Kotlin
   generate from `FfiFerrumClient`) + data-plane glue (`run_mesh_session`) + the
   TUN-from-fd FFI entry (`device::from_fd` + `FfiFerrumClient::run`/`stop`) + a Tauri
   desktop shell (`apps/desktop`) whose **`connect` drives the real data plane on the
@@ -163,19 +163,19 @@ on the new environment before assuming it's still blocked.
   four ABIs; **signed release APK builds**) + **Windows wintun IPv6** (the `tun` crate is
   IPv4-only on Windows, so a v6 tunnel address is assigned **out-of-band via `netsh interface
   ipv6`** after the adapter comes up — `configure_ipv6_windows` in `crates/tunnel/src/device.rs`;
-  IPv4-on-Windows and both families on Unix keep the in-crate path) **and a privileged-helper
-  daemon** (`ferrum-helper`, Linux/Unix): a root-owned Unix-socket daemon that opens the
-  TUN device (handing the fd back via `SCM_RIGHTS`/`fdpass`) and runs the kill-switch
-  `nft` commands on behalf of the unprivileged desktop process, which tries it first and
-  falls back to doing both privileged operations in-process if it isn't reachable — see
-  `crates/helper`, `ferrum_tunnel::{helper_proto,fdpass,firewall}`, and
-  `apps/desktop/README.md`/`packaging/systemd/` for the one-time setup.
-  Remaining (current scope): a Windows/macOS privileged-helper service (a named-pipe
-  transport on Windows; the wire protocol is already transport-agnostic so it can plug
-  in without a protocol change).
+  IPv4-on-Windows and both families on Unix keep the in-crate path) + **privileged helpers on
+  both desktop OSes** (the GUI runs **unprivileged** either way): on **Linux**, a root-owned
+  `ferrum-helper` Unix-socket daemon (`crates/helper`) opens the TUN device (fd back via
+  `SCM_RIGHTS`/`fdpass`) and runs the kill-switch's `nft` commands, over a transport-agnostic
+  wire protocol (`ferrum_tunnel::helper_proto`); on **Windows**, a separate `ferrum-helper`
+  LocalSystem service owns the elevated wintun + WFP parts, driven over a named pipe (the GUI
+  ships a `ConnectConfig` and gets an event stream back — `apps/desktop/.../{ipc,service,
+  helper_client}.rs` + the `ferrum-helper` bin; pipe EOF/SCM-stop tears the tunnel +
+  kill-switch down). Both fall back to the pre-existing in-process/elevated-GUI model if their
+  helper isn't reachable/installed.
   **Deferred to a future version:** the **iOS** (NetworkExtension + SwiftUI) shell and
-  **macOS** (`pf`) kill-switch enforcement — both need an Apple toolchain/host this project
-  doesn't target yet.
+  **macOS** (`pf` kill-switch + an equivalent privileged helper) — both need an Apple
+  toolchain/host this project doesn't target yet.
 - **Phase 6 (~15%):** `sendmmsg` batching + **UDP GSO send-path** (`UDP_SEGMENT`) + **UDP GRO
   receive-path** (`UDP_GRO`; one `recvmsg` coalesces a run, `GroBuffer` drains it per
   `recv`/`try_recv`) — Linux; the `unsafe` FFI is now compile-checked here too via the
@@ -209,22 +209,24 @@ on the new environment before assuming it's still blocked.
    desktop run on the supervisor** (always-on auto-reconnect; OIDC token via
    `FerrumClient::set_token`), and the **desktop enforces the kill-switch in the OS firewall**
    (**`nftables` on Linux + WFP on Windows** — `apps/desktop/.../killswitch.rs`). Windows
-   wintun **IPv6** landed too (out-of-band `netsh interface ipv6` address assignment —
+   wintun **IPv6** now lands too (out-of-band `netsh interface ipv6` address assignment —
    `tun` is IPv4-only on Windows).
    (Phase 4 NAT traversal is functionally complete:
    signaling, STUN, relay, state machine, automatic fallback, and both local +
    coordinator-advertised relay selection all land. ICE candidate-pair prioritization
    (`tunnel::ice`) and the desktop-GUI relay/STUN fields now land too — Phase 4 hardening is complete.)
-2. **Phase 5 — privileged-helper for the desktop TUN** ✅ *(Linux done)*: a root-owned
-   `ferrum-helper` daemon (`crates/helper`) owns TUN creation (handing the fd back via
-   `SCM_RIGHTS`/`fdpass`) and the kill-switch's `nft` commands, reachable over a Unix
-   socket via a transport-agnostic wire protocol (`ferrum_tunnel::helper_proto`); the
-   desktop tries it first and falls back to the pre-existing in-process behavior if it
-   isn't reachable. Remaining (current scope): a Windows service (named pipe) + macOS
-   equivalent — the protocol is already designed for it. *(The **Android shell** already
-   landed — `clients/android/`, `FerrumVpnService` + Compose, signed APK. iOS + macOS
-   deferred to a future version — need an Apple toolchain/host this project doesn't
-   target yet.)*
+2. **Phase 5 — privileged helpers for the desktop TUN** ✅ *(Linux + Windows done)*: the
+   GUI runs **unprivileged on both desktop OSes**. On **Linux**, a root-owned `ferrum-helper`
+   daemon (`crates/helper`) owns TUN creation (fd back via `SCM_RIGHTS`/`fdpass`) and the
+   kill-switch's `nft` commands, reachable over a Unix socket via a transport-agnostic wire
+   protocol (`ferrum_tunnel::helper_proto`); the desktop tries it first and falls back to the
+   pre-existing in-process behavior if it isn't reachable. On **Windows**, a separate
+   `ferrum-helper` LocalSystem service owns the elevated wintun + WFP parts, driven over a
+   named pipe (`apps/desktop/.../{ipc,service,helper_client}.rs` + the `ferrum-helper` bin);
+   pipe EOF or an SCM stop tears the tunnel + kill-switch down, so a dead GUI never strands
+   one. *(The **Android shell** already landed — `clients/android/`, `FerrumVpnService` +
+   Compose, signed APK. iOS + macOS deferred to a future version — need an Apple
+   toolchain/host this project doesn't target yet, including a macOS equivalent helper.)*
 3. **Phase 6 — observability (M1)** ✅ *(done)*: coordinator *and* relay
    Prometheus metrics (`--metrics-listen` → `/metrics`, aggregate counts only per NFR5) +
    `#[tracing::instrument(skip_all)]` spans across the coordinator RPC handlers + relay loop
