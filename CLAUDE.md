@@ -31,10 +31,14 @@ Outside `crates/`: **`apps/desktop`** is a Tauri v2 desktop shell (Phase 5 FR4) 
 its own standalone workspace (excluded from this one) driving `ferrum-client-core`,
 preferring the `ferrum-helper` daemon over privileged in-process operations
 when it's reachable (Linux). **`apps/admin-panel`** is an Angular 19 app — the
-coordinator's `--admin-listen` web panel (device list/revoke, live ACL policy
-view/edit); its `ng build` output is embedded into `ferrum-coordinator` at
-compile time via `rust-embed` behind the `admin-api` feature (see
-[PRD/admin-panel-angular.md](PRD/admin-panel-angular.md) and
+coordinator's `--admin-listen` web panel: a Dashboard overview (device/tag
+counts, ACL policy summary) as the default landing page, device list/revoke,
+live ACL policy view/edit, and a light/dark theme toggle (`ThemeService`,
+persisted to `localStorage`); its `ng build` output is embedded into
+`ferrum-coordinator` at compile time via `rust-embed` behind the `admin-api`
+feature (see [PRD/admin-panel-angular.md](PRD/admin-panel-angular.md) — the
+Dashboard/theme toggle landed as a post-acceptance follow-on, documented in
+STATUS.md rather than a PRD revision — and
 [apps/admin-panel/README.md](apps/admin-panel/README.md)). **`relay-ebpf`**
 is the relay's XDP fast path (Phase 6 FR1) — an `aya-ebpf` `#[xdp]` program,
 its own standalone workspace (needs a `bpfel-unknown-none` target + nightly

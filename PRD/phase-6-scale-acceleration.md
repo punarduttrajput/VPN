@@ -6,7 +6,7 @@
 | **Phase** | 6 of 6 — Production Scale |
 | **Status** | Draft |
 | **Owner** | punarduttrajput |
-| **Last updated** | 2026-06-16 |
+| **Last updated** | 2026-07-06 |
 | **Depends on** | Phases 1–5 |
 
 ---
@@ -67,6 +67,14 @@ fleet reproducible and auditable.
 - XDP program (via `aya`) on relays/gateways for fast-path encrypted-packet forwarding.
 - Userspace fallback for packets the XDP path doesn't handle.
 - Benchmark vs. Phase 4 userspace relay; document throughput/CPU gains.
+- **Drill-down:** [PRD/phase-6-ebpf-xdp-relay.md](phase-6-ebpf-xdp-relay.md)
+  (2026-07-06) specifies this precisely against the actual relay
+  implementation (`ferrum-transport`'s `RelayServer`, not the `crates/relay`
+  named below) and reconciles the design with real constraints — see that
+  document's Status/Risks. As of that date: the userspace loader and shared
+  types are built and tested; the kernel `#[xdp]` program itself is written
+  but unbuilt/unverified (needs a Linux host with `bpf-linker`); the ≥10
+  Gbps NFR1 target below is not yet measured.
 
 ### FR2 — Anycast Edge
 - Announce anycast prefixes (BGP) across regional points of presence.

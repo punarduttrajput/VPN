@@ -1,14 +1,31 @@
 # Ferrum Admin Panel
 
-Angular 19 frontend for `ferrum-coordinator`'s `admin-api` feature: device
-list/revoke and live ACL-policy view/edit. See
+Angular 19 frontend for `ferrum-coordinator`'s `admin-api` feature. See
 [PRD/admin-panel-angular.md](../../PRD/admin-panel-angular.md) for the design
-and [crates/coordinator/src/admin.rs](../../crates/coordinator/src/admin.rs)
-for the backend it talks to.
+(§12 covers the two additions below, which landed after that PRD's
+acceptance criteria were already met) and
+[crates/coordinator/src/admin.rs](../../crates/coordinator/src/admin.rs) for
+the backend it talks to.
 
-No new API surface — this is a drop-in replacement for the old vanilla
-HTML/CSS/JS panel (`crates/coordinator/admin-ui/`, since removed), talking to
-the same four endpoints:
+## Routes
+
+- **`/dashboard`** (default landing page) — stat cards (device count,
+  devices awaiting an endpoint, distinct policy tags in use, ACL policy
+  mode) and a recent-devices preview. Computed client-side from the same
+  two endpoints below; no dedicated dashboard endpoint exists.
+- **`/devices`** — device list/revoke.
+- **`/policy`** — live ACL-policy view/edit.
+- **`/login`** — paste-a-token screen (see Auth below).
+
+A light/dark theme toggle (sun/moon button in the nav, `ThemeService`) is
+available on every authenticated route — persisted to `localStorage`,
+defaulting to the OS/browser's `prefers-color-scheme`.
+
+## Backend contract
+
+No new API surface beyond the original vanilla panel it replaced
+(`crates/coordinator/admin-ui/`, since removed) — the Dashboard is client-side
+aggregation over the same two read endpoints, not a new one:
 
 - `GET /api/devices`
 - `POST /api/devices/revoke`
@@ -65,4 +82,4 @@ resolves at compile time, so `cargo build --features admin-api` fails if
 Run the result with `--admin-listen <ip:port>` plus the three `--oidc-*`
 flags (the admin API has no other auth mode) and open `http://<ip:port>/` —
 the coordinator serves the built app directly, including a SPA fallback to
-`index.html` for a hard refresh on `/devices` or `/policy`.
+`index.html` for a hard refresh on `/dashboard`, `/devices`, or `/policy`.
