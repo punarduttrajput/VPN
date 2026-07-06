@@ -3,6 +3,7 @@ import { Router, RouterLink, RouterLinkActive, RouterOutlet } from '@angular/rou
 
 import { AuthService } from '../core/auth.service';
 import { StatusService } from '../core/status.service';
+import { ThemeService } from '../core/theme.service';
 
 @Component({
   selector: 'app-shell',
@@ -14,6 +15,7 @@ export class ShellComponent {
   private readonly auth = inject(AuthService);
   private readonly router = inject(Router);
   readonly status = inject(StatusService);
+  readonly themeService = inject(ThemeService);
 
   signOut(): void {
     this.auth.signOut();

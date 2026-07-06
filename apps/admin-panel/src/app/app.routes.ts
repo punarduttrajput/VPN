@@ -12,7 +12,12 @@ export const routes: Routes = [
     loadComponent: () => import('./shell/shell.component').then((m) => m.ShellComponent),
     canActivate: [authGuard],
     children: [
-      { path: '', redirectTo: 'devices', pathMatch: 'full' },
+      { path: '', redirectTo: 'dashboard', pathMatch: 'full' },
+      {
+        path: 'dashboard',
+        loadComponent: () =>
+          import('./dashboard/dashboard.component').then((m) => m.DashboardComponent),
+      },
       {
         path: 'devices',
         loadComponent: () => import('./devices/devices.component').then((m) => m.DevicesComponent),

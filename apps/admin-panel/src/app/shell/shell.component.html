@@ -9,8 +9,18 @@
   }
 
   <nav class="actions">
+    <a routerLink="/dashboard" routerLinkActive="active" class="secondary">Dashboard</a>
     <a routerLink="/devices" routerLinkActive="active" class="secondary">Devices</a>
     <a routerLink="/policy" routerLinkActive="active" class="secondary">ACL Policy</a>
+    <button
+      class="icon-toggle"
+      type="button"
+      (click)="themeService.toggle()"
+      [attr.aria-label]="themeService.theme() === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'"
+      [title]="themeService.theme() === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'"
+    >
+      {{ themeService.theme() === 'dark' ? '☀' : '☾' }}
+    </button>
     <button class="secondary" (click)="signOut()">Sign out</button>
   </nav>
 
