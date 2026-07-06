@@ -1,0 +1,36 @@
+[package]
+name = "ferrum-relay-xdp-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Deliberately dependency-free and `#![no_std]` (std only under `cfg(test)`) so
+# this crate builds and unit-tests on every host — including one with no BPF
+# toolchain at all — and so neither of its two consumers (the `relay-ebpf`
+# kernel program and `ferrum-transport`'s userspace loader) pulls in the other
+# side's dependency tree just to share these types. See
+# PRD/phase-6-ebpf-xdp-relay.md.
+[features]
+# Enables `AddrKey::from_v4`'s std-facing constructor (takes plain octets/port
+# rather than requiring the caller to do the byte-order conversion itself).
+# Off by default so `relay-ebpf` (no_std, no reason to want this) never even
+# sees the option; the userspace loader in `ferrum-transport` enables it.
+std = []
+# `AddrKey`/`GatewayInfo` need to implement `aya::Pod` to be used as BPF map
+# keys/values on the userspace side — but Rust's orphan rule means that impl
+# can only live in the crate that owns the type (here) or the crate that owns
+# the trait (`aya`), not in a third crate. This feature adds an *optional*
+# dependency on `aya` and provides the impl right here, so this crate stays
+# dependency-free by default (and for the tests above) while still giving
+# the userspace loader a clean, non-orphan way to opt in.
+#
+# Checked against the actual downloaded `aya = "0.14.0"` / `aya-ebpf =
+# "0.2.1"` source (see the impl site's comment in `lib.rs`): only the
+# userspace `aya` crate's map types bound their key/value generics on `Pod`
+# at all — `aya-ebpf`'s map types have no such bound, so there is
+# deliberately no `aya-ebpf`-side feature/impl here.
+aya-pod = ["dep:aya"]
+
+[dependencies]
+aya = { version = "0.14", optional = true }

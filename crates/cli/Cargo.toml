@@ -28,6 +28,12 @@ otlp = [
     "dep:opentelemetry-otlp",
     "dep:tracing-opentelemetry",
 ]
+# The relay's eBPF/XDP fast path (PRD `phase-6-ebpf-xdp-relay.md`) via
+# `ferrum relay --xdp-iface <name> --xdp-program <path>`. Forwarded straight
+# to `ferrum-transport`, whose `aya`/`aya-log` deps are themselves Linux-only
+# target dependencies — so this is a no-op everywhere except a Linux build
+# that explicitly requests it.
+xdp = ["ferrum-transport/xdp"]
 
 [dependencies]
 ferrum-core = { path = "../core" }

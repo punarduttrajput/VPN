@@ -89,6 +89,15 @@ pub struct RelayMetrics {
     bytes_forwarded_total: AtomicU64,
     frames_dropped_total: AtomicU64,
     clients_registered: AtomicU64,
+    /// Cumulative fast-pathed frames/bytes (PRD `phase-6-ebpf-xdp-relay.md`
+    /// FR4) — set (not added to) by the XDP loader from its own already-
+    /// cumulative kernel counters, so a missed poll never double-counts.
+    /// Separate metric names rather than a label on the two counters above,
+    /// deliberately: those two already have an exact-match test
+    /// (`relay_metrics_render_in_prometheus_format`) and, in production,
+    /// potentially dashboards depending on their unlabeled shape.
+    xdp_frames_forwarded_total: AtomicU64,
+    xdp_bytes_forwarded_total: AtomicU64,
 }
 
 impl RelayMetrics {
@@ -111,6 +120,16 @@ impl RelayMetrics {
     /// forward).
     fn note_dropped(&self) {
         self.frames_dropped_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Publish the XDP fast path's current cumulative totals (PRD FR4) — the
+    /// loader calls this after summing the eBPF program's per-CPU counters,
+    /// passing the running totals it read, not a delta.
+    pub fn set_xdp_totals(&self, frames: u64, bytes: u64) {
+        self.xdp_frames_forwarded_total
+            .store(frames, Ordering::Relaxed);
+        self.xdp_bytes_forwarded_total
+            .store(bytes, Ordering::Relaxed);
     }
 
     /// Render all relay metrics in the Prometheus text exposition format.
@@ -146,6 +165,18 @@ impl RelayMetrics {
             "Total frames dropped (unknown sender/destination, malformed, or failed forward).",
             self.frames_dropped_total.load(Ordering::Relaxed),
         );
+        counter(
+            &mut out,
+            "ferrum_relay_xdp_frames_forwarded_total",
+            "Total data frames forwarded entirely in-kernel by the XDP fast path (0 if not enabled).",
+            self.xdp_frames_forwarded_total.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "ferrum_relay_xdp_bytes_forwarded_total",
+            "Total payload bytes forwarded entirely in-kernel by the XDP fast path (0 if not enabled).",
+            self.xdp_bytes_forwarded_total.load(Ordering::Relaxed),
+        );
         out
     }
 }
@@ -166,6 +197,40 @@ fn emit(out: &mut String, name: &str, help: &str, typ: &str, value: u64) {
     ));
 }
 
+/// What changed in the `Clients` table as a result of one `register` call —
+/// enough for an observer (the eBPF fast path's userspace loader; PRD
+/// `phase-6-ebpf-xdp-relay.md` FR3) to mirror the update *and* clean up
+/// whatever it had cached for a stale mapping, without needing to see the
+/// whole table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RegisterDelta {
+    key: PublicKey,
+    addr: SocketAddr,
+    /// This key's previous address, if it just roamed (now stale).
+    evicted_addr: Option<SocketAddr>,
+    /// This address's previous key, if it was just reassigned (now stale).
+    evicted_key: Option<PublicKey>,
+}
+
+/// An observer notified of every successful registration, so a fast-path
+/// implementation can mirror `RelayServer`'s state without ever becoming a
+/// second source of truth for it (PRD FR3: userspace stays authoritative).
+///
+/// The default relay (no hook attached) behaves exactly as before this
+/// existed — see [`RelayServer::set_xdp_hook`].
+pub trait RelayXdpHook: Send + Sync {
+    /// Called with the fully up-to-date `(key, addr)` pairing plus whatever
+    /// mapping it just made stale, immediately after `RelayServer` commits a
+    /// `Register` frame to its own table.
+    fn on_register(
+        &self,
+        key: PublicKey,
+        addr: SocketAddr,
+        evicted_addr: Option<SocketAddr>,
+        evicted_key: Option<PublicKey>,
+    );
+}
+
 /// The relay server: a public-key-keyed UDP packet forwarder.
 ///
 /// Bind it on a reachable address, then drive [`serve`](RelayServer::serve).
@@ -175,6 +240,7 @@ pub struct RelayServer {
     socket: UdpSocket,
     clients: Mutex<Clients>,
     metrics: Arc<RelayMetrics>,
+    xdp_hook: Mutex<Option<Arc<dyn RelayXdpHook>>>,
 }
 
 /// The relay's bidirectional `key <-> addr` table.
@@ -187,17 +253,27 @@ struct Clients {
 impl Clients {
     /// Record `key` as reachable at `addr`, clearing any stale mappings for
     /// either side (a client that roamed to a new address, or an address reused
-    /// by a different key).
-    fn register(&mut self, key: PublicKey, addr: SocketAddr) {
+    /// by a different key), and reporting exactly what was cleared.
+    fn register(&mut self, key: PublicKey, addr: SocketAddr) -> RegisterDelta {
+        let mut evicted_addr = None;
+        let mut evicted_key = None;
         if let Some(old_addr) = self.by_key.insert(key, addr) {
             if old_addr != addr {
                 self.by_addr.remove(&old_addr);
+                evicted_addr = Some(old_addr);
             }
         }
         if let Some(old_key) = self.by_addr.insert(addr, key) {
             if old_key != key {
                 self.by_key.remove(&old_key);
+                evicted_key = Some(old_key);
             }
+        }
+        RegisterDelta {
+            key,
+            addr,
+            evicted_addr,
+            evicted_key,
         }
     }
 }
@@ -209,6 +285,7 @@ impl RelayServer {
             socket: UdpSocket::bind(local).await?,
             clients: Mutex::new(Clients::default()),
             metrics: Arc::new(RelayMetrics::default()),
+            xdp_hook: Mutex::new(None),
         })
     }
 
@@ -221,6 +298,15 @@ impl RelayServer {
     /// (PRD Phase 6 FR4). Clone it before moving the server into its serve loop.
     pub fn metrics(&self) -> Arc<RelayMetrics> {
         self.metrics.clone()
+    }
+
+    /// Attach an eBPF/XDP fast-path observer (PRD `phase-6-ebpf-xdp-relay.md`)
+    /// — call before [`serve`](Self::serve). Every future registration also
+    /// notifies `hook`; nothing about the existing forwarding/drop/metrics
+    /// behavior changes, on this or any other path. Only one hook can be
+    /// attached at a time (a second call replaces the first).
+    pub fn set_xdp_hook(&self, hook: Arc<dyn RelayXdpHook>) {
+        *self.xdp_hook.lock().expect("relay xdp hook poisoned") = Some(hook);
     }
 
     /// Forward frames until the socket errors. Register frames update the table;
@@ -240,12 +326,25 @@ impl RelayServer {
                 Some(&TAG_REGISTER) if n == 1 + KEY_LEN => {
                     let mut key = [0u8; KEY_LEN];
                     key.copy_from_slice(&frame[1..1 + KEY_LEN]);
-                    let count = {
+                    let (delta, count) = {
                         let mut clients = self.clients.lock().expect("relay table poisoned");
-                        clients.register(key, from);
-                        clients.by_key.len()
+                        let delta = clients.register(key, from);
+                        (delta, clients.by_key.len())
                     };
                     self.metrics.note_register(count);
+                    if let Some(hook) = self
+                        .xdp_hook
+                        .lock()
+                        .expect("relay xdp hook poisoned")
+                        .as_ref()
+                    {
+                        hook.on_register(
+                            delta.key,
+                            delta.addr,
+                            delta.evicted_addr,
+                            delta.evicted_key,
+                        );
+                    }
                     debug!(%from, "relay client registered");
                 }
                 Some(&TAG_DATA) if n >= DATA_HEADER => {
@@ -479,6 +578,19 @@ mod tests {
         assert!(t.contains("ferrum_relay_frames_forwarded_total 1\n"));
         assert!(t.contains("ferrum_relay_bytes_forwarded_total 100\n"));
         assert!(t.contains("ferrum_relay_frames_dropped_total 1\n"));
+        // XDP totals default to zero when the fast path isn't enabled.
+        assert!(t.contains("ferrum_relay_xdp_frames_forwarded_total 0\n"));
+        assert!(t.contains("ferrum_relay_xdp_bytes_forwarded_total 0\n"));
+    }
+
+    #[test]
+    fn xdp_totals_are_set_not_accumulated() {
+        let m = RelayMetrics::default();
+        m.set_xdp_totals(10, 2000);
+        m.set_xdp_totals(15, 3200); // a later poll's cumulative totals
+        let t = m.render();
+        assert!(t.contains("ferrum_relay_xdp_frames_forwarded_total 15\n"));
+        assert!(t.contains("ferrum_relay_xdp_bytes_forwarded_total 3200\n"));
     }
 
     #[test]
@@ -491,6 +603,94 @@ mod tests {
         assert_eq!(c.by_key.get(&key(1)), Some(&a2));
         assert!(!c.by_addr.contains_key(&a1), "stale address dropped");
         assert_eq!(c.by_addr.get(&a2), Some(&key(1)));
+    }
+
+    /// The delta a fast-path observer relies on (PRD FR3) reports exactly
+    /// what became stale — nothing on a first registration, the old address
+    /// on a roam, the old key when an address is reassigned.
+    #[test]
+    fn register_delta_reports_evicted_mappings() {
+        let mut c = Clients::default();
+        let a1: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let a2: SocketAddr = "127.0.0.1:2".parse().unwrap();
+
+        let first = c.register(key(1), a1);
+        assert_eq!(first.evicted_addr, None);
+        assert_eq!(first.evicted_key, None);
+
+        let roamed = c.register(key(1), a2); // same key, new address
+        assert_eq!(roamed.evicted_addr, Some(a1));
+        assert_eq!(roamed.evicted_key, None);
+
+        let reassigned = c.register(key(2), a1); // a1 now claimed by a new key
+        assert_eq!(reassigned.evicted_addr, None);
+        assert_eq!(reassigned.evicted_key, None); // a1 had no key registered anymore
+    }
+
+    /// A registered `RelayXdpHook` (the eBPF fast path's userspace loader, in
+    /// production) is notified on every `Register` frame the server handles,
+    /// with the same eviction info `Clients::register` computed — proving the
+    /// wiring in `serve()` without needing any BPF/aya machinery at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn xdp_hook_is_notified_on_register() {
+        type Call = (PublicKey, SocketAddr, Option<SocketAddr>, Option<PublicKey>);
+
+        #[derive(Default)]
+        struct RecordingHook {
+            calls: Mutex<Vec<Call>>,
+        }
+        impl RelayXdpHook for RecordingHook {
+            fn on_register(
+                &self,
+                key: PublicKey,
+                addr: SocketAddr,
+                evicted_addr: Option<SocketAddr>,
+                evicted_key: Option<PublicKey>,
+            ) {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((key, addr, evicted_addr, evicted_key));
+            }
+        }
+
+        let server = Arc::new(
+            RelayServer::bind("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap(),
+        );
+        let addr = server.local_addr().unwrap();
+        let hook = Arc::new(RecordingHook::default());
+        server.set_xdp_hook(hook.clone());
+        tokio::spawn({
+            let server = server.clone();
+            async move {
+                let _ = server.serve().await;
+            }
+        });
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client
+            .send_to(&register_frame(&key(0x42)), addr)
+            .await
+            .unwrap();
+
+        // Poll briefly rather than a fixed sleep — the frame is local UDP
+        // and should land almost immediately.
+        for _ in 0..50 {
+            if !hook.calls.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let calls = hook.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "hook should fire exactly once");
+        let (seen_key, seen_addr, evicted_addr, evicted_key) = calls[0];
+        assert_eq!(seen_key, key(0x42));
+        assert_eq!(seen_addr, client.local_addr().unwrap());
+        assert_eq!(evicted_addr, None);
+        assert_eq!(evicted_key, None);
     }
 
     /// Two clients registered with the relay exchange an opaque payload addressed

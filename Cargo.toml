@@ -9,10 +9,14 @@ members = [
     "crates/coordinator",
     "crates/client-core",
     "crates/helper",
+    "crates/relay-xdp-common",
 ]
 # The Tauri desktop shell is its own workspace (heavy webview deps); keep it out
 # of the library workspace so this CI stays lean. See apps/desktop/.
-exclude = ["apps/desktop/src-tauri"]
+# `relay-ebpf` is likewise its own standalone workspace (needs a
+# bpfel-unknown-none target + nightly + bpf-linker most hosts building this
+# repo don't have) — see PRD/phase-6-ebpf-xdp-relay.md.
+exclude = ["apps/desktop/src-tauri", "relay-ebpf"]
 
 [workspace.package]
 version = "0.1.0"

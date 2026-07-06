@@ -12,9 +12,20 @@ default = []
 quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:bytes"]
 # MASQUE / HTTP3 (Phase 2 FR3) — builds on the QUIC stack.
 masque = ["quic", "dep:h3", "dep:h3-quinn", "dep:h3-datagram", "dep:http"]
+# The relay's eBPF/XDP fast path (PRD `phase-6-ebpf-xdp-relay.md`). Off by
+# default; even when built, `aya`/`aya-log` are Linux-only target
+# dependencies (below) so enabling this on any other host — including the
+# one this was authored on — fetches and compiles nothing extra at all.
+xdp = [
+    "dep:aya",
+    "dep:aya-log",
+    "dep:anyhow",
+    "ferrum-relay-xdp-common/std",
+    "ferrum-relay-xdp-common/aya-pod",
+]
 
 [dependencies]
-tokio.workspace = true
+tokio = { workspace = true, features = ["process"] }
 thiserror.workspace = true
 tracing.workspace = true
 quinn = { workspace = true, optional = true }
@@ -25,9 +36,21 @@ h3 = { workspace = true, optional = true }
 h3-quinn = { workspace = true, optional = true }
 h3-datagram = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
+anyhow = { workspace = true, optional = true }
+# Only used by `relay_xdp.rs` (the `xdp` feature) — optional so a default
+# build pulls in nothing extra; enabling it is what the `xdp` feature's
+# "ferrum-relay-xdp-common/std" / ".../aya-pod" entries above do.
+ferrum-relay-xdp-common = { path = "../relay-xdp-common", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
+# `optional = true` + gated by the `xdp` feature above (`dep:aya`/
+# `dep:aya-log`) — so these are only actually fetched/compiled on a Linux
+# host that explicitly builds with `--features xdp`. On any other host,
+# including this one, `aya`/`aya-log` never enter the dependency graph at
+# all: Cargo simply never evaluates a target table that doesn't match.
+aya = { version = "0.14", optional = true }
+aya-log = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }

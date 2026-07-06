@@ -29,7 +29,17 @@ pub use udp::{UdpMeshTransport, UdpTransport};
 pub mod stun;
 
 pub mod relay;
-pub use relay::{RelayMeshTransport, RelayMetrics, RelayServer};
+pub use relay::{RelayMeshTransport, RelayMetrics, RelayServer, RelayXdpHook};
+
+// The relay's eBPF/XDP fast path (PRD `phase-6-ebpf-xdp-relay.md`) — Linux
+// and `xdp`-feature gated; `aya` is a `[target.'cfg(target_os =
+// "linux")'.dependencies]` dependency (see that Cargo.toml section), so
+// this is a no-op on every other host, including the one it was authored
+// on. See `crates/transport/src/relay_xdp.rs`'s module doc.
+#[cfg(all(target_os = "linux", feature = "xdp"))]
+pub mod relay_xdp;
+#[cfg(all(target_os = "linux", feature = "xdp"))]
+pub use relay_xdp::{RelayXdpError, RelayXdpLoader};
 
 #[cfg(feature = "quic")]
 pub mod quic;

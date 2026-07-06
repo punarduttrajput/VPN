@@ -25,6 +25,7 @@ traversal, and kernel-level scale work are the remaining frontier.
 | `ferrum-coordinator` | Coordinator: registry, IP allocation, network map, ACL/policy, streaming, SQLite (`sqlite`), mTLS (`mtls`), OIDC (`oidc`). |
 | `ferrum-client-core` | `ControlClient` (gRPC) + `FerrumClient` (Phase 5 facade: connection state machine + event stream). `uniffi` feature exposes `FfiFerrumClient` → generated Swift/Kotlin (incl. `run(tun_fd,…)`/`stop()` with `data-plane`). `data-plane` feature adds `run_mesh_session` (ties the facade to `ferrum-tunnel::run_mesh`; consumes a `device::from_fd` TUN). |
 | `ferrum-helper` | `ferrum-helper` binary: the Phase 5 privileged-helper daemon (Linux/Unix only). Listens on a Unix socket, speaks `ferrum_tunnel::helper_proto`; opens the TUN device (`device::open_raw`, handing the fd back via `fdpass`/`SCM_RIGHTS`) and runs kill-switch `nft` commands (`firewall`) on behalf of an unprivileged caller — see `apps/desktop/README.md` and `packaging/systemd/`. |
+| `ferrum-relay-xdp-common` | `#![no_std]`-except-under-`cfg(test)`, dependency-free wire types (`AddrKey`, `GatewayInfo`) shared by the relay's eBPF/XDP fast path (Phase 6 FR1) and its userspace loader — see `PRD/phase-6-ebpf-xdp-relay.md` and `relay-ebpf/` below. |
 
 Outside `crates/`: **`apps/desktop`** is a Tauri v2 desktop shell (Phase 5 FR4) —
 its own standalone workspace (excluded from this one) driving `ferrum-client-core`,
@@ -34,7 +35,15 @@ coordinator's `--admin-listen` web panel (device list/revoke, live ACL policy
 view/edit); its `ng build` output is embedded into `ferrum-coordinator` at
 compile time via `rust-embed` behind the `admin-api` feature (see
 [PRD/admin-panel-angular.md](PRD/admin-panel-angular.md) and
-[apps/admin-panel/README.md](apps/admin-panel/README.md)).
+[apps/admin-panel/README.md](apps/admin-panel/README.md)). **`relay-ebpf`**
+is the relay's XDP fast path (Phase 6 FR1) — an `aya-ebpf` `#[xdp]` program,
+its own standalone workspace (needs a `bpfel-unknown-none` target + nightly
++ `bpf-linker`, excluded from this one the same way) loaded at runtime by
+`ferrum relay --xdp-iface/--xdp-program` (see
+[PRD/phase-6-ebpf-xdp-relay.md](PRD/phase-6-ebpf-xdp-relay.md) and
+[relay-ebpf/README.md](relay-ebpf/README.md) — the latter is unusually
+important to read here: the kernel program is written but has never been
+built or verifier-checked on any host so far).
 
 ## Build / test / lint
 
@@ -101,6 +110,7 @@ Linux / online machine** — several "deferred / blocked" items may now be doabl
 | **Real-hardware NFR1 throughput** — only informational on shared CI (~0.52 of a 1 Gbps shaped link vs 0.70 target). | Measure on real/representative hardware with `STRICT_THROUGHPUT=1`. |
 | **Windows UDP gotcha** — sending to a dead port triggers ICMP-unreachable → `WSAECONNRESET` on the next `recv_from`, killing the loop (a test had to use a drained "sink" socket, not a blackhole). | Linux doesn't do this; the workaround is harmless but unnecessary there. |
 | Live **third-party MASQUE proxy** interop — no external proxy available. | Test against a real RFC 9298 proxy if one is reachable. |
+| **eBPF/XDP (`relay-ebpf/`)** — this host has no LLVM/clang, no `bpf-linker`, no `bpfel-unknown-none` target, and no Linux kernel; separately, its nightly MSVC toolchain can't even link host-side proc-macro build scripts (`link.exe` / missing VS C++ Build Tools) — discovered trying `cargo check` inside `relay-ebpf/` itself. Neither gap is fundamental to the *code*; both are this specific host's toolchain. | On a real Linux box: `rustup toolchain install nightly --component rust-src && cargo install bpf-linker`, then follow `relay-ebpf/README.md`. The userspace loader (`crates/transport/src/relay_xdp.rs`, `xdp` feature) already cross-compile-checks clean against the real `aya` API from here — only the kernel program itself needs the new box. |
 
 When you hit something marked "deferred because offline/Windows," **try it first**
 on the new environment before assuming it's still blocked.
@@ -202,7 +212,15 @@ on the new environment before assuming it's still blocked.
   injection — `FerrumCoordinatorDown` fired and routed to the pager receiver) **and a
   coordinator latency SLO** (a `ferrum_request_duration_seconds` histogram SLI — aggregate-only,
   NFR5 — feeds a 99%-of-RPCs-under-100ms burn-rate alert; promtool-tested). **FR4 is complete.**
-  eBPF/XDP, anycast, autoscaling not started.
+  **eBPF/XDP relay fast path (FR1) is designed and coded, unverified** (PRD:
+  [PRD/phase-6-ebpf-xdp-relay.md](PRD/phase-6-ebpf-xdp-relay.md)) — the userspace-side split
+  (`ferrum-relay-xdp-common`, `crates/transport/src/relay_xdp.rs`, the `RelayServer::set_xdp_hook`
+  wiring, the `ferrum relay --xdp-iface/--xdp-program` flags) is real, tested, and cross-compile-
+  checked against the actual `aya = "0.14.0"` API; the kernel-side `#[xdp]` program
+  (`relay-ebpf/`, its own standalone workspace) is fully written but has never been compiled,
+  loaded, or verifier-checked — this build host has no LLVM/`bpf-linker`/BPF target/Linux kernel
+  at all, a strictly harder gap than any prior Linux-only feature here. Anycast, autoscaling not
+  started.
 
 ## Recommended next work (highest-value, buildable in Rust)
 
@@ -242,4 +260,10 @@ on the new environment before assuming it's still blocked.
    **coordinator latency SLO** (request-duration histogram SLI → 99%-under-100ms burn-rate).
    FR4 complete.
 4. **Phase 6 / NFR1**: UDP GSO (send) + GRO (receive) ✅ *(done — `UdpTransport`)*; remaining:
-   real-hardware throughput; eBPF/XDP fast path (Linux).
+   real-hardware throughput.
+5. **Phase 6 — eBPF/XDP relay fast path (FR1)** 🟡 *(userspace side done; kernel program
+   unverified)*: see [PRD/phase-6-ebpf-xdp-relay.md](PRD/phase-6-ebpf-xdp-relay.md). Next step for
+   whoever has a real Linux host with `bpf-linker` available: follow
+   `relay-ebpf/README.md` to build the `#[xdp]` program, load it via
+   `ferrum relay --xdp-iface <name> --xdp-program <path>`, and benchmark against the existing
+   userspace relay to validate the ≥10 Gbps NFR1 target.

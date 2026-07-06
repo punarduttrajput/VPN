@@ -1,0 +1,33 @@
+[package]
+name = "ferrum-relay-ebpf"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+# This crate is its own standalone workspace — see README.md and
+# PRD/phase-6-ebpf-xdp-relay.md for why. It is deliberately NOT a member of
+# the repo-root workspace (which lists members explicitly, so nothing extra
+# is needed there beyond the defensive `exclude` entry already added) because
+# it targets `bpfel-unknown-none` via a nightly toolchain + `bpf-linker`,
+# which most hosts building the rest of this repo (this one included) don't
+# have installed.
+[workspace]
+
+[[bin]]
+name = "ferrum-relay-ebpf"
+path = "src/main.rs"
+
+[dependencies]
+aya-ebpf = "0.2"
+aya-log-ebpf = "0.2"
+# No feature flags needed: `aya-ebpf`'s map types have no `Pod`-style bound
+# on their key/value generics (checked against the real 0.2.1 source — see
+# ferrum-relay-xdp-common's Cargo.toml doc comment), so this crate uses
+# `AddrKey`/`GatewayInfo` directly with no extra trait impl required.
+ferrum-relay-xdp-common = { path = "../crates/relay-xdp-common" }
+
+[profile.release]
+lto = true
+panic = "abort"
+codegen-units = 1
+debug = false

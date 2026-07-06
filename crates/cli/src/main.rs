@@ -48,6 +48,18 @@ enum Command {
         /// `http://localhost:4317` (Phase 6 FR4; requires the `otlp` feature).
         #[arg(long)]
         otlp_endpoint: Option<String>,
+        /// Network interface to attach the eBPF/XDP fast path to, e.g. `eth0`
+        /// (PRD `phase-6-ebpf-xdp-relay.md`; requires the `xdp` feature, Linux
+        /// only, and a compiled `relay-ebpf` object — see `--xdp-program`).
+        /// Without this, the relay behaves exactly as before this feature
+        /// existed: pure userspace forwarding.
+        #[arg(long)]
+        xdp_iface: Option<String>,
+        /// Path to the compiled `relay-ebpf` object (see
+        /// `relay-ebpf/README.md` for how to build it). Required alongside
+        /// `--xdp-iface` to actually enable the fast path.
+        #[arg(long)]
+        xdp_program: Option<String>,
     },
     /// Bring up the tunnel from a config file and run until Ctrl-C.
     Up {
@@ -120,6 +132,8 @@ fn main() -> Result<()> {
             listen,
             metrics_listen,
             otlp_endpoint,
+            xdp_iface,
+            xdp_program,
         } => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?
@@ -127,6 +141,8 @@ fn main() -> Result<()> {
                 &listen,
                 metrics_listen.as_deref(),
                 otlp_endpoint.as_deref(),
+                xdp_iface.as_deref(),
+                xdp_program.as_deref(),
             )),
         Command::Up { config, iface, mtu } => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -170,10 +186,14 @@ fn keygen() {
 /// forwards opaque (already-encrypted) datagrams between registered peers, so it
 /// needs no keys of its own. With `metrics_listen` set, also serve
 /// privacy-preserving Prometheus metrics on `GET /metrics` (Phase 6 FR4).
+/// `xdp_iface`/`xdp_program` opt into the eBPF fast path (PRD
+/// `phase-6-ebpf-xdp-relay.md`) — see [`enable_xdp_fastpath`].
 async fn relay(
     listen: &str,
     metrics_listen: Option<&str>,
     otlp_endpoint: Option<&str>,
+    xdp_iface: Option<&str>,
+    xdp_program: Option<&str>,
 ) -> Result<()> {
     // Tracing: stderr logs always; OTLP span export (Phase 6 FR4) when
     // --otlp-endpoint is given and the `otlp` feature is built. The guard flushes
@@ -196,12 +216,70 @@ async fn relay(
         tokio::spawn(serve_relay_metrics(metrics_addr, metrics));
     }
 
+    enable_xdp_fastpath(&server, addr.port(), xdp_iface, xdp_program).await;
+
     info!(%addr, "relay listening (Ctrl-C to stop)");
     tokio::select! {
         result = server.serve() => result.context("relay server")?,
         _ = shutdown_signal() => info!("relay stopped"),
     }
     Ok(())
+}
+
+/// Attach the eBPF/XDP fast path (PRD `phase-6-ebpf-xdp-relay.md`) when both
+/// `--xdp-iface` and `--xdp-program` are given, the `xdp` feature is built,
+/// and the host is Linux. Never a hard failure either way (PRD FR5 goal G4:
+/// additive, never required) — a missing flag, an unbuilt feature, or a
+/// failed attach all just mean "the relay runs userspace-only," logged, not
+/// returned as an error that would abort an otherwise-working relay.
+#[cfg(all(target_os = "linux", feature = "xdp"))]
+async fn enable_xdp_fastpath(
+    server: &ferrum_transport::RelayServer,
+    relay_port: u16,
+    xdp_iface: Option<&str>,
+    xdp_program: Option<&str>,
+) {
+    let (Some(iface), Some(program)) = (xdp_iface, xdp_program) else {
+        if xdp_iface.is_some() || xdp_program.is_some() {
+            tracing::warn!(
+                "relay xdp: both --xdp-iface and --xdp-program are required to enable the fast path; running userspace-only"
+            );
+        }
+        return;
+    };
+    match ferrum_transport::RelayXdpLoader::attach(
+        std::path::Path::new(program),
+        iface,
+        relay_port,
+        server.metrics(),
+    )
+    .await
+    {
+        Ok(loader) => {
+            server.set_xdp_hook(loader);
+            info!(%iface, %program, "relay xdp fast path enabled");
+        }
+        Err(e) => {
+            tracing::warn!("relay xdp: failed to attach fast path ({e}); running userspace-only");
+        }
+    }
+}
+
+/// Non-Linux / `xdp`-feature-off builds: the flags are always accepted (see
+/// the `Relay` subcommand) but only ever warn here — see
+/// [`enable_xdp_fastpath`] above for what they do when the feature is built.
+#[cfg(not(all(target_os = "linux", feature = "xdp")))]
+async fn enable_xdp_fastpath(
+    _server: &ferrum_transport::RelayServer,
+    _relay_port: u16,
+    xdp_iface: Option<&str>,
+    xdp_program: Option<&str>,
+) {
+    if xdp_iface.is_some() || xdp_program.is_some() {
+        tracing::warn!(
+            "relay xdp: --xdp-iface/--xdp-program given, but this binary wasn't built with the `xdp` feature (or isn't running on Linux); running userspace-only"
+        );
+    }
 }
 
 /// Serve the relay's privacy-preserving metrics (PRD Phase 6 FR4) on a tiny
