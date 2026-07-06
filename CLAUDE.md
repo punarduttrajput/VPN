@@ -29,7 +29,12 @@ traversal, and kernel-level scale work are the remaining frontier.
 Outside `crates/`: **`apps/desktop`** is a Tauri v2 desktop shell (Phase 5 FR4) —
 its own standalone workspace (excluded from this one) driving `ferrum-client-core`,
 preferring the `ferrum-helper` daemon over privileged in-process operations
-when it's reachable (Linux).
+when it's reachable (Linux). **`apps/admin-panel`** is an Angular 19 app — the
+coordinator's `--admin-listen` web panel (device list/revoke, live ACL policy
+view/edit); its `ng build` output is embedded into `ferrum-coordinator` at
+compile time via `rust-embed` behind the `admin-api` feature (see
+[PRD/admin-panel-angular.md](PRD/admin-panel-angular.md) and
+[apps/admin-panel/README.md](apps/admin-panel/README.md)).
 
 ## Build / test / lint
 

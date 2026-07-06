@@ -1,0 +1,25 @@
+<div class="section-actions">
+  <button class="secondary" [disabled]="loading()" (click)="refresh()">Refresh</button>
+</div>
+
+<h2>Devices</h2>
+<ul class="rows">
+  @if (devices().length === 0) {
+    <li class="empty">No devices registered.</li>
+  }
+  @for (d of devices(); track d.public_key) {
+    <li>
+      <div class="info">
+        <span><strong>{{ d.name }}</strong> <span class="ip">{{ d.tunnel_ip }}</span></span>
+        <span class="key">{{ d.public_key }}</span>
+        <span class="endpoint">{{ d.endpoint || '(no endpoint yet)' }}</span>
+        <span class="tags">
+          @for (t of d.tags; track t) {
+            <span class="badge">{{ t }}</span>
+          }
+        </span>
+      </div>
+      <button class="link" (click)="revoke(d)">Revoke</button>
+    </li>
+  }
+</ul>
