@@ -1,0 +1,33 @@
+<h2>ACL Policy</h2>
+<p class="hint">
+  Edits apply immediately to live traffic but are <strong>runtime-only</strong>
+  — a coordinator restart reverts to the <code>--policy</code> file (or
+  allow-all if none was given).
+</p>
+
+<div class="toggle">
+  <input id="policy-allow-all" type="checkbox" [formControl]="allowAll" />
+  <label for="policy-allow-all">Allow all (full mesh — ignores rules below)</label>
+</div>
+
+<ul class="rows">
+  @for (group of ruleGroups; track group; let i = $index) {
+    <li class="rule-row" [formGroup]="group">
+      <label>
+        src tags (comma-separated, or *)
+        <input formControlName="src" />
+      </label>
+      <label>
+        dst tags (comma-separated, or *)
+        <input formControlName="dst" />
+      </label>
+      <button class="link" (click)="removeRule(i)">Remove</button>
+    </li>
+  }
+</ul>
+
+<div class="section-actions">
+  <button class="secondary" (click)="addRule()">+ Add rule</button>
+  <button class="secondary" [disabled]="loading()" (click)="refresh()">Refresh</button>
+  <button (click)="save()">Save policy</button>
+</div>

@@ -15,10 +15,11 @@
 use std::sync::{Arc, Mutex};
 
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use rust_embed::RustEmbed;
 use serde::Deserialize;
 use tokio::sync::broadcast;
 
@@ -51,9 +52,10 @@ pub fn router(
         .route("/api/devices", get(list_devices))
         .route("/api/devices/revoke", axum::routing::post(revoke_device))
         .route("/api/policy", get(get_policy).put(put_policy))
-        .route("/", get(index))
-        .route("/main.js", get(main_js))
-        .route("/styles.css", get(styles_css))
+        // Anything that isn't an /api/* route falls through to here — the
+        // embedded Angular build, with an index.html fallback for its
+        // client-side routes (/devices, /policy, a hard refresh on either).
+        .fallback(static_asset)
         .with_state(state)
 }
 
@@ -162,33 +164,31 @@ async fn put_policy(
     StatusCode::NO_CONTENT.into_response()
 }
 
-// Static panel — embedded at compile time (no bundler, matching
-// `apps/desktop/dist`'s own no-build-step convention). Deliberately not behind
-// `authorize`: the page shell has to load before an operator has a token to
+// Static panel — the Angular app's `ng build` output
+// (apps/admin-panel/dist/admin-panel/browser/), embedded at compile time so
+// the coordinator ships as a single binary with no separate file server or
+// runtime path to configure. Deliberately not behind `authorize`: the page
+// shell (and its JS bundle) has to load before an operator has a token to
 // paste in; only the `/api/*` routes above are gated.
+#[derive(RustEmbed)]
+#[folder = "../../apps/admin-panel/dist/admin-panel/browser/"]
+struct AdminUi;
 
-async fn index() -> Response {
-    (
-        [("content-type", "text/html; charset=utf-8")],
-        include_str!("../admin-ui/index.html"),
-    )
-        .into_response()
+async fn static_asset(uri: Uri) -> Response {
+    let path = uri.path().trim_start_matches('/');
+    // A hit is a real asset (index.html, a hashed JS/CSS chunk, favicon); a
+    // miss is one of the Angular router's client-side paths (/devices,
+    // /policy, or a hard refresh on either) — serve the app shell for those
+    // too and let its Router take over.
+    serve_embedded(path)
+        .or_else(|| serve_embedded("index.html"))
+        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
 }
 
-async fn main_js() -> Response {
-    (
-        [("content-type", "application/javascript; charset=utf-8")],
-        include_str!("../admin-ui/main.js"),
-    )
-        .into_response()
-}
-
-async fn styles_css() -> Response {
-    (
-        [("content-type", "text/css; charset=utf-8")],
-        include_str!("../admin-ui/styles.css"),
-    )
-        .into_response()
+fn serve_embedded(path: &str) -> Option<Response> {
+    let file = AdminUi::get(path)?;
+    let mime = file.metadata.mimetype();
+    Some(([("content-type", mime)], file.data.into_owned()).into_response())
 }
 
 #[cfg(test)]

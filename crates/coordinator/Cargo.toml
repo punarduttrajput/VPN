@@ -31,7 +31,10 @@ otlp = [
 # Admin HTTP API + static panel (device list/revoke, live ACL policy view/edit).
 # Implies `oidc`: the admin surface has no other auth mode — it reuses the same
 # OidcVerifier, gated on an "admin" tag/claim, and fails closed with no verifier.
-admin-api = ["oidc", "dep:axum"]
+# The panel itself is an Angular app (apps/admin-panel/) whose `ng build` output
+# is embedded at compile time via `rust-embed` — run that build before
+# `cargo build --features admin-api` (see apps/admin-panel/README.md).
+admin-api = ["oidc", "dep:axum", "dep:rust-embed"]
 
 [dependencies]
 ferrum-control-proto = { path = "../control-proto" }
@@ -55,6 +58,7 @@ opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 axum = { version = "0.7", optional = true }
+rust-embed = { version = "8", optional = true, features = ["mime-guess"] }
 
 [dev-dependencies]
 tokio-stream = { version = "0.1", features = ["net"] }

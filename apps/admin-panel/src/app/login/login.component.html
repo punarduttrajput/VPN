@@ -1,0 +1,31 @@
+<main>
+  <header>
+    <h1>Ferrum — Admin</h1>
+    <span class="badge">coordinator</span>
+  </header>
+
+  <section>
+    <p class="hint">
+      Paste an OIDC bearer token whose verified claims include the
+      <code>admin</code> tag. The token is kept only in this browser tab
+      (<code>sessionStorage</code>) and sent as <code>Authorization: Bearer</code>
+      on every request — it is never stored on the coordinator.
+    </p>
+    <div class="form">
+      <label>
+        Admin token
+        <input
+          type="password"
+          autocomplete="off"
+          placeholder="eyJhbGciOi..."
+          [ngModel]="token()"
+          (ngModelChange)="token.set($event)"
+          (keydown.enter)="connect()"
+        />
+      </label>
+      <div class="actions">
+        <button (click)="connect()">Connect</button>
+      </div>
+    </div>
+  </section>
+</main>

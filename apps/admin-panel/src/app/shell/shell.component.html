@@ -1,0 +1,18 @@
+<main>
+  <header>
+    <h1>Ferrum — Admin</h1>
+    <span class="badge">coordinator</span>
+  </header>
+
+  @if (status.message(); as msg) {
+    <div id="status-banner" [class]="msg.kind">{{ msg.text }}</div>
+  }
+
+  <nav class="actions">
+    <a routerLink="/devices" routerLinkActive="active" class="secondary">Devices</a>
+    <a routerLink="/policy" routerLinkActive="active" class="secondary">ACL Policy</a>
+    <button class="secondary" (click)="signOut()">Sign out</button>
+  </nav>
+
+  <router-outlet></router-outlet>
+</main>
