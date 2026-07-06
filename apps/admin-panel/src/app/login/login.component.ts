@@ -20,6 +20,6 @@ export class LoginComponent {
     const token = this.token().trim();
     if (!token) return;
     this.auth.setToken(token);
-    this.router.navigateByUrl('/devices');
+    this.router.navigateByUrl('/dashboard');
   }
 }

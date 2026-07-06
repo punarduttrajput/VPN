@@ -21,4 +21,10 @@ describe('ShellComponent', () => {
   it('should create', () => {
     expect(component).toBeTruthy();
   });
+
+  it('theme toggle flips the ThemeService state', () => {
+    const before = component.themeService.theme();
+    component.themeService.toggle();
+    expect(component.themeService.theme()).not.toBe(before);
+  });
 });

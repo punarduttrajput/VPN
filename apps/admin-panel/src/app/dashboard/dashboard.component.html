@@ -1,0 +1,54 @@
+<div class="section-actions">
+  <button class="secondary" [disabled]="loading()" (click)="refresh()">Refresh</button>
+</div>
+
+<h2>Overview</h2>
+<div class="stat-grid">
+  <div class="stat-card">
+    <span class="stat-label">Devices</span>
+    <span class="stat-value">{{ deviceCount() }}</span>
+    <span class="stat-detail">registered with the coordinator</span>
+  </div>
+  <div class="stat-card">
+    <span class="stat-label">Awaiting endpoint</span>
+    <span class="stat-value" [class.warn]="pendingCount() > 0">{{ pendingCount() }}</span>
+    <span class="stat-detail">not yet reachable</span>
+  </div>
+  <div class="stat-card">
+    <span class="stat-label">Tags in use</span>
+    <span class="stat-value">{{ tagCount() }}</span>
+    <span class="stat-detail">distinct policy tags</span>
+  </div>
+  <div class="stat-card">
+    <span class="stat-label">ACL policy</span>
+    <span class="stat-value" [class.ok]="policy()?.allow_all">{{ policyLabel() }}</span>
+    <span class="stat-detail">
+      <a routerLink="/policy">edit policy →</a>
+    </span>
+  </div>
+</div>
+
+<h2>Recent devices</h2>
+<ul class="rows">
+  @if (recentDevices().length === 0) {
+    <li class="empty">No devices registered.</li>
+  }
+  @for (d of recentDevices(); track d.public_key) {
+    <li>
+      <div class="info">
+        <span><strong>{{ d.name }}</strong> <span class="ip">{{ d.tunnel_ip }}</span></span>
+        <span class="endpoint">{{ d.endpoint || '(no endpoint yet)' }}</span>
+      </div>
+      <span class="tags">
+        @for (t of d.tags; track t) {
+          <span class="badge">{{ t }}</span>
+        }
+      </span>
+    </li>
+  }
+</ul>
+@if (deviceCount() > recentDevices().length) {
+  <p class="hint">
+    <a routerLink="/devices">view all {{ deviceCount() }} devices →</a>
+  </p>
+}

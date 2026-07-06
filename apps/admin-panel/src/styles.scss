@@ -1,15 +1,35 @@
-/* Global styles — ported from crates/coordinator/admin-ui/styles.css (the
-   dark palette the vanilla panel used before this Angular rewrite). */
+/* Global styles — originally ported from crates/coordinator/admin-ui/styles.css
+   (the vanilla panel's dark palette), since extended with a light theme
+   (toggled via ThemeService, keyed off [data-theme] on <html>) and some
+   visual polish (shadows, hover states, a dashboard stat-card grid). */
 :root {
   --bg: #0f1419;
   --panel: #1a212b;
+  --panel-raised: #212a36;
   --border: #2a3441;
   --text: #e6edf3;
   --muted: #8b97a6;
   --accent: #3b82f6;
+  --accent-soft: rgba(59, 130, 246, 0.15);
   --ok: #22c55e;
   --warn: #f59e0b;
   --err: #ef4444;
+  --shadow: rgba(0, 0, 0, 0.35);
+}
+
+:root[data-theme='light'] {
+  --bg: #f4f6f8;
+  --panel: #ffffff;
+  --panel-raised: #ffffff;
+  --border: #dde3ea;
+  --text: #1a212b;
+  --muted: #62707e;
+  --accent: #2563eb;
+  --accent-soft: rgba(37, 99, 235, 0.1);
+  --ok: #16a34a;
+  --warn: #b45309;
+  --err: #dc2626;
+  --shadow: rgba(15, 23, 42, 0.08);
 }
 
 * {
@@ -27,11 +47,12 @@ body {
   background: var(--bg);
   color: var(--text);
   font-size: 14px;
+  transition: background-color 0.15s ease, color 0.15s ease;
 }
 
 main {
   padding: 16px;
-  max-width: 780px;
+  max-width: 860px;
   margin: 0 auto;
 }
 
@@ -45,6 +66,18 @@ header {
 h1 {
   font-size: 18px;
   margin: 0;
+}
+
+a {
+  color: var(--accent);
+}
+
+a:not(.secondary) {
+  text-decoration: none;
+}
+
+a:not(.secondary):hover {
+  text-decoration: underline;
 }
 
 h2 {
@@ -88,6 +121,7 @@ input {
   color: var(--text);
   padding: 8px 10px;
   font-size: 13px;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
 }
 
 input:focus {
@@ -114,6 +148,16 @@ a.secondary {
   font-size: 13px;
   text-decoration: none;
   display: inline-block;
+  transition: background-color 0.15s ease, border-color 0.15s ease, transform 0.1s ease;
+}
+
+button:hover:not(:disabled),
+a.secondary:hover {
+  filter: brightness(1.08);
+}
+
+button:active:not(:disabled) {
+  transform: translateY(1px);
 }
 
 button:disabled {
@@ -128,9 +172,15 @@ a.secondary {
   color: var(--text);
 }
 
+button.secondary:hover,
+a.secondary:hover {
+  border-color: var(--accent);
+}
+
 a.secondary.active {
   border-color: var(--accent);
   color: var(--accent);
+  background: var(--accent-soft);
 }
 
 button.link {
@@ -139,6 +189,31 @@ button.link {
   color: var(--err);
   font-weight: 500;
   padding: 4px 8px;
+}
+
+button.link:hover {
+  filter: none;
+  text-decoration: underline;
+}
+
+/* Icon-only toggle (theme switch) — round, same footprint on both themes. */
+button.icon-toggle {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--text);
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  line-height: 1;
+}
+
+button.icon-toggle:hover {
+  border-color: var(--accent);
 }
 
 .badge {
@@ -168,6 +243,11 @@ button.link {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+
+.rows li:not(.empty):hover {
+  border-color: var(--accent);
 }
 
 .rows .key {
@@ -256,4 +336,50 @@ button.link {
 #status-banner.err {
   background: rgba(239, 68, 68, 0.15);
   color: var(--err);
+}
+
+/* Dashboard stat-card grid (dashboard.component.html). */
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.stat-card {
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px;
+  box-shadow: 0 1px 3px var(--shadow);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+
+.stat-card .stat-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.stat-card .stat-value {
+  font-size: 26px;
+  font-weight: 700;
+  line-height: 1.1;
+}
+
+.stat-card .stat-value.ok {
+  color: var(--ok);
+}
+
+.stat-card .stat-value.warn {
+  color: var(--warn);
+}
+
+.stat-card .stat-detail {
+  font-size: 12px;
+  color: var(--muted);
 }
