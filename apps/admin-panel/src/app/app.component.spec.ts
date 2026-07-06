@@ -16,4 +16,10 @@ describe('AppComponent', () => {
     const app = fixture.componentInstance;
     expect(app).toBeTruthy();
   });
+
+  it('applies a theme to <html> on bootstrap, before any route (e.g. /login) renders', () => {
+    document.documentElement.removeAttribute('data-theme');
+    TestBed.createComponent(AppComponent);
+    expect(document.documentElement.getAttribute('data-theme')).not.toBeNull();
+  });
 });
