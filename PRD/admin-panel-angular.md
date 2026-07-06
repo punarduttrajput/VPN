@@ -281,3 +281,29 @@ upgrade for anyone already running `ferrum-coordinator --admin-listen`.
 Sets up a structured base for later admin-surface growth (Phase 6
 metrics/observability data, Phase 4 per-peer path/candidate detail) without
 another rewrite.
+
+---
+
+## 12. Post-Acceptance Extensions (not a scope change — logged in STATUS.md)
+
+Two follow-on additions landed the same day, after every milestone/acceptance
+criterion above was already met, on top of this same structured base rather
+than requiring any revision to it:
+
+- **Dashboard overview page** — a new default landing route (`dashboard/`)
+  with stat cards (device count, devices awaiting an endpoint, distinct
+  policy tags, ACL policy mode) and a recent-devices preview, computed
+  client-side from the same `DevicesService`/`PolicyService` calls the
+  Devices/Policy routes already make. No new backend endpoint, no HTTP
+  contract change — exactly the kind of admin-surface growth §11 anticipated.
+- **Light/dark theme toggle** — a new `ThemeService` (`localStorage`-backed,
+  defaults to `prefers-color-scheme`) and a toggle button in the shell nav,
+  with a light-theme CSS variable override added alongside the existing dark
+  palette in `styles.scss`.
+
+Neither changes this PRD's Goals, Functional Requirements, or Acceptance
+Criteria (§5/§9 above describe login+devices+policy parity, which is still
+exactly what M1–M5 delivered) — they're additive UI features layered on top.
+See the 2026-07-06 STATUS.md entries ("Dashboard overview page + light/dark
+theme toggle" and the follow-up login-page theme fix) for what shipped and
+how it was verified.
