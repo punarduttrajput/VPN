@@ -146,6 +146,13 @@ struct TransportArg {
     stun_server: Option<String>,
     #[serde(default)]
     relay: Option<String>,
+    /// Comma-separated DNS resolver IPs — a local override of the
+    /// coordinator-advertised list (PRD leak-protection.md M5).
+    #[serde(default)]
+    dns_servers: Option<String>,
+    /// IPv6 leak policy: `""`/`"auto"` | `"block"` | `"tunnel"` | `"off"`.
+    #[serde(default)]
+    ipv6_policy: Option<String>,
 }
 
 /// An event pushed to the webview on the `client-event` channel.
@@ -160,43 +167,61 @@ struct UiEvent {
     message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     blocked: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dns_protected: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ipv6_blocked: Option<bool>,
 }
+
+/// A `UiEvent` with every optional field unset; constructors fill their own.
+const EMPTY_UI_EVENT: UiEvent = UiEvent {
+    kind: "",
+    state: None,
+    peers: None,
+    message: None,
+    blocked: None,
+    dns_protected: None,
+    ipv6_blocked: None,
+};
 
 impl UiEvent {
     fn state(s: String) -> Self {
         UiEvent {
             kind: "state",
             state: Some(s),
-            peers: None,
-            message: None,
-            blocked: None,
+            ..EMPTY_UI_EVENT
         }
     }
     fn peers(n: u32) -> Self {
         UiEvent {
             kind: "peers",
-            state: None,
             peers: Some(n),
-            message: None,
-            blocked: None,
+            ..EMPTY_UI_EVENT
         }
     }
     fn error(message: String) -> Self {
         UiEvent {
             kind: "error",
-            state: None,
-            peers: None,
             message: Some(message),
-            blocked: None,
+            ..EMPTY_UI_EVENT
         }
     }
     fn kill_switch(blocked: bool) -> Self {
         UiEvent {
             kind: "kill-switch",
-            state: None,
-            peers: None,
-            message: None,
             blocked: Some(blocked),
+            ..EMPTY_UI_EVENT
+        }
+    }
+    /// What this session's leak protection resolved to (PRD leak-protection.md
+    /// M5) — drives the "DNS protected / IPv6 blocked" chips, including the
+    /// honest warning state when nothing protects DNS.
+    fn leak_protection(dns_protected: bool, ipv6_blocked: bool) -> Self {
+        UiEvent {
+            kind: "leak-protection",
+            dns_protected: Some(dns_protected),
+            ipv6_blocked: Some(ipv6_blocked),
+            ..EMPTY_UI_EVENT
         }
     }
 }
@@ -265,10 +290,19 @@ fn build_config(
         relay: transport.relay,
         token: None,
         kill_switch,
-        // Leak protection (PRD leak-protection.md): no GUI fields until M5 —
-        // empty defaults mean coordinator-advertised DNS + the `auto` v6 policy.
-        dns_servers: Vec::new(),
-        ipv6_policy: String::new(),
+        // Leak protection (PRD leak-protection.md M5): the Advanced form's
+        // comma-separated override; empty means coordinator-advertised.
+        dns_servers: transport
+            .dns_servers
+            .as_deref()
+            .map(|s| {
+                s.split(',')
+                    .map(|part| part.trim().to_string())
+                    .filter(|part| !part.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        ipv6_policy: transport.ipv6_policy.unwrap_or_default(),
     }
 }
 
@@ -294,6 +328,19 @@ async fn connect(
     #[cfg(windows)]
     {
         // The GUI is unprivileged: ask the helper service to bring the tunnel up.
+        // Mirror the service's leak-protection resolution for display only — the
+        // chips show what the session will enforce (the service resolves and
+        // enforces independently).
+        let display_cfg = cfg.clone();
+        let display_app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let dns = dataplane::resolve_dns(&display_cfg).await;
+            let block_v6 = dataplane::ipv6_block(&display_cfg);
+            let _ = display_app.emit(
+                "client-event",
+                UiEvent::leak_protection(!dns.is_empty(), block_v6),
+            );
+        });
         let session = helper_client::connect(app.clone(), cfg).await?;
         *state.session.lock().unwrap() = Some(Session::Helper(session));
         *state.status.lock().unwrap() = "Connecting".into();
@@ -330,6 +377,10 @@ fn connect_in_process(
         if dns.is_empty() {
             log::warn!("no DNS servers configured or advertised; DNS is unprotected this session");
         }
+        let _ = app.emit(
+            "client-event",
+            UiEvent::leak_protection(!dns.is_empty(), block_v6),
+        );
         *app.state::<AppState>().leak_params.lock().unwrap() = Some((dns, block_v6));
 
         let result = dataplane::bring_up(&client, &cfg, async move {

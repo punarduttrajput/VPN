@@ -48,6 +48,11 @@ COORD_PORT=${COORD_PORT:-50051}
 # Carry the mesh over QUIC instead of UDP (requires the quic build feature).
 # Only meaningful together with TEST_MESH=1.
 MESH_QUIC=${MESH_QUIC:-0}
+# Also verify the leak-guard firewall's observable behavior (PRD
+# leak-protection.md AC5): engage the production nft ruleset inside ns A —
+# never touching the host — and assert the DNS lock + IPv6 block + restore.
+# Off by default (needs nft + python3); set TEST_LEAKGUARD=1 to enable.
+TEST_LEAKGUARD=${TEST_LEAKGUARD:-0}
 # ---------------------------------------------------------------------------
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -98,6 +103,11 @@ fi
 for tool in cargo ip tc iperf3 ping awk; do
   command -v "$tool" >/dev/null || { red "missing required tool: $tool"; exit 2; }
 done
+if [ "$TEST_LEAKGUARD" = "1" ]; then
+  for tool in nft python3; do
+    command -v "$tool" >/dev/null || { red "TEST_LEAKGUARD=1 needs: $tool"; exit 2; }
+  done
+fi
 
 BUILD_FEATURES="ferrum-tunnel/real-tun"
 # QUIC is needed for the QUIC point-to-point test and/or a QUIC-carried mesh.
@@ -380,6 +390,92 @@ CFG
     sleep 1
     PIDS=()
   fi
+fi
+
+# ---- optional: leak-guard firewall behavior (PRD leak-protection.md M5) ----
+# Engages the *production* ruleset — printed by the leakguard_script example,
+# which calls the same `ferrum_tunnel::leakguard::engage_script` the clients
+# run — inside ns A, so the host's firewall is never touched (nft tables are
+# per-netns). Asserts AC2's observable behavior: DNS to an unapproved resolver
+# is dropped, ordinary traffic and approved resolvers keep working, off-tunnel
+# IPv6 is blocked (with v4 untouched), and disengage restores everything.
+if [ "$TEST_LEAKGUARD" = "1" ]; then
+  info "Leak-guard firewall behavior (TEST_LEAKGUARD=1)"
+  LG_BIN="$ROOT/target/release/examples/leakguard_script"
+  ( cd "$ROOT" && CARGO_NET_OFFLINE=false \
+      cargo build --release -p ferrum-tunnel --example leakguard_script )
+  [ -x "$LG_BIN" ] || { red "example binary not found at $LG_BIN"; exit 2; }
+
+  # v6 on the veth underlay + a stand-in "tunnel" interface in ns A (the rules
+  # match on interface name only, so a dummy link is enough).
+  UL1_V6=fd00:66::1; UL2_V6=fd00:66::2
+  ip -n "$NS1" addr add "$UL1_V6/64" dev veth-a
+  ip -n "$NS2" addr add "$UL2_V6/64" dev veth-b
+  ip -n "$NS1" link add ferrumlg0 type dummy
+  ip -n "$NS1" link set ferrumlg0 up
+  sleep 2 # let the new v6 addresses pass DAD
+
+  # UDP echo responders in ns B: port 53 plays the "LAN/ISP resolver" the
+  # guard must cut off; port 5353 is the ordinary-traffic control.
+  udp_echo() { # udp_echo <port>
+    ip netns exec "$NS2" python3 - "$1" <<'PY' &
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("0.0.0.0", int(sys.argv[1])))
+while True:
+    data, addr = s.recvfrom(2048)
+    s.sendto(b"ok", addr)
+PY
+    PIDS+=($!)
+  }
+  udp_echo 53
+  udp_echo 5353
+  sleep 1
+
+  udp_probe() { # udp_probe <ip> <port> — succeeds iff a reply arrives
+    ip netns exec "$NS1" python3 - "$1" "$2" <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(2)
+s.sendto(b"hi", (sys.argv[1], int(sys.argv[2])))
+try:
+    s.recvfrom(64)
+except socket.timeout:
+    sys.exit(1)
+PY
+  }
+  fails() { ! "$@"; }
+
+  check "leak-guard baseline: UDP 53 to the 'LAN resolver' answers" \
+    udp_probe "$UL2" 53
+  check "leak-guard baseline: IPv6 ping works" \
+    ip netns exec "$NS1" ping -6 -c 2 -W 2 "$UL2_V6" >/dev/null
+
+  # Engage with an *unapproved* resolver + the v6 block.
+  "$LG_BIN" ferrumlg0 1 10.99.0.53 | ip netns exec "$NS1" nft -f -
+  check "leak-guard: DNS (53) to an unapproved resolver is dropped" \
+    fails udp_probe "$UL2" 53
+  check "leak-guard: non-DNS UDP (5353) is untouched" \
+    udp_probe "$UL2" 5353
+  check "leak-guard: off-tunnel IPv6 is blocked" \
+    fails ip netns exec "$NS1" ping -6 -c 2 -W 2 "$UL2_V6" >/dev/null
+  check "leak-guard: IPv4 is untouched" \
+    ip netns exec "$NS1" ping -c 2 -W 2 "$UL2" >/dev/null
+
+  # Re-engage approving the responder: the idempotent replace + the
+  # accept-before-drop ordering, observed rather than unit-asserted.
+  "$LG_BIN" ferrumlg0 1 "$UL2" | ip netns exec "$NS1" nft -f -
+  check "leak-guard: DNS to the approved resolver answers through the lock" \
+    udp_probe "$UL2" 53
+
+  # Disengage (the exact production teardown) restores everything.
+  ip netns exec "$NS1" nft delete table inet ferrum_leakguard
+  check "leak-guard disengaged: DNS restored" udp_probe "$UL2" 53
+  check "leak-guard disengaged: IPv6 restored" \
+    ip netns exec "$NS1" ping -6 -c 2 -W 2 "$UL2_V6" >/dev/null
+
+  for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
+  PIDS=()
 fi
 
 # ---- summary --------------------------------------------------------------

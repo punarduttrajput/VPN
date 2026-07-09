@@ -4,7 +4,7 @@
 |---|---|
 | **Product** | Ferrum (Rust) |
 | **Phase** | Cross-cutting (Phase 3 control plane + Phase 5 clients) |
-| **Status** | In progress — M1–M4 implemented (M3 needs a Windows-host pass; M4's Android side needs a device build; M4's deployment needs a VM run); M5 (GUI + leak tests) next |
+| **Status** | Implemented (M1–M5). Outstanding verification passes: M2 root run (AC2), M3 Windows host (AC3), M4 Android build + VM redeploy (AC4), M5 root netns run (AC5) |
 | **Owner** | punarduttrajput |
 | **Last updated** | 2026-07-09 |
 | **Depends on** | Phase 3 coordinator (network map), Phase 5 kill-switch machinery (`ferrum_tunnel::firewall`, desktop WFP engine), `ferrum-helper` daemons |
@@ -173,7 +173,7 @@ family so the default is safe without configuration.
 | **M2** ✅ | Linux enforcement: `ferrum-tunnel::dns` (resolvectl + resolv.conf fallback), `ferrum_leakguard` nftables table (DNS lock + v6 block), helper-proto messages + daemon handlers, desktop + CLI wiring. (The shared `run_mesh_session` signature ended up untouched: enforcement rides the existing `Connected`/`Disconnected` events — CLI via `client.subscribe()`, desktop in its event loop — so the FFI surface is unchanged until a platform needs more.) | `leak-protection-m2` |
 | **M3** ✅ | Windows enforcement: netsh DNS on the wintun adapter, WFP leak-guard sublayer (own provider/sublayer, `FilterSpec` extensions), engaged from the helper service's event loop on `Connected` (no new pipe messages needed — the service already owns the session). Written/tested on Linux (pure rule/arg builders + WFP names verified against the `windows` crate source); needs a compile + live pass on a Windows host. | `leak-protection-m3` |
 | **M4** ✅ | Android DNS/v6 policy (`FerrumClient::advertised_dns` captured at connect → FFI → `VpnService.Builder.addDnsServer`; local-override extra + settings fields; `::/0` route policy-driven, with an in-tunnel sink fallback when no resolver exists — an empty VPN DNS list would make Android leak via the underlying network) + oracle-vm resolver (`dns-node` mesh device + dnsmasq sharing its netns; `--dns`/`DNS_ADVERTISE` wiring). Rust side tested; Kotlin + the compose stack need a device build / VM run. | `leak-protection-m4` |
-| **M5** | GUI status/config surface, netns leak tests in `verify-linux.sh`, docs. | `leak-protection-m5` |
+| **M5** ✅ | GUI surface: "DNS protected / IPv6 blocked" chips (green when protecting, amber warning when a session runs unprotected — never silent) driven by a `leak-protection` event on both privilege paths, + DNS-override / IPv6-policy fields in the Advanced form (verified with the headless-Chromium screenshot harness). `verify-linux.sh TEST_LEAKGUARD=1`: engages the production ruleset (via the `leakguard_script` example) inside a netns and asserts the DNS lock, control traffic, v6 block, approved-resolver path, and disengage-restore (needs a root host to run, like the rest of the script). | `leak-protection-m5` |
 
 ## 7. Acceptance Criteria
 

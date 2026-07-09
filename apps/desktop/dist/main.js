@@ -121,6 +121,8 @@ const transportModeEl = $("transport_mode");
 const serverNameField = $("server_name_field");
 const masqueProxyField = $("masque_proxy_field");
 const privilegeNoteEl = $("privilege-note");
+const dnsChipEl = $("dns-chip");
+const v6ChipEl = $("v6-chip");
 
 // Show the TLS server-name field for QUIC/MASQUE and the proxy field for MASQUE.
 function syncTransportFields() {
@@ -133,6 +135,23 @@ transportModeEl.addEventListener("change", syncTransportFields);
 function setKillSwitchState(blocked) {
   killSwitchStateEl.textContent = blocked ? "blocking" : (killSwitchEl.checked ? "armed" : "off");
   killSwitchStateEl.className = "badge" + (blocked ? " err" : "");
+}
+
+// Leak-protection chips (PRD leak-protection.md M5). `null` resets to the
+// neutral pre-connect state; an unprotected DNS reads as a warning, never
+// silently.
+function setLeakChips(dnsProtected, ipv6Blocked) {
+  if (dnsProtected === null) {
+    dnsChipEl.textContent = "DNS: —";
+    dnsChipEl.className = "chip off";
+    v6ChipEl.textContent = "IPv6: —";
+    v6ChipEl.className = "chip off";
+    return;
+  }
+  dnsChipEl.textContent = dnsProtected ? "DNS: protected" : "DNS: unprotected";
+  dnsChipEl.className = "chip " + (dnsProtected ? "ok" : "warn");
+  v6ChipEl.textContent = ipv6Blocked ? "IPv6: blocked" : "IPv6: open";
+  v6ChipEl.className = "chip " + (ipv6Blocked ? "ok" : "warn");
 }
 
 const STATES = ["disconnected", "connecting", "connected", "reconnecting", "failed"];
@@ -193,6 +212,8 @@ connectBtn.addEventListener("click", async () => {
         masque_proxy: $("masque_proxy").value.trim() || null,
         stun_server: $("stun_server").value.trim() || null,
         relay: $("relay").value.trim() || null,
+        dns_servers: $("dns_servers").value.trim() || null,
+        ipv6_policy: $("ipv6_policy").value || null,
       },
     });
   } catch (e) {
@@ -217,6 +238,15 @@ listen("client-event", (event) => {
   if (e.kind === "state") {
     setState(e.state);
     log(`state → ${e.state}`);
+    // The chips describe a session; a fully ended one has nothing to show.
+    if (String(e.state).toLowerCase() === "disconnected") setLeakChips(null);
+  } else if (e.kind === "leak-protection") {
+    setLeakChips(e.dns_protected, e.ipv6_blocked);
+    log(
+      `leak protection: DNS ${e.dns_protected ? "protected" : "UNPROTECTED"}, ` +
+      `IPv6 ${e.ipv6_blocked ? "blocked" : "open"}`,
+      !e.dns_protected,
+    );
   } else if (e.kind === "peers") {
     log(`peers updated: ${e.peers}`);
     refreshPeers();
