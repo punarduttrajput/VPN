@@ -183,14 +183,14 @@ pub async fn resolve_dns(cfg: &ConnectConfig) -> Vec<IpAddr> {
     let Ok(public_key) = ferrum_core::keys::public_base64_from_private(&cfg.private_key) else {
         return Vec::new(); // bring_up will surface the key error itself
     };
-    let mut control = match ferrum_client_core::ControlClient::connect(cfg.coordinator.clone()).await
-    {
-        Ok(c) => c,
-        Err(e) => {
-            log::warn!("fetching advertised DNS: connecting to coordinator failed: {e}");
-            return Vec::new();
-        }
-    };
+    let mut control =
+        match ferrum_client_core::ControlClient::connect(cfg.coordinator.clone()).await {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("fetching advertised DNS: connecting to coordinator failed: {e}");
+                return Vec::new();
+            }
+        };
     if let Some(token) = cfg.token.clone() {
         control = control.with_token(token);
     }

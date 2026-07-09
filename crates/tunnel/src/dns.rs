@@ -1,7 +1,9 @@
-//! Linux system-DNS enforcement (PRD `leak-protection.md`, FR3): point the OS
+//! System-DNS enforcement (PRD `leak-protection.md`, FR3/FR5): point the OS
 //! resolver at the tunnel's DNS servers while connected, restore on disconnect.
+//! [`set_dns`]/[`restore_dns`] share a signature across platforms so callers
+//! don't need per-OS shims.
 //!
-//! Two mechanisms, tried in order:
+//! **Linux** — two mechanisms, tried in order:
 //!
 //! 1. **systemd-resolved** (`resolvectl`): set the servers on the tunnel
 //!    *link* plus the `~.` routing domain, which makes the tunnel resolver win
@@ -14,17 +16,26 @@
 //!    exists on engage, it is kept — it's the pre-Ferrum original from a
 //!    crashed session, and overwriting it would lose the user's real config.
 //!
-//! Shared by the CLI, the desktop's direct-fallback path, and the
-//! privileged-helper daemon (mirrors [`crate::firewall`] / [`crate::leakguard`]).
+//! **Windows** — static resolvers on the wintun adapter via
+//! `netsh interface ipv4|ipv6 set/add dnsservers` (the same out-of-band
+//! `netsh` pattern [`crate::device`] uses for the adapter's IPv6 address);
+//! restore resets both families to DHCP. Like resolved's per-link settings,
+//! the adapter's DNS dies with the adapter, so even a crash can't strand it.
+//!
+//! Shared by the CLI, the desktop's direct-fallback path, and the privileged
+//! helpers on both OSes (mirrors [`crate::firewall`] / [`crate::leakguard`]).
 
 use std::io;
 use std::net::IpAddr;
+#[cfg(target_os = "linux")]
 use std::path::Path;
 use std::process::Command;
 
-/// The resolv.conf path this module manages.
+/// The resolv.conf path this module manages (Linux fallback path).
+#[cfg(target_os = "linux")]
 pub const RESOLV_CONF: &str = "/etc/resolv.conf";
 /// Where the pre-Ferrum resolv.conf is parked while ours is active.
+#[cfg(target_os = "linux")]
 pub const RESOLV_CONF_BACKUP: &str = "/etc/resolv.conf.ferrum-backup";
 
 /// `resolvectl dns <iface> <server>…` — set the link's DNS servers.
@@ -56,6 +67,7 @@ pub fn resolv_conf_contents(servers: &[IpAddr]) -> String {
 }
 
 /// Run `resolvectl` with `args`; `Ok` only on a zero exit.
+#[cfg(target_os = "linux")]
 fn run_resolvectl<S: AsRef<std::ffi::OsStr>>(args: &[S]) -> io::Result<()> {
     let out = Command::new("resolvectl").args(args).output()?;
     if out.status.success() {
@@ -71,6 +83,7 @@ fn run_resolvectl<S: AsRef<std::ffi::OsStr>>(args: &[S]) -> io::Result<()> {
 
 /// Swap `conf` for our generated file, parking the original at `backup`.
 /// Path-parameterized so the dance is testable without touching `/etc`.
+#[cfg(target_os = "linux")]
 fn swap_resolv_conf(conf: &Path, backup: &Path, contents: &str) -> io::Result<()> {
     // A pre-existing backup is the original from a crashed session — keep it,
     // so restore always lands the user's real config.
@@ -81,6 +94,7 @@ fn swap_resolv_conf(conf: &Path, backup: &Path, contents: &str) -> io::Result<()
 }
 
 /// Undo [`swap_resolv_conf`]: move the backup over our file, if one exists.
+#[cfg(target_os = "linux")]
 fn restore_resolv_conf(conf: &Path, backup: &Path) -> io::Result<()> {
     if backup.exists() {
         std::fs::rename(backup, conf)?;
@@ -90,6 +104,7 @@ fn restore_resolv_conf(conf: &Path, backup: &Path) -> io::Result<()> {
 
 /// Point system DNS at `servers` for the life of the connection: per-link via
 /// systemd-resolved when available, else the `/etc/resolv.conf` swap.
+#[cfg(target_os = "linux")]
 pub fn set_dns(iface: &str, servers: &[IpAddr]) -> io::Result<()> {
     if servers.is_empty() {
         return Err(io::Error::other("no DNS servers to set"));
@@ -110,10 +125,122 @@ pub fn set_dns(iface: &str, servers: &[IpAddr]) -> io::Result<()> {
 /// Restore pre-connection DNS. Best-effort on both mechanisms (each is a no-op
 /// where it wasn't the one used), so it's safe to call unconditionally on
 /// disconnect — including cleaning up after a crashed previous session.
+#[cfg(target_os = "linux")]
 pub fn restore_dns(iface: &str) -> io::Result<()> {
     // The revert fails harmlessly when resolvectl/the link isn't there.
     let _ = run_resolvectl(&resolvectl_revert_args(iface));
     restore_resolv_conf(Path::new(RESOLV_CONF), Path::new(RESOLV_CONF_BACKUP))
+}
+
+/// The `netsh interface …` address family token for `ip`.
+fn netsh_family(ip: IpAddr) -> &'static str {
+    if ip.is_ipv4() {
+        "ipv4"
+    } else {
+        "ipv6"
+    }
+}
+
+/// `netsh interface ipv4|ipv6 set dnsservers name=<iface> source=static
+/// address=<server> register=none validate=no` — replace the adapter's
+/// resolvers for `server`'s address family with this one. `register=none`
+/// keeps the tunnel out of dynamic DNS registration; `validate=no` skips the
+/// reachability probe (the resolver is only reachable through the tunnel,
+/// which may still be settling).
+pub fn netsh_set_dns_args(iface: &str, server: IpAddr) -> Vec<String> {
+    vec![
+        "interface".into(),
+        netsh_family(server).into(),
+        "set".into(),
+        "dnsservers".into(),
+        format!("name={iface}"),
+        "source=static".into(),
+        format!("address={server}"),
+        "register=none".into(),
+        "validate=no".into(),
+    ]
+}
+
+/// `netsh interface ipv4|ipv6 add dnsservers name=<iface> address=<server>
+/// index=<index> validate=no` — append a secondary resolver (1-based index).
+pub fn netsh_add_dns_args(iface: &str, server: IpAddr, index: u32) -> Vec<String> {
+    vec![
+        "interface".into(),
+        netsh_family(server).into(),
+        "add".into(),
+        "dnsservers".into(),
+        format!("name={iface}"),
+        format!("address={server}"),
+        format!("index={index}"),
+        "validate=no".into(),
+    ]
+}
+
+/// `netsh interface <family> set dnsservers name=<iface> source=dhcp` —
+/// return the adapter's resolvers for `family` (`"ipv4"`/`"ipv6"`) to DHCP.
+pub fn netsh_reset_dns_args(iface: &str, family: &str) -> Vec<String> {
+    vec![
+        "interface".into(),
+        family.into(),
+        "set".into(),
+        "dnsservers".into(),
+        format!("name={iface}"),
+        "source=dhcp".into(),
+    ]
+}
+
+/// Run `netsh` with `args`; `Ok` only on a zero exit (mirrors the pattern
+/// `crate::device` uses for the out-of-band IPv6 address).
+#[cfg(target_os = "windows")]
+fn run_netsh(args: &[String]) -> io::Result<()> {
+    let out = Command::new("netsh").args(args).output()?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "netsh {args:?} exited with {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout).trim()
+        )))
+    }
+}
+
+/// Point the wintun adapter's DNS at `servers`: the first server of each
+/// address family replaces (`set … source=static`), the rest append
+/// (`add … index=n`). Windows resolution then prefers the tunnel adapter's
+/// resolvers; the WFP leak guard blocks DNS from escaping any other way.
+#[cfg(target_os = "windows")]
+pub fn set_dns(iface: &str, servers: &[IpAddr]) -> io::Result<()> {
+    if servers.is_empty() {
+        return Err(io::Error::other("no DNS servers to set"));
+    }
+    let (mut v4_count, mut v6_count) = (0u32, 0u32);
+    for server in servers {
+        let count = if server.is_ipv4() {
+            &mut v4_count
+        } else {
+            &mut v6_count
+        };
+        *count += 1;
+        let args = if *count == 1 {
+            netsh_set_dns_args(iface, *server)
+        } else {
+            netsh_add_dns_args(iface, *server, *count)
+        };
+        run_netsh(&args)?;
+    }
+    Ok(())
+}
+
+/// Reset the adapter's resolvers (both families) to DHCP. Best-effort: the
+/// wintun adapter is usually destroyed with the session — taking its DNS
+/// settings with it — so a missing adapter here is the normal case.
+#[cfg(target_os = "windows")]
+pub fn restore_dns(iface: &str) -> io::Result<()> {
+    for family in ["ipv4", "ipv6"] {
+        let _ = run_netsh(&netsh_reset_dns_args(iface, family));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -148,8 +275,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn netsh_args_set_add_and_reset_per_family() {
+        let v4: IpAddr = "10.99.0.53".parse().unwrap();
+        let v6: IpAddr = "fd00::53".parse().unwrap();
+        assert_eq!(
+            netsh_set_dns_args("ferrum0", v4),
+            [
+                "interface",
+                "ipv4",
+                "set",
+                "dnsservers",
+                "name=ferrum0",
+                "source=static",
+                "address=10.99.0.53",
+                "register=none",
+                "validate=no",
+            ]
+        );
+        // The family token follows the server's address family.
+        assert_eq!(netsh_set_dns_args("ferrum0", v6)[1], "ipv6");
+        assert_eq!(
+            netsh_add_dns_args("ferrum0", v6, 2),
+            [
+                "interface",
+                "ipv6",
+                "add",
+                "dnsservers",
+                "name=ferrum0",
+                "address=fd00::53",
+                "index=2",
+                "validate=no",
+            ]
+        );
+        assert_eq!(
+            netsh_reset_dns_args("ferrum0", "ipv4"),
+            [
+                "interface",
+                "ipv4",
+                "set",
+                "dnsservers",
+                "name=ferrum0",
+                "source=dhcp",
+            ]
+        );
+    }
+
     /// The full swap/restore dance in a temp dir — including the crash case
     /// (engage twice, restore once) landing the *original* contents back.
+    #[cfg(target_os = "linux")]
     #[test]
     fn swap_and_restore_round_trip_preserves_the_original() {
         let dir = std::env::temp_dir().join(format!("ferrum-dns-test-{}", std::process::id()));

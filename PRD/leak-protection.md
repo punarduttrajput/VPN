@@ -4,7 +4,7 @@
 |---|---|
 | **Product** | Ferrum (Rust) |
 | **Phase** | Cross-cutting (Phase 3 control plane + Phase 5 clients) |
-| **Status** | In progress — M1 + M2 (Linux enforcement) implemented; M3 (Windows) next |
+| **Status** | In progress — M1–M3 implemented (M3 Windows-side needs an elevated-host verification pass); M4 (Android + deployment) next |
 | **Owner** | punarduttrajput |
 | **Last updated** | 2026-07-09 |
 | **Depends on** | Phase 3 coordinator (network map), Phase 5 kill-switch machinery (`ferrum_tunnel::firewall`, desktop WFP engine), `ferrum-helper` daemons |
@@ -171,7 +171,7 @@ family so the default is safe without configuration.
 |---|---|---|
 | **M1** ✅ | Protocol + config plumbing: proto `dns_servers`, coordinator `--dns`/`with_dns_servers`, `ControlClient::advertised_dns`, `[dns]` + `[leak_protection]` config blocks, resolution helper + logging in `up-mesh`/`run_mesh_session`. No enforcement. | `leak-protection-m1` |
 | **M2** ✅ | Linux enforcement: `ferrum-tunnel::dns` (resolvectl + resolv.conf fallback), `ferrum_leakguard` nftables table (DNS lock + v6 block), helper-proto messages + daemon handlers, desktop + CLI wiring. (The shared `run_mesh_session` signature ended up untouched: enforcement rides the existing `Connected`/`Disconnected` events — CLI via `client.subscribe()`, desktop in its event loop — so the FFI surface is unchanged until a platform needs more.) | `leak-protection-m2` |
-| **M3** | Windows enforcement: netsh DNS on the wintun adapter, WFP leak-guard sublayer, helper-service messages. | `leak-protection-m3` |
+| **M3** ✅ | Windows enforcement: netsh DNS on the wintun adapter, WFP leak-guard sublayer (own provider/sublayer, `FilterSpec` extensions), engaged from the helper service's event loop on `Connected` (no new pipe messages needed — the service already owns the session). Written/tested on Linux (pure rule/arg builders + WFP names verified against the `windows` crate source); needs a compile + live pass on a Windows host. | `leak-protection-m3` |
 | **M4** | Android DNS/v6 policy + oracle-vm resolver + `--dns` deployment wiring. | `leak-protection-m4` |
 | **M5** | GUI status/config surface, netns leak tests in `verify-linux.sh`, docs. | `leak-protection-m5` |
 

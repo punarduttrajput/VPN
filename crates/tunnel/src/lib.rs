@@ -8,7 +8,7 @@ pub mod mesh;
 pub mod path;
 pub mod session;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub mod dns;
 #[cfg(unix)]
 pub mod fdpass;
