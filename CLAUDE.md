@@ -45,10 +45,11 @@ its own standalone workspace (needs a `bpfel-unknown-none` target + nightly
 + `bpf-linker`, excluded from this one the same way) loaded at runtime by
 `ferrum relay --xdp-iface/--xdp-program` (see
 [PRD/phase-6-ebpf-xdp-relay.md](PRD/phase-6-ebpf-xdp-relay.md) and
-[relay-ebpf/README.md](relay-ebpf/README.md) — the kernel program builds,
-passes the kernel eBPF verifier, and attaches via the production loader as
-of 2026-07-09; live-traffic verification + the NFR1 benchmark are still
-open, needing netns+veth or two hosts).
+[relay-ebpf/README.md](relay-ebpf/README.md) — **live-traffic verified
+end-to-end as of 2026-07-10** on a netns+veth bed (in-kernel forwarding,
+valid rewritten checksums, exact counter accounting; harness:
+`crates/transport/examples/relay_traffic.rs`); only the NFR1 ≥10 Gbps
+real-hardware benchmark remains open).
 
 ## Build / test / lint
 
@@ -115,7 +116,7 @@ Linux / online machine** — several "deferred / blocked" items may now be doabl
 | **Real-hardware NFR1 throughput** — only informational on shared CI (~0.52 of a 1 Gbps shaped link vs 0.70 target). | Measure on real/representative hardware with `STRICT_THROUGHPUT=1`. |
 | **Windows UDP gotcha** — sending to a dead port triggers ICMP-unreachable → `WSAECONNRESET` on the next `recv_from`, killing the loop (a test had to use a drained "sink" socket, not a blackhole). | Linux doesn't do this; the workaround is harmless but unnecessary there. |
 | Live **third-party MASQUE proxy** interop — no external proxy available. | Test against a real RFC 9298 proxy if one is reachable. |
-| **eBPF/XDP (`relay-ebpf/`)** — the offline-Windows host had no LLVM/clang, no `bpf-linker`, no `bpfel-unknown-none` target, and no Linux kernel. | ✅ **Closed on the Linux box (2026-07-09):** rustup nightly (user-level, `--default-toolchain none` so the distro's stable `/usr/bin/cargo` stays the workspace default) + the **prebuilt `bpf-linker` musl binary** from the aya-rs GitHub releases (no LLVM matching needed) → the program builds, passes the kernel verifier, and attaches via `sudo ferrum relay --xdp-iface lo --xdp-program …` (build the CLI with `--features xdp`). Note: `bpftool prog load` can't check it — libbpf v1.0+ rejects aya's legacy `maps` ELF section before verification; use the production loader. Remaining: live-traffic verification + benchmark (needs netns+veth or two hosts — XDP doesn't fire on loopback). |
+| **eBPF/XDP (`relay-ebpf/`)** — the offline-Windows host had no LLVM/clang, no `bpf-linker`, no `bpfel-unknown-none` target, and no Linux kernel. | ✅ **Closed on the Linux box (2026-07-09):** rustup nightly (user-level, `--default-toolchain none` so the distro's stable `/usr/bin/cargo` stays the workspace default) + the **prebuilt `bpf-linker` musl binary** from the aya-rs GitHub releases (no LLVM matching needed) → the program builds, passes the kernel verifier, and attaches via `sudo ferrum relay --xdp-iface lo --xdp-program …` (build the CLI with `--features xdp`). Note: `bpftool prog load` can't check it — libbpf v1.0+ rejects aya's legacy `maps` ELF section before verification; use the production loader. **2026-07-10: live traffic verified too** (netns+veth; three live-only bugs found/fixed — map-key padding, a stats-poll deadlock, the UDP src-port rewrite — see STATUS.md). Remaining: the ≥10 Gbps NFR1 figure on real hardware/native mode. |
 
 When you hit something marked "deferred because offline/Windows," **try it first**
 on the new environment before assuming it's still blocked.
@@ -217,18 +218,22 @@ on the new environment before assuming it's still blocked.
   injection — `FerrumCoordinatorDown` fired and routed to the pager receiver) **and a
   coordinator latency SLO** (a `ferrum_request_duration_seconds` histogram SLI — aggregate-only,
   NFR5 — feeds a 99%-of-RPCs-under-100ms burn-rate alert; promtool-tested). **FR4 is complete.**
-  **eBPF/XDP relay fast path (FR1): built, verifier-accepted, and attached** (2026-07-09; PRD:
+  **eBPF/XDP relay fast path (FR1): live-traffic verified end-to-end** (2026-07-10; PRD:
   [PRD/phase-6-ebpf-xdp-relay.md](PRD/phase-6-ebpf-xdp-relay.md)) — the userspace-side split
   (`ferrum-relay-xdp-common`, `crates/transport/src/relay_xdp.rs`, the `RelayServer::set_xdp_hook`
   wiring, the `ferrum relay --xdp-iface/--xdp-program` flags) is real and tested, and the
-  kernel-side `#[xdp]` program (`relay-ebpf/`, its own standalone workspace) now **compiles,
-  passes the kernel eBPF verifier, and attaches through the production loader** on a real Linux
-  host (`relay xdp fast path enabled` on `--xdp-iface lo`; two first-load bugs found and fixed —
-  an `EbpfLogger` drop closing a map fd before `BPF_PROG_LOAD`, and a verifier-rejected
-  `while`-carry-fold in the checksum update, now a fixed two-fold — see `relay-ebpf/README.md`
-  and STATUS.md's 2026-07-09 entry). Remaining for FR1: **live traffic through the fast path**
-  (XDP doesn't fire on loopback — needs two hosts or netns+veth), the checksum capture check,
-  and the NFR1 ≥10 Gbps benchmark. Anycast, autoscaling not started.
+  kernel-side `#[xdp]` program (`relay-ebpf/`, its own standalone workspace) **compiles, passes
+  the verifier, attaches through the production loader, and forwards live relay `Data` frames
+  in-kernel** on a netns+veth bed: 2000/2000 delivered with the userspace forward counter at 0,
+  valid IPv4 checksums on every fast-pathed packet (RFC 1624 confirmed live), exact counter
+  reconciliation, and 99.97% vs 92.6% delivery against the userspace relay at ~1 Gbps offered
+  (veth/generic mode — functional comparison, not the line-rate claim). Five real bugs found and
+  fixed across the two verification passes (loader `EbpfLogger` drop, verifier-rejected checksum
+  carry-fold, `AddrKey` implicit map-key padding, a stats-poll tokio-mutex deadlock, and a
+  missing UDP src-port rewrite) — see `relay-ebpf/README.md` and STATUS.md's 2026-07-09/-10
+  entries; verification harness committed as `crates/transport/examples/relay_traffic.rs`.
+  Remaining for FR1: the NFR1 ≥10 Gbps figure (real hardware + native/driver XDP mode + a
+  multi-queue sender). Anycast, autoscaling not started.
 
 ## Recommended next work (highest-value, buildable in Rust)
 
@@ -269,10 +274,10 @@ on the new environment before assuming it's still blocked.
    FR4 complete.
 4. **Phase 6 / NFR1**: UDP GSO (send) + GRO (receive) ✅ *(done — `UdpTransport`)*; remaining:
    real-hardware throughput.
-5. **Phase 6 — eBPF/XDP relay fast path (FR1)** 🟡 *(userspace side done; kernel program
-   builds + passes the verifier + attaches, 2026-07-09)*: see
-   [PRD/phase-6-ebpf-xdp-relay.md](PRD/phase-6-ebpf-xdp-relay.md) and `relay-ebpf/README.md`.
-   Next step: **live traffic through the fast path** — XDP doesn't fire on loopback, so set up
-   netns+veth (or two hosts), exchange relay `Data` frames, confirm the XDP counters climb and
-   Wireshark reports valid IPv4 checksums on fast-pathed packets, then benchmark against the
-   userspace relay to validate the ≥10 Gbps NFR1 target.
+5. **Phase 6 — eBPF/XDP relay fast path (FR1)** ✅ *(live-traffic verified end-to-end,
+   2026-07-10 — in-kernel forwarding, valid checksums, counters exact; netns+veth recipe +
+   results in `relay-ebpf/README.md`, harness in `crates/transport/examples/relay_traffic.rs`)*:
+   see [PRD/phase-6-ebpf-xdp-relay.md](PRD/phase-6-ebpf-xdp-relay.md). The one remaining FR1
+   item is the **NFR1 ≥10 Gbps benchmark on real hardware** — native (driver) XDP mode on a
+   multi-queue NIC with a line-rate sender (the veth/generic-mode bed saturates around 1 Gbps
+   offered from a single socket; at that load: XDP 99.97% delivered vs userspace 92.6%).

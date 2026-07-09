@@ -58,19 +58,37 @@ pub struct AddrKey {
     /// UDP port as a plain integer value (just the port number — a `u16`
     /// has no byte-order ambiguity once it's off the wire).
     pub port: u16,
+    /// Explicit padding, always zero. Without it, `repr(C)` inserts two
+    /// *implicit* trailing padding bytes (size 8, align 4) whose contents
+    /// Rust leaves undefined — and a BPF hash map compares keys byte-wise
+    /// over the full `key_size`, so a lookup key built on the kernel stack
+    /// can never reliably match an entry inserted from userspace. This was
+    /// a real, observed bug (2026-07-09, first live-traffic run): every
+    /// `ADDR_TO_KEY` lookup missed and all traffic fell through to
+    /// userspace. Both sides must construct this as zero; [`AddrKey::new`]
+    /// is the only intended constructor.
+    pub _pad: [u8; 2],
 }
 
 impl AddrKey {
+    /// The one intended constructor — guarantees `_pad` is zero (see its
+    /// field doc: nonzero/undefined padding makes map lookups miss).
+    /// `const` and `no_std` so the eBPF program can use it too.
+    pub const fn new(ip: u32, port: u16) -> Self {
+        Self {
+            ip,
+            port,
+            _pad: [0; 2],
+        }
+    }
+
     /// Build an `AddrKey` from IPv4 octets (as from
     /// [`std::net::Ipv4Addr::octets`]) and a port (as from
     /// [`std::net::SocketAddrV4::port`]) — the conversion userspace needs
     /// when mirroring `RelayServer`'s `Clients` table.
     #[cfg(any(test, feature = "std"))]
     pub fn from_v4(octets: [u8; 4], port: u16) -> Self {
-        Self {
-            ip: u32::from_be_bytes(octets),
-            port,
-        }
+        Self::new(u32::from_be_bytes(octets), port)
     }
 }
 
@@ -145,6 +163,16 @@ mod tests {
         // the original octets with no further byte-swapping.
         assert_eq!(k.ip.to_be_bytes(), [192, 168, 1, 1]);
         assert_eq!(k.port, 51821);
+    }
+
+    #[test]
+    fn addr_key_has_no_implicit_padding() {
+        // 4 (ip) + 2 (port) + 2 (explicit _pad) — if this ever grows, the
+        // compiler inserted implicit padding again, and BPF map lookups
+        // will miss on undefined bytes (see the `_pad` field doc).
+        assert_eq!(core::mem::size_of::<AddrKey>(), 8);
+        assert_eq!(AddrKey::new(1, 2)._pad, [0; 2]);
+        assert_eq!(AddrKey::from_v4([10, 0, 0, 1], 7)._pad, [0; 2]);
     }
 
     #[test]
