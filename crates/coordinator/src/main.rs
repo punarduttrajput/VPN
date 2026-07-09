@@ -167,6 +167,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => svc,
     };
 
+    // Advertise DNS resolvers (PRD leak-protection.md): every device points its
+    // system DNS at them through the tunnel while connected, unless locally
+    // overridden. Bare IPs (comma-separated), validated so a typo fails fast.
+    let svc = match arg_value("--dns") {
+        Some(dns) => {
+            let servers: Vec<String> = dns.split(',').map(|s| s.trim().to_string()).collect();
+            for server in &servers {
+                server
+                    .parse::<std::net::IpAddr>()
+                    .map_err(|e| format!("--dns '{server}' is not an IP address: {e}"))?;
+            }
+            info!(?servers, "advertising DNS resolvers to devices");
+            svc.with_dns_servers(servers)
+        }
+        None => svc,
+    };
+
     // Metrics endpoint (PRD Phase 6 FR4): enable with --metrics-listen <ip:port>.
     // Runs on its own port; serves GET /metrics in the Prometheus text format.
     if let Some(addr) = arg_value("--metrics-listen") {

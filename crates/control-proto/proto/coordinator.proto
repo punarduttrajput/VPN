@@ -57,6 +57,11 @@ message NetworkMapResponse {
   // ("ip:port"), or empty if none. A node uses it as the relay underlay for
   // NAT traversal (PRD Phase 4) unless it has a local override configured.
   string relay = 2;
+  // DNS resolvers advertised by the coordinator (bare IPs, reachable through
+  // the tunnel), or empty if none. A node points its system DNS at these
+  // while connected (PRD leak-protection.md) unless it has a local `[dns]`
+  // override configured — the same local-else-advertised order as `relay`.
+  repeated string dns_servers = 3;
 }
 
 message PublishCandidatesRequest {

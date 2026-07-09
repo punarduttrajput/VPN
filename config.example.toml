@@ -10,3 +10,10 @@ interface_address = "10.8.0.1/24"
 public_key = "KHyJB+k340kMHCKZfdFOY0ZWRYn7Sab16haK1Yk+WW8="
 endpoint = "203.0.113.5:51820"
 allowed_ips = ["10.8.0.2/32"]
+
+# Leak protection (PRD/leak-protection.md). Optional; defaults shown.
+# [dns]
+# servers = ["10.99.0.53"]   # local override; empty = use coordinator-advertised
+#
+# [leak_protection]
+# ipv6 = "auto"              # auto | block | tunnel | off

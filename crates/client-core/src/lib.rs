@@ -192,6 +192,19 @@ impl ControlClient {
         Ok(Some(resp.relay).filter(|r| !r.is_empty()))
     }
 
+    /// The DNS resolvers (bare IPs, reachable through the tunnel) the
+    /// coordinator advertises to this network, or `None` if it advertises none
+    /// (PRD leak-protection.md). A device points its system DNS at them while
+    /// connected unless it has a local `[dns]` override — see
+    /// [`resolve_dns_servers`].
+    pub async fn advertised_dns(&mut self, public_key: &str) -> Result<Option<Vec<String>>, Error> {
+        let req = self.request(NetworkMapRequest {
+            public_key: public_key.to_string(),
+        });
+        let resp = self.inner.get_network_map(req).await?.into_inner();
+        Ok(Some(resp.dns_servers).filter(|d| !d.is_empty()))
+    }
+
     /// Publish this device's ICE candidates (host + STUN server-reflexive
     /// `ip:port` strings) so permitted peers can learn how to reach it for NAT
     /// traversal (PRD Phase 4). The device must already be registered;
@@ -252,6 +265,22 @@ impl ControlClient {
     }
 }
 
+/// Resolve the DNS servers to use while connected (PRD leak-protection.md):
+/// a non-empty local `[dns] servers` override wins, else the
+/// coordinator-advertised list, else none — the same local-else-advertised
+/// order as relay selection. An empty result means DNS is unprotected; callers
+/// should surface that visibly.
+pub fn resolve_dns_servers(
+    local_override: &[String],
+    advertised: Option<Vec<String>>,
+) -> Vec<String> {
+    if local_override.is_empty() {
+        advertised.unwrap_or_default()
+    } else {
+        local_override.to_vec()
+    }
+}
+
 /// A live stream of network-map updates from the coordinator.
 pub struct NetworkMapStream {
     inner: tonic::Streaming<ferrum_control_proto::coordinator::NetworkMapResponse>,
@@ -286,8 +315,16 @@ mod tests {
 
     /// Start an in-process coordinator advertising `relay` (empty for none).
     async fn start_coordinator_with_relay(relay: &str) -> String {
+        start_coordinator_configured(relay, Vec::new()).await
+    }
+
+    /// Start an in-process coordinator advertising `relay` (empty for none)
+    /// and `dns_servers` (empty for none).
+    async fn start_coordinator_configured(relay: &str, dns_servers: Vec<String>) -> String {
         let registry = Arc::new(Mutex::new(Registry::new(Ipv4Addr::new(10, 8, 0, 0), 24)));
-        let svc = CoordinatorService::new(registry).with_relay(relay);
+        let svc = CoordinatorService::new(registry)
+            .with_relay(relay)
+            .with_dns_servers(dns_servers);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -321,6 +358,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(a.advertised_relay("AAA").await.unwrap(), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn advertised_dns_is_surfaced_to_clients() {
+        let url =
+            start_coordinator_configured("", vec!["10.99.0.53".into(), "fd00::53".into()]).await;
+        let mut a = ControlClient::connect(url).await.unwrap();
+        a.register("AAA", "laptop", "1.1.1.1:51820", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            a.advertised_dns("AAA").await.unwrap(),
+            Some(vec!["10.99.0.53".to_string(), "fd00::53".to_string()])
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn advertised_dns_is_none_when_coordinator_has_no_dns() {
+        let url = start_coordinator().await; // no DNS configured
+        let mut a = ControlClient::connect(url).await.unwrap();
+        a.register("AAA", "laptop", "1.1.1.1:51820", &[])
+            .await
+            .unwrap();
+        assert_eq!(a.advertised_dns("AAA").await.unwrap(), None);
+    }
+
+    #[test]
+    fn dns_resolution_prefers_local_override_then_advertised() {
+        let local = vec!["10.8.0.2".to_string()];
+        let advertised = Some(vec!["10.99.0.53".to_string()]);
+        assert_eq!(resolve_dns_servers(&local, advertised.clone()), local);
+        assert_eq!(
+            resolve_dns_servers(&[], advertised),
+            vec!["10.99.0.53".to_string()]
+        );
+        assert_eq!(resolve_dns_servers(&[], None), Vec::<String>::new());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

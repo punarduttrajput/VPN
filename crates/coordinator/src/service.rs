@@ -18,11 +18,13 @@ use crate::metrics::Metrics;
 use crate::registry::{Registry, RegistryError};
 
 /// Compute the current network-map response for a device, advertising `relay`
-/// (the coordinator's configured relay address, or empty for none).
+/// (the coordinator's configured relay address, or empty for none) and
+/// `dns_servers` (the coordinator's configured resolvers, or empty for none).
 fn current_map(
     registry: &Arc<Mutex<Registry>>,
     public_key: &str,
     relay: &str,
+    dns_servers: &[String],
 ) -> NetworkMapResponse {
     let reg = registry.lock().expect("registry mutex poisoned");
     let peers = reg
@@ -38,6 +40,7 @@ fn current_map(
     NetworkMapResponse {
         peers,
         relay: relay.to_string(),
+        dns_servers: dns_servers.to_vec(),
     }
 }
 
@@ -62,6 +65,10 @@ pub struct CoordinatorService {
     /// A network-wide relay address (`ip:port`) advertised to every device in the
     /// network map (PRD Phase 4 NAT traversal), or empty for none.
     relay: String,
+    /// DNS resolvers (bare IPs, reachable through the tunnel) advertised to
+    /// every device in the network map (PRD leak-protection.md), or empty for
+    /// none.
+    dns_servers: Vec<String>,
     /// Aggregate, privacy-preserving control-plane metrics (PRD Phase 6 FR4).
     metrics: Arc<Metrics>,
     /// When set (the `oidc` feature + a configured verifier), every RPC requires
@@ -78,6 +85,7 @@ impl CoordinatorService {
             registry,
             changes,
             relay: String::new(),
+            dns_servers: Vec::new(),
             metrics: Metrics::new(),
             #[cfg(feature = "oidc")]
             verifier: None,
@@ -107,6 +115,15 @@ impl CoordinatorService {
         self
     }
 
+    /// Advertise DNS resolvers (bare IPs, reachable through the tunnel) to
+    /// every device in the network map (PRD leak-protection.md). Devices point
+    /// their system DNS at them while connected unless locally overridden.
+    /// An empty list (the default) advertises none.
+    pub fn with_dns_servers(mut self, dns_servers: Vec<String>) -> Self {
+        self.dns_servers = dns_servers;
+        self
+    }
+
     /// Build a service that requires OIDC bearer tokens on every RPC.
     #[cfg(feature = "oidc")]
     pub fn with_auth(
@@ -118,6 +135,7 @@ impl CoordinatorService {
             registry,
             changes,
             relay: String::new(),
+            dns_servers: Vec::new(),
             metrics: Metrics::new(),
             verifier: Some(verifier),
         }
@@ -215,7 +233,12 @@ impl Coordinator for CoordinatorService {
         self.authenticate_metered(&request)?;
         self.metrics.inc_network_map_request();
         let req = request.into_inner();
-        let map = current_map(&self.registry, &req.public_key, &self.relay);
+        let map = current_map(
+            &self.registry,
+            &req.public_key,
+            &self.relay,
+            &self.dns_servers,
+        );
         tracing::debug!(peers = map.peers.len(), "served network map");
         Ok(Response::new(map))
     }
@@ -233,6 +256,7 @@ impl Coordinator for CoordinatorService {
         let public_key = request.into_inner().public_key;
         let registry = self.registry.clone();
         let relay = self.relay.clone();
+        let dns_servers = self.dns_servers.clone();
         let mut changes = self.changes.subscribe();
         // Track this stream in the active-streams gauge; the guard rides into the
         // serving task and decrements when it ends (disconnect / close / error).
@@ -244,7 +268,12 @@ impl Coordinator for CoordinatorService {
             let _guard = guard;
             // Push the current map immediately, then on every change.
             if tx
-                .send(Ok(current_map(&registry, &public_key, &relay)))
+                .send(Ok(current_map(
+                    &registry,
+                    &public_key,
+                    &relay,
+                    &dns_servers,
+                )))
                 .await
                 .is_err()
             {
@@ -255,7 +284,12 @@ impl Coordinator for CoordinatorService {
             // client disconnects.
             while let Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) = changes.recv().await {
                 if tx
-                    .send(Ok(current_map(&registry, &public_key, &relay)))
+                    .send(Ok(current_map(
+                        &registry,
+                        &public_key,
+                        &relay,
+                        &dns_servers,
+                    )))
                     .await
                     .is_err()
                 {
@@ -385,6 +419,53 @@ mod tests {
         assert_eq!(map.peers[0].public_key, "BBB");
         assert_eq!(map.peers[0].endpoint, "2.2.2.2:51820");
         assert_eq!(map.peers[0].allowed_ips, vec!["10.8.0.3/32".to_string()]);
+    }
+
+    /// Configured DNS resolvers are advertised in every network map (and an
+    /// unconfigured service advertises none) — PRD leak-protection.md M1.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn advertised_dns_servers_land_in_map() {
+        use ferrum_control_proto::coordinator::coordinator_server::Coordinator;
+
+        let registry = Arc::new(Mutex::new(Registry::new(Ipv4Addr::new(10, 8, 0, 0), 24)));
+        let svc = CoordinatorService::new(registry)
+            .with_dns_servers(vec!["10.99.0.53".into(), "fd00::53".into()]);
+        svc.register_device(Request::new(RegisterDeviceRequest {
+            public_key: "AAA".into(),
+            name: "a".into(),
+            endpoint: "1.1.1.1:51820".into(),
+            tags: vec![],
+        }))
+        .await
+        .unwrap();
+
+        let map = svc
+            .get_network_map(Request::new(NetworkMapRequest {
+                public_key: "AAA".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(map.dns_servers, vec!["10.99.0.53", "fd00::53"]);
+
+        let registry = Arc::new(Mutex::new(Registry::new(Ipv4Addr::new(10, 8, 0, 0), 24)));
+        let bare = CoordinatorService::new(registry);
+        bare.register_device(Request::new(RegisterDeviceRequest {
+            public_key: "AAA".into(),
+            name: "a".into(),
+            endpoint: "1.1.1.1:51820".into(),
+            tags: vec![],
+        }))
+        .await
+        .unwrap();
+        let map = bare
+            .get_network_map(Request::new(NetworkMapRequest {
+                public_key: "AAA".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(map.dns_servers.is_empty());
     }
 
     /// Calling the RPC handlers directly bumps the matching metrics, and `render`

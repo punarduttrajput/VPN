@@ -18,7 +18,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{info, warn};
 
 use ferrum_core::config::Cidr;
 use ferrum_transport::{MeshTransport, RelayMeshTransport};
@@ -169,6 +169,22 @@ where
         {
             warn!("publishing NAT-traversal candidates failed: {e}");
         }
+    }
+
+    // Surface the coordinator-advertised DNS resolvers (PRD leak-protection.md
+    // M1). Enforcement (pointing system DNS at them + the leak-guard firewall)
+    // lands in M2/M3; until then this is observability so an operator can see
+    // what the network advertises — and that DNS is unprotected either way.
+    match control
+        .advertised_dns(&identity.public_key)
+        .await
+        .unwrap_or(None)
+    {
+        Some(dns) => info!(
+            ?dns,
+            "coordinator advertises DNS resolvers (not yet enforced — leak-protection M2)"
+        ),
+        None => info!("coordinator advertises no DNS resolvers; DNS is unprotected"),
     }
 
     // Resolve the relay underlay: a local override wins, else whatever the
