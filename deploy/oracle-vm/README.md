@@ -39,6 +39,7 @@ add Ingress rules for the instance's subnet:
 | 80, 443 | TCP | Caddy (admin panel HTTPS + ACME challenge) |
 | 443 | UDP | HTTP/3 (optional, Caddy falls back to TCP fine without it) |
 | 50051 | TCP | Coordinator gRPC — clients connect here directly |
+| 51820 | UDP | dns-node mesh data plane (DNS through the tunnel) |
 | 51821 | UDP | Relay — this is the one that matters for NAT traversal |
 
 **b. The OS firewall** — stock Oracle Ubuntu images ship with `iptables`
@@ -50,6 +51,7 @@ sudo iptables -I INPUT -p tcp --dport 80 -j ACCEPT
 sudo iptables -I INPUT -p tcp --dport 443 -j ACCEPT
 sudo iptables -I INPUT -p udp --dport 443 -j ACCEPT
 sudo iptables -I INPUT -p tcp --dport 50051 -j ACCEPT
+sudo iptables -I INPUT -p udp --dport 51820 -j ACCEPT
 sudo iptables -I INPUT -p udp --dport 51821 -j ACCEPT
 sudo netfilter-persistent save   # persist across reboots (apt install iptables-persistent if missing)
 ```
@@ -104,6 +106,35 @@ Save the printed token somewhere you can paste from — the admin panel asks
 for it once per browser session (`sessionStorage`, never sent anywhere but
 this coordinator). Mint a **device** token the same way for clients that need
 one (`--tags dev`, or whatever tag your ACL policy expects).
+
+## 5b. DNS through the tunnel (leak protection)
+
+This deployment also runs an **in-mesh resolver** (PRD
+[leak-protection.md](../../PRD/leak-protection.md) M4): a `dns-node` container
+joins the mesh as an ordinary device, and a `dnsmasq` container shares its
+network namespace — so DNS is answered at the node's coordinator-assigned
+tunnel address, reachable only *through* the tunnel. The coordinator
+advertises that address to every device (`--dns` / `DNS_ADVERTISE`), and the
+clients' leak protection points system DNS at it while connected.
+
+One-time setup — the dns-node authenticates like any device, so mint it a
+long-lived token:
+
+```sh
+python3 scripts/mint-token.py mint --sub dns-node --tags device \
+  --issuer https://ferrum.internal --audience ferrum-admin \
+  --ttl 31536000 > secrets/dns-node-token
+```
+
+Set `DNS_NODE_ENDPOINT` in `.env` (the VM public IP, port 51820), and leave
+`DNS_ADVERTISE=10.8.0.2` — that's the address a fresh registry assigns the
+first device. **If your coordinator DB already has devices**, bring the
+dns-node up once, read its actual address from
+`docker compose logs dns-node | grep "assigned tunnel address"`, put that in
+`DNS_ADVERTISE`, and `docker compose up -d` again.
+
+Verify from any connected client: `dig @10.8.0.2 example.com` resolves (and
+times out when the tunnel is down — DNS never leaves the mesh).
 
 ## 6. Bring it up
 

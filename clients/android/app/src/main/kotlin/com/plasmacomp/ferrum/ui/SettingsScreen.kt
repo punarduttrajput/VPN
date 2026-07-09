@@ -53,6 +53,26 @@ fun SettingsScreen(vm: VpnViewModel) {
             modifier = Modifier.fillMaxWidth(),
         )
 
+        OutlinedTextField(
+            value = ui.dnsServers,
+            onValueChange = vm::setDnsServers,
+            label = { Text("DNS override (optional)") },
+            placeholder = { Text("10.99.0.53, fd00::53") },
+            supportingText = { Text("Empty = use the resolvers the coordinator advertises") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+        )
+
+        OutlinedTextField(
+            value = ui.ipv6Policy,
+            onValueChange = vm::setIpv6Policy,
+            label = { Text("IPv6 policy (optional)") },
+            placeholder = { Text("auto | block | tunnel | off") },
+            supportingText = { Text("Anything but \"off\" keeps IPv6 inside the tunnel") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+        )
+
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,

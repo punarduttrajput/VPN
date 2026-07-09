@@ -16,11 +16,16 @@ COPY crates ./crates
 # Separate invocations: combining -p and --bin in one `cargo build` scopes
 # --bin across *all* selected packages, so ferrum-coordinator's own binary
 # would silently never get built (it has no bin literally named "ferrum").
+# real-tun: the dns-node service runs `ferrum up-mesh` with a real TUN device
+# (PRD leak-protection.md M4); the relay doesn't care either way.
 RUN cargo build --release -p ferrum-coordinator --features admin-api,sqlite
-RUN cargo build --release -p ferrum-cli --bin ferrum
+RUN cargo build --release -p ferrum-cli --bin ferrum --features ferrum-tunnel/real-tun
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+# dnsmasq: the in-mesh resolver (PRD leak-protection.md M4) — the `resolver`
+# service runs it from this same image, sharing the dns-node's network
+# namespace so it answers DNS at the node's tunnel address.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates dnsmasq \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/ferrum-coordinator /usr/local/bin/ferrum-coordinator

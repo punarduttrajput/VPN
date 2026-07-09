@@ -24,6 +24,11 @@ class FerrumVpnService : VpnService() {
         const val EXTRA_DEVICE_NAME = "device_name"
         const val EXTRA_STUN_SERVER = "stun_server"
         const val EXTRA_RELAY       = "relay"
+        /** Comma-separated DNS resolver IPs — a local override of the
+         *  coordinator-advertised list (PRD leak-protection.md). */
+        const val EXTRA_DNS         = "dns"
+        /** IPv6 policy: "auto" (default) | "block" | "tunnel" | "off". */
+        const val EXTRA_IPV6_POLICY = "ipv6_policy"
 
         private const val NOTIF_CHANNEL = "ferrum_vpn"
         private const val NOTIF_ID = 1
@@ -61,6 +66,8 @@ class FerrumVpnService : VpnService() {
         val deviceName  = intent.getStringExtra(EXTRA_DEVICE_NAME) ?: "ferrum-android"
         val stunServer  = intent.getStringExtra(EXTRA_STUN_SERVER)
         val relay       = intent.getStringExtra(EXTRA_RELAY)
+        val dnsOverride = intent.getStringExtra(EXTRA_DNS)
+        val ipv6Policy  = intent.getStringExtra(EXTRA_IPV6_POLICY)
 
         val keystore   = KeystoreHelper(this)
         val prefs      = getSharedPreferences("ferrum_prefs", MODE_PRIVATE)
@@ -98,8 +105,19 @@ class FerrumVpnService : VpnService() {
             }
 
             // Step 2: Build the OS VPN interface with the correct assigned address.
+            // Leak protection (PRD leak-protection.md M4): a local DNS override
+            // wins, else whatever the coordinator advertised during connect —
+            // the same local-else-advertised order as relay selection. IPv6 is
+            // routed into the tunnel unless the policy is "off" (on Android,
+            // routing ::/0 into a mesh that doesn't carry v6 *is* the block:
+            // v6 blackholes instead of leaking around the tunnel).
+            val dnsServers = dnsOverride
+                ?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() }
+                ?.takeIf { it.isNotEmpty() }
+                ?: c.advertisedDns()
+            val routeIpv6 = ipv6Policy?.trim()?.lowercase() != "off"
             val assignedCidr = c.address()
-            val fd = buildVpnInterface(assignedCidr) ?: run {
+            val fd = buildVpnInterface(assignedCidr, dnsServers, routeIpv6) ?: run {
                 _state.value = ConnectionState.FAILED
                 updateNotification("Failed to open TUN interface")
                 stopSelf()
@@ -170,7 +188,11 @@ class FerrumVpnService : VpnService() {
         super.onDestroy()
     }
 
-    private fun buildVpnInterface(assignedCidr: String?): ParcelFileDescriptor? {
+    private fun buildVpnInterface(
+        assignedCidr: String?,
+        dnsServers: List<String>,
+        routeIpv6: Boolean,
+    ): ParcelFileDescriptor? {
         val builder = Builder().setSession("Ferrum VPN")
         if (assignedCidr != null) {
             // Parse "10.8.0.2/32" into address + prefix length.
@@ -182,10 +204,25 @@ class FerrumVpnService : VpnService() {
             // Fallback: coordinator didn't return an address yet.
             builder.addAddress("10.100.0.2", 32)
         }
+        builder.addRoute("0.0.0.0", 0)
+        // "off" skips this route, letting v6 use the physical network; any
+        // other policy sends v6 into the tunnel (carried if the mesh has v6,
+        // blackholed — blocked, not leaked — if it doesn't).
+        if (routeIpv6) builder.addRoute("::", 0)
+        // With no resolver configured or advertised, an *empty* VPN DNS list
+        // would make Android resolve via the underlying network — a plaintext
+        // leak around the tunnel. Point at an in-tunnel sink instead: queries
+        // fail visibly rather than leak silently (the pre-M4 hardcoded value,
+        // now only a fallback).
+        val servers = dnsServers.ifEmpty { listOf("1.1.1.1") }
+        for (server in servers) {
+            try {
+                builder.addDnsServer(server)
+            } catch (e: IllegalArgumentException) {
+                // A malformed override entry — skip it rather than fail bring-up.
+            }
+        }
         return builder
-            .addRoute("0.0.0.0", 0)
-            .addRoute("::", 0)
-            .addDnsServer("1.1.1.1")
             .setBlocking(false)
             .establish()
     }

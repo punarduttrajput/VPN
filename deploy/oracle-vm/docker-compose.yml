@@ -2,6 +2,9 @@
 # works on any VPS with a public IP and open UDP). Brings up:
 #   coordinator -> gRPC control plane (50051/tcp) + admin panel (behind Caddy)
 #   relay       -> DERP-style NAT-traversal fallback (51821/udp)
+#   dns-node    -> a mesh device (51820/udp) whose tunnel address hosts…
+#   resolver    -> …dnsmasq in the dns-node's netns: DNS through the tunnel
+#                  (PRD leak-protection.md M4; advertised via --dns)
 #   caddy       -> automatic HTTPS in front of the admin panel only
 #
 # `ferrum-coordinator`'s own argv parser expects `--flag value` as two separate
@@ -39,6 +42,8 @@ services:
       - /secrets/jwks.json
       - --relay
       - ${RELAY_ADVERTISE}
+      - --dns
+      - ${DNS_ADVERTISE:-10.8.0.2}
     volumes:
       - coordinator-data:/data
       - ./secrets/jwks.json:/secrets/jwks.json:ro
@@ -62,6 +67,58 @@ services:
       - "51821:51821/udp"
     networks: [ferrum]
 
+  # Joins the mesh so the resolver below is reachable at a mesh address
+  # (PRD leak-protection.md M4). Its coordinator-assigned tunnel address is
+  # what --dns / DNS_ADVERTISE points at — 10.8.0.2 on a fresh registry when
+  # this starts first; confirm with:
+  #   docker compose logs dns-node | grep "assigned tunnel address"
+  # Needs a device token: mint-token.py mint --sub dns-node --tags device
+  #   --ttl 31536000 … > secrets/dns-node-token   (see README §"DNS through
+  # the tunnel").
+  dns-node:
+    image: ferrum:local # same image; `ferrum up-mesh` entrypoint
+    container_name: ferrum-dns-node
+    restart: unless-stopped
+    depends_on: [coordinator]
+    user: "0:0" # opens /dev/net/tun; the image's unprivileged default can't
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    entrypoint: ["/bin/sh", "/opt/ferrum/dns-node-entrypoint.sh"]
+    environment:
+      - COORDINATOR_URL=http://coordinator:50051
+      - DNS_NODE_ENDPOINT=${DNS_NODE_ENDPOINT}
+    ports:
+      - "51820:51820/udp" # mesh data plane — peers reach the node directly here
+    volumes:
+      - dns-node-data:/data # persists the node's keypair across restarts
+      - ./scripts/dns-node-entrypoint.sh:/opt/ferrum/dns-node-entrypoint.sh:ro
+      - ./secrets/dns-node-token:/secrets/dns-node-token:ro
+    networks: [ferrum]
+
+  # The actual resolver, sharing the dns-node's network namespace so it
+  # answers DNS at the node's tunnel address (which --dns advertises).
+  # dnsmasq is baked into the ferrum image (see Dockerfile).
+  resolver:
+    image: ferrum:local
+    container_name: ferrum-resolver
+    restart: unless-stopped
+    network_mode: "service:dns-node"
+    user: "0:0" # binds port 53, then dnsmasq drops privileges itself
+    entrypoint: ["/usr/sbin/dnsmasq"]
+    command:
+      - --keep-in-foreground
+      - --no-resolv # upstreams below, not the container's own resolv.conf
+      - --server=1.1.1.1
+      - --server=9.9.9.9
+      - --interface=ferrum0 # the dns-node's tunnel interface
+      - --bind-dynamic # ferrum0 appears only once the mesh is up
+      - --cache-size=1000
+      - --domain-needed # basic hygiene: no plain-name / RFC1918-PTR upstream
+      - --bogus-priv
+      - --log-facility=- # stdout, so `docker compose logs resolver` works
+    # No `networks:` here — network_mode above already pins it to dns-node's.
+
   caddy:
     image: caddy:2.9-alpine
     container_name: ferrum-caddy
@@ -84,5 +141,6 @@ networks:
 
 volumes:
   coordinator-data:
+  dns-node-data:
   caddy-data:
   caddy-config:

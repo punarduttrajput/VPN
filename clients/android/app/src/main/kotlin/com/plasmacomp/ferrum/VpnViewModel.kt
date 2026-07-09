@@ -19,6 +19,11 @@ data class VpnUiState(
     val deviceName: String = "",
     val stunServer: String = "",
     val relay: String = "",
+    /** Comma-separated DNS override (leak protection); empty = use whatever
+     *  the coordinator advertises. */
+    val dnsServers: String = "",
+    /** IPv6 policy: "auto" (default when blank) | "block" | "tunnel" | "off". */
+    val ipv6Policy: String = "",
     val killSwitch: Boolean = false,
     val vpnPermissionNeeded: Boolean = false,
 )
@@ -33,6 +38,8 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
             deviceName  = prefs.getString("device_name", android.os.Build.MODEL) ?: "",
             stunServer  = prefs.getString("stun_server", "") ?: "",
             relay       = prefs.getString("relay", "") ?: "",
+            dnsServers  = prefs.getString("dns_servers", "") ?: "",
+            ipv6Policy  = prefs.getString("ipv6_policy", "") ?: "",
             killSwitch  = prefs.getBoolean("kill_switch", false),
         )
     )
@@ -60,6 +67,8 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
     fun setDeviceName(v: String)   { _ui.update { it.copy(deviceName = v) };  prefs.edit().putString("device_name", v).apply() }
     fun setStunServer(v: String)   { _ui.update { it.copy(stunServer = v) };  prefs.edit().putString("stun_server", v).apply() }
     fun setRelay(v: String)        { _ui.update { it.copy(relay = v) };       prefs.edit().putString("relay", v).apply() }
+    fun setDnsServers(v: String)   { _ui.update { it.copy(dnsServers = v) };  prefs.edit().putString("dns_servers", v).apply() }
+    fun setIpv6Policy(v: String)   { _ui.update { it.copy(ipv6Policy = v) };  prefs.edit().putString("ipv6_policy", v).apply() }
     fun setKillSwitch(v: Boolean)  { _ui.update { it.copy(killSwitch = v) };  prefs.edit().putBoolean("kill_switch", v).apply() }
 
     /** Returns an intent to request VPN permission if needed, null if already granted. */
@@ -73,6 +82,8 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
             putExtra(FerrumVpnService.EXTRA_DEVICE_NAME, s.deviceName)
             if (s.stunServer.isNotBlank()) putExtra(FerrumVpnService.EXTRA_STUN_SERVER, s.stunServer)
             if (s.relay.isNotBlank())      putExtra(FerrumVpnService.EXTRA_RELAY, s.relay)
+            if (s.dnsServers.isNotBlank()) putExtra(FerrumVpnService.EXTRA_DNS, s.dnsServers)
+            if (s.ipv6Policy.isNotBlank()) putExtra(FerrumVpnService.EXTRA_IPV6_POLICY, s.ipv6Policy)
         }
         context.startForegroundService(intent)
     }
