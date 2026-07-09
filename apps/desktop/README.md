@@ -53,6 +53,21 @@ product spec this section is tracking against.
   falling back in-process) and **Windows via WFP** — on Windows by the helper service
   (which has the elevation). macOS `pf` is a follow-up; the UI reflects the intent
   everywhere. See [`src-tauri/src/killswitch.rs`](src-tauri/src/killswitch.rs).
+- **Leak protection (DNS + IPv6, Linux — [PRD/leak-protection.md](../../PRD/leak-protection.md) M2).**
+  Once a session reaches `Connected`, system DNS is pointed at the resolved
+  resolvers (a local `dns_servers` override in the config bundle, else whatever
+  the coordinator advertises via `--dns`) — per-link via `resolvectl` under
+  systemd-resolved, else an `/etc/resolv.conf` swap with backup/restore — and a
+  `ferrum_leakguard` `nftables` table locks plaintext DNS (53) / DoT (853) to
+  those resolvers or the tunnel, plus (policy `auto`/`block`) drops off-tunnel
+  IPv6 (loopback/link-local/neighbor-discovery exempt). Both go through the
+  [privileged helper daemon](#privileged-helper-linux) first, falling back
+  in-process; both are restored on disconnect/exit. Unlike the kill-switch this
+  never blocks ordinary traffic, and with no resolver configured or advertised
+  the session runs (and logs) **DNS-unprotected** rather than breaking
+  resolution. DoH-capable browsers bypass system DNS — a documented non-goal.
+  Windows enforcement lands with the helper service (M3); macOS is deferred.
+  See [`src-tauri/src/leakguard.rs`](src-tauri/src/leakguard.rs).
 - Live connection state and the peer list, driven through the shared facade.
   Core events (`StateChanged` / `PeersUpdated` / `Error` / `TrafficBlocked`) are
   pushed to the UI as `client-event` (on Windows, relayed from the service).
@@ -74,9 +89,10 @@ port.
 
 ## Privileged helper (Linux)
 
-Opening a TUN device and changing firewall rules both need root. Rather than
-running the whole GUI as root, a small daemon — [`ferrum-helper`](../../crates/helper)
-— does just those two things and hands results back over a Unix domain socket;
+Opening a TUN device, changing firewall rules (kill-switch + leak guard), and
+setting/restoring system DNS all need root. Rather than running the whole GUI
+as root, a small daemon — [`ferrum-helper`](../../crates/helper)
+— does just those things and hands results back over a Unix domain socket;
 the desktop app (`apps/desktop`) tries that socket first and only falls back to
 doing the privileged operation in-process (which still needs the app itself to
 run elevated) if the helper isn't reachable.

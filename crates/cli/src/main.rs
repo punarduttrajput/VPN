@@ -540,19 +540,16 @@ async fn up_mesh(
                 .context("publishing candidates to coordinator")?;
         }
     }
-    // Leak-protection M1 (PRD leak-protection.md): resolve the DNS servers this
-    // node will use once enforcement lands — a local `[dns] servers` override
-    // wins, else the coordinator-advertised list. Enforcement is M2; for now
-    // log the resolution so operators can see it (and that DNS is unprotected).
+    // Leak protection (PRD leak-protection.md): resolve the DNS servers this
+    // node uses while connected — a local `[dns] servers` override wins, else
+    // the coordinator-advertised list. Enforced below on Linux once the tunnel
+    // first comes up; other platforms log the resolution only.
     let advertised_dns = control.advertised_dns(&public_key).await.unwrap_or(None);
     let dns = resolve_dns_servers(&config.dns.servers, advertised_dns);
     if dns.is_empty() {
         tracing::warn!("no DNS servers configured or advertised; DNS is unprotected");
     } else {
-        info!(
-            ?dns,
-            "resolved DNS servers (not yet enforced — leak-protection M2)"
-        );
+        info!(?dns, "resolved DNS servers");
     }
 
     // The supervised session opens its own (token-carrying) control channels.
@@ -587,6 +584,39 @@ async fn up_mesh(
     let policy = ReconnectPolicy::default();
     let relay = config.transport.relay.clone();
     let priv_b64 = config.private_key.clone();
+
+    // Leak-protection enforcement (PRD leak-protection.md M2, Linux): once the
+    // session first reaches `Connected` (tunnel up — never before a captive
+    // portal, NFR2), point system DNS at the resolved servers and engage the
+    // leak-guard firewall; both are restored after the session ends. Failures
+    // are warnings, not fatal — an unprivileged run keeps working, visibly
+    // unprotected. (A mock-TUN dev build never reaches `Connected`, so nothing
+    // engages there.)
+    #[cfg(target_os = "linux")]
+    let leak_protection = {
+        let dns_ips: Vec<std::net::IpAddr> = dns.iter().filter_map(|s| s.parse().ok()).collect();
+        let block_ipv6 = config.leak_protection.ipv6.blocks(tun_cfg.address.addr);
+        let active = !dns_ips.is_empty() || block_ipv6;
+        if active {
+            let mut events = client.subscribe();
+            let iface_name = iface.to_string();
+            tokio::spawn(async move {
+                use ferrum_client_core::{ClientEvent, ConnectionState};
+                use tokio::sync::broadcast::error::RecvError;
+                loop {
+                    match events.recv().await {
+                        Ok(ClientEvent::StateChanged(ConnectionState::Connected)) => {
+                            engage_leak_protection(&iface_name, &dns_ips, block_ipv6);
+                            break; // rules are connection-lifetime; engage once
+                        }
+                        Ok(_) | Err(RecvError::Lagged(_)) => continue,
+                        Err(RecvError::Closed) => break,
+                    }
+                }
+            });
+        }
+        active
+    };
 
     // Factory that (re)opens the OS TUN for each session attempt — a session
     // consumes and closes its device, so a reconnect rebuilds it.
@@ -712,9 +742,48 @@ async fn up_mesh(
             }
         }
     };
+    // Restore DNS + drop the leak-guard rules however the session ended (clean
+    // Ctrl-C or an exhausted retry budget) — before the error propagates.
+    #[cfg(target_os = "linux")]
+    if leak_protection {
+        restore_leak_protection(iface);
+    }
+
     result.context("supervised mesh data plane")?;
     info!("tunnel stopped");
     Ok(())
+}
+
+/// Engage leak protection (PRD leak-protection.md M2, Linux): system DNS to the
+/// tunnel resolvers (when any resolved) + the `ferrum_leakguard` firewall.
+/// Failures are warnings, never fatal — the tunnel still works, just visibly
+/// unprotected (typically an unprivileged run).
+#[cfg(target_os = "linux")]
+fn engage_leak_protection(iface: &str, dns_servers: &[std::net::IpAddr], block_ipv6: bool) {
+    if !dns_servers.is_empty() {
+        match ferrum_tunnel::dns::set_dns(iface, dns_servers) {
+            Ok(()) => info!(servers = ?dns_servers, "system DNS pointed at tunnel resolvers"),
+            Err(e) => tracing::warn!("setting system DNS failed (run as root?): {e}"),
+        }
+    }
+    match ferrum_tunnel::leakguard::engage(iface, dns_servers, block_ipv6) {
+        Ok(()) => info!(block_ipv6, "leak guard engaged"),
+        Err(e) => tracing::warn!("engaging leak guard failed (run as root?): {e}"),
+    }
+}
+
+/// Undo [`engage_leak_protection`]. Best-effort on both mechanisms — safe when
+/// enforcement never actually engaged (unprivileged, or never connected).
+#[cfg(target_os = "linux")]
+fn restore_leak_protection(iface: &str) {
+    if let Err(e) = ferrum_tunnel::dns::restore_dns(iface) {
+        tracing::warn!("restoring system DNS: {e}");
+    }
+    match ferrum_tunnel::leakguard::disengage() {
+        Ok(()) => info!("leak guard disengaged"),
+        // Expected when it never engaged; nothing to clean up.
+        Err(e) => tracing::debug!("leak-guard disengage: {e}"),
+    }
 }
 
 /// Default padded datagram size when `padding` is on but `pad_to` is unset.

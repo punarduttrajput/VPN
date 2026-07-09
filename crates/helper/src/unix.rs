@@ -99,6 +99,78 @@ fn dispatch(req: HelperRequest) -> (HelperResponse, Option<RawFd>) {
                 (HelperResponse::Err(e.to_string()), None)
             }
         },
+        HelperRequest::SetDns { iface, servers } => set_dns(&iface, &servers),
+        HelperRequest::RestoreDns { iface } => match ferrum_tunnel::dns::restore_dns(&iface) {
+            Ok(()) => {
+                info!(iface, "system DNS restored");
+                (HelperResponse::Ok, None)
+            }
+            Err(e) => {
+                warn!("restoring system DNS failed: {e}");
+                (HelperResponse::Err(e.to_string()), None)
+            }
+        },
+        HelperRequest::LeakGuardEngage {
+            iface,
+            dns_servers,
+            block_ipv6,
+        } => leak_guard_engage(&iface, &dns_servers, block_ipv6),
+        HelperRequest::LeakGuardDisengage => match ferrum_tunnel::leakguard::disengage() {
+            Ok(()) => {
+                info!("leak guard disengaged");
+                (HelperResponse::Ok, None)
+            }
+            Err(e) => {
+                warn!("leak-guard disengage failed: {e}");
+                (HelperResponse::Err(e.to_string()), None)
+            }
+        },
+    }
+}
+
+/// Parse string IPs, rejecting the request cleanly on a malformed one.
+fn parse_ips(ips: &[String]) -> Result<Vec<IpAddr>, HelperResponse> {
+    ips.iter()
+        .map(|s| s.parse())
+        .collect::<Result<Vec<IpAddr>, _>>()
+        .map_err(|e| HelperResponse::Err(format!("invalid IP address: {e}")))
+}
+
+fn set_dns(iface: &str, servers: &[String]) -> (HelperResponse, Option<RawFd>) {
+    let ips = match parse_ips(servers) {
+        Ok(ips) => ips,
+        Err(resp) => return (resp, None),
+    };
+    match ferrum_tunnel::dns::set_dns(iface, &ips) {
+        Ok(()) => {
+            info!(iface, servers = ips.len(), "system DNS set");
+            (HelperResponse::Ok, None)
+        }
+        Err(e) => {
+            error!("setting system DNS failed: {e}");
+            (HelperResponse::Err(e.to_string()), None)
+        }
+    }
+}
+
+fn leak_guard_engage(
+    iface: &str,
+    dns_servers: &[String],
+    block_ipv6: bool,
+) -> (HelperResponse, Option<RawFd>) {
+    let ips = match parse_ips(dns_servers) {
+        Ok(ips) => ips,
+        Err(resp) => return (resp, None),
+    };
+    match ferrum_tunnel::leakguard::engage(iface, &ips, block_ipv6) {
+        Ok(()) => {
+            info!(iface, block_ipv6, "leak guard engaged");
+            (HelperResponse::Ok, None)
+        }
+        Err(e) => {
+            error!("leak-guard engage failed: {e}");
+            (HelperResponse::Err(e.to_string()), None)
+        }
     }
 }
 
@@ -330,6 +402,47 @@ mod tests {
         // Without root, `nft` itself refuses (see the `firewall` module); a
         // developer running this as root would instead see `Ok`.
         assert!(matches!(resp, HelperResponse::Err(_) | HelperResponse::Ok));
+
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    // See the `multi_thread` note on the `OpenTun` test above — same reason.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn leak_guard_engage_reports_permission_errors_cleanly() {
+        let socket_path = temp_socket_path("leakguard");
+        let socket_str = socket_path.to_str().unwrap().to_string();
+        let server_socket = socket_str.clone();
+        tokio::spawn(async move {
+            let _ = run(&server_socket, "ferrum-test-nonexistent-group").await;
+        });
+        wait_for_socket(&socket_path).await;
+
+        let (resp, fd) = round_trip(
+            &socket_path,
+            &HelperRequest::LeakGuardEngage {
+                iface: "ferrum-test0".to_string(),
+                dns_servers: vec!["10.99.0.53".to_string()],
+                block_ipv6: true,
+            },
+        )
+        .await;
+        assert!(fd.is_none());
+        // Without root, `nft` itself refuses; a developer running this as root
+        // would instead see `Ok`.
+        assert!(matches!(resp, HelperResponse::Err(_) | HelperResponse::Ok));
+
+        // A malformed IP is rejected in the daemon, before any privileged call.
+        let (resp, fd) = round_trip(
+            &socket_path,
+            &HelperRequest::LeakGuardEngage {
+                iface: "ferrum-test0".to_string(),
+                dns_servers: vec!["not-an-ip".to_string()],
+                block_ipv6: false,
+            },
+        )
+        .await;
+        assert!(fd.is_none());
+        assert!(matches!(resp, HelperResponse::Err(msg) if msg.contains("invalid IP")));
 
         let _ = std::fs::remove_file(&socket_path);
     }

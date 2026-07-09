@@ -8,12 +8,16 @@ pub mod mesh;
 pub mod path;
 pub mod session;
 
+#[cfg(target_os = "linux")]
+pub mod dns;
 #[cfg(unix)]
 pub mod fdpass;
 #[cfg(target_os = "linux")]
 pub mod firewall;
 #[cfg(all(unix, feature = "helper-ipc"))]
 pub mod helper_proto;
+#[cfg(target_os = "linux")]
+pub mod leakguard;
 
 mod runner;
 
