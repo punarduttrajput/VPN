@@ -35,12 +35,29 @@ pub enum HelperRequest {
     },
     /// Remove the kill-switch firewall rules.
     KillSwitchDisengage,
+    /// Point system DNS at `servers` (string-formatted `IpAddr`s) for the life
+    /// of the connection (PRD leak-protection.md FR3): per-link on `iface` via
+    /// systemd-resolved, else the `/etc/resolv.conf` swap.
+    SetDns { iface: String, servers: Vec<String> },
+    /// Restore pre-connection DNS (safe to send unconditionally on disconnect).
+    RestoreDns { iface: String },
+    /// Install the leak-guard firewall rules on `iface` (PRD leak-protection.md
+    /// FR4): lock DNS (53/853) to `dns_servers`/the tunnel, and drop off-tunnel
+    /// IPv6 when `block_ipv6` (loopback/link-local/neighbor-discovery exempt).
+    LeakGuardEngage {
+        iface: String,
+        dns_servers: Vec<String>,
+        block_ipv6: bool,
+    },
+    /// Remove the leak-guard firewall rules.
+    LeakGuardDisengage,
 }
 
 /// A response from the helper to the GUI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HelperResponse {
-    /// A `KillSwitchEngage`/`KillSwitchDisengage` request succeeded.
+    /// A request with no payload to return (kill-switch, DNS, leak-guard)
+    /// succeeded.
     Ok,
     /// An `OpenTun` request succeeded; the fd travels alongside this response
     /// as `SCM_RIGHTS` ancillary data (see [`send_response`]/[`recv_response`]).
@@ -129,6 +146,36 @@ mod tests {
                 assert_eq!(allow_ips, vec!["203.0.113.7".to_string()]);
             }
             other => panic!("unexpected request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn leak_protection_requests_roundtrip() {
+        let (mut a, mut b) = UnixStream::pair().unwrap();
+        let reqs = [
+            HelperRequest::SetDns {
+                iface: "ferrum0".to_string(),
+                servers: vec!["10.99.0.53".to_string()],
+            },
+            HelperRequest::RestoreDns {
+                iface: "ferrum0".to_string(),
+            },
+            HelperRequest::LeakGuardEngage {
+                iface: "ferrum0".to_string(),
+                dns_servers: vec!["10.99.0.53".to_string(), "fd00::53".to_string()],
+                block_ipv6: true,
+            },
+            HelperRequest::LeakGuardDisengage,
+        ];
+        for req in reqs {
+            send_request(&mut a, &req).unwrap();
+            let got = recv_request(&mut b).unwrap();
+            // The enums have no PartialEq (they carry no invariants worth one);
+            // JSON equality is an exact structural round-trip check.
+            assert_eq!(
+                serde_json::to_string(&got).unwrap(),
+                serde_json::to_string(&req).unwrap()
+            );
         }
     }
 

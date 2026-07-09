@@ -30,6 +30,8 @@ mod identity;
 pub mod dataplane;
 pub mod ipc;
 mod killswitch;
+#[cfg(not(windows))]
+mod leakguard;
 
 #[cfg(windows)]
 mod helper_client;
@@ -55,6 +57,8 @@ use tokio::sync::oneshot;
 use ferrum_client_core::ClientEvent;
 #[cfg(not(windows))]
 use killswitch::KillSwitch;
+#[cfg(not(windows))]
+use leakguard::LeakGuard;
 
 /// A running data-plane session, kept so `disconnect` can wind it down. The
 /// representation differs by privilege model: an in-process shutdown channel on
@@ -97,6 +101,17 @@ struct AppState {
     /// kill-switch so the control plane can reconnect while traffic is blocked.
     #[cfg(not(windows))]
     coordinator_ips: Mutex<Vec<IpAddr>>,
+    /// Leak-protection enforcer (PRD leak-protection.md M2): system DNS + the
+    /// leak-guard firewall, engaged as the session reaches `Connected` and
+    /// disengaged on disconnect/exit. Windows enforcement lives in the helper
+    /// service (M3), so this is Unix-only like the kill-switch.
+    #[cfg(not(windows))]
+    leak_guard: Mutex<LeakGuard>,
+    /// The DNS servers + IPv6-block decision resolved at connect (local
+    /// override else coordinator-advertised), consumed by the event loop when
+    /// `Connected` fires. `None` until a connect resolves them.
+    #[cfg(not(windows))]
+    leak_params: Mutex<Option<(Vec<IpAddr>, bool)>>,
 }
 
 /// A peer as presented to the webview.
@@ -251,6 +266,10 @@ fn build_config(
         relay: transport.relay,
         token: None,
         kill_switch,
+        // Leak protection (PRD leak-protection.md): no GUI fields until M5 —
+        // empty defaults mean coordinator-advertised DNS + the `auto` v6 policy.
+        dns_servers: Vec::new(),
+        ipv6_policy: String::new(),
     }
 }
 
@@ -304,6 +323,16 @@ fn connect_in_process(
 
     let client = state.client.clone();
     tauri::async_runtime::spawn(async move {
+        // Resolve this session's leak protection (local override else
+        // coordinator-advertised DNS; v6 policy) *before* bring-up starts, so
+        // the parameters are in place when the event loop sees `Connected`.
+        let dns = dataplane::resolve_dns(&cfg).await;
+        let block_v6 = dataplane::ipv6_block(&cfg);
+        if dns.is_empty() {
+            log::warn!("no DNS servers configured or advertised; DNS is unprotected this session");
+        }
+        *app.state::<AppState>().leak_params.lock().unwrap() = Some((dns, block_v6));
+
         let result = dataplane::bring_up(&client, &cfg, async move {
             let _ = stop_rx.await;
         })
@@ -419,6 +448,10 @@ fn new_app_state() -> AppState {
         kill_switch: Mutex::new(KillSwitch::default()),
         #[cfg(not(windows))]
         coordinator_ips: Mutex::new(Vec::new()),
+        #[cfg(not(windows))]
+        leak_guard: Mutex::new(LeakGuard::default()),
+        #[cfg(not(windows))]
+        leak_params: Mutex::new(None),
     }
 }
 
@@ -457,12 +490,13 @@ pub fn run() {
         if let RunEvent::Exit = event {
             let _ = app_handle;
             #[cfg(not(windows))]
-            app_handle
-                .state::<AppState>()
-                .kill_switch
-                .lock()
-                .unwrap()
-                .disengage();
+            {
+                let state = app_handle.state::<AppState>();
+                state.kill_switch.lock().unwrap().disengage();
+                // Restore DNS + drop the leak-guard table too, so an app exit
+                // never strands the system on the tunnel resolver.
+                state.leak_guard.lock().unwrap().disengage();
+            }
         }
     });
 }
@@ -482,17 +516,42 @@ fn setup_event_forwarding(app: &tauri::App) {
         loop {
             match events.recv().await {
                 Ok(ev) => {
-                    if let ClientEvent::TrafficBlocked(blocked) = &ev {
-                        let st = handle.state::<AppState>();
-                        if *blocked {
-                            let ips = st.coordinator_ips.lock().unwrap().clone();
-                            st.kill_switch
+                    match &ev {
+                        ClientEvent::TrafficBlocked(blocked) => {
+                            let st = handle.state::<AppState>();
+                            if *blocked {
+                                let ips = st.coordinator_ips.lock().unwrap().clone();
+                                st.kill_switch
+                                    .lock()
+                                    .unwrap()
+                                    .engage(dataplane::TUN_IFACE, &ips);
+                            } else {
+                                st.kill_switch.lock().unwrap().disengage();
+                            }
+                        }
+                        // Leak protection engages only once the tunnel is up
+                        // (never at boot / before a captive portal — NFR2) and
+                        // re-engages idempotently on every reconnect.
+                        ClientEvent::StateChanged(ConnectionState::Connected) => {
+                            let st = handle.state::<AppState>();
+                            let params = st.leak_params.lock().unwrap().clone();
+                            if let Some((dns, block_v6)) = params {
+                                st.leak_guard.lock().unwrap().engage(
+                                    dataplane::TUN_IFACE,
+                                    &dns,
+                                    block_v6,
+                                );
+                            }
+                        }
+                        ClientEvent::StateChanged(ConnectionState::Disconnected) => {
+                            handle
+                                .state::<AppState>()
+                                .leak_guard
                                 .lock()
                                 .unwrap()
-                                .engage(dataplane::TUN_IFACE, &ips);
-                        } else {
-                            st.kill_switch.lock().unwrap().disengage();
+                                .disengage();
                         }
+                        _ => {}
                     }
                     let ui = to_ui_event(ev);
                     cache_state(&handle.state::<AppState>(), &ui);

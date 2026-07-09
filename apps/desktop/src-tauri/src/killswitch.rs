@@ -198,8 +198,11 @@ impl Drop for KillSwitch {
 /// operation in-process. Returns `Some(Err(_))` only when the helper *is*
 /// reachable but the operation itself failed (or the protocol broke), so a
 /// real failure is surfaced rather than silently retried in-process.
+/// `pub(crate)`: the leak guard ([`crate::leakguard`]) shares the same daemon.
 #[cfg(target_os = "linux")]
-fn ask_helper(req: ferrum_tunnel::helper_proto::HelperRequest) -> Option<Result<(), String>> {
+pub(crate) fn ask_helper(
+    req: ferrum_tunnel::helper_proto::HelperRequest,
+) -> Option<Result<(), String>> {
     use ferrum_tunnel::helper_proto::{recv_response, send_request, HelperResponse};
     use std::os::unix::net::UnixStream;
 

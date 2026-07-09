@@ -133,6 +133,20 @@ pub enum Ipv6LeakPolicy {
     Off,
 }
 
+impl Ipv6LeakPolicy {
+    /// Whether this policy calls for blocking IPv6 off-tunnel, given the
+    /// tunnel's assigned address: `auto` blocks exactly when the tunnel
+    /// carries no v6 address (so v6 would otherwise leak around it); `tunnel`
+    /// routes rather than blocks; `off` never blocks.
+    pub fn blocks(self, tunnel_addr: std::net::IpAddr) -> bool {
+        match self {
+            Ipv6LeakPolicy::Block => true,
+            Ipv6LeakPolicy::Auto => tunnel_addr.is_ipv4(),
+            Ipv6LeakPolicy::Tunnel | Ipv6LeakPolicy::Off => false,
+        }
+    }
+}
+
 /// The `[leak_protection]` config block (PRD `leak-protection.md`).
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct LeakProtectionConfig {
@@ -522,6 +536,19 @@ mod tests {
         let toml_str = format!("{}\n[dns]\nservers = [\"10.99.0.53:53\"]\n", valid_toml());
         let cfg: Config = toml::from_str(&toml_str).unwrap();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn ipv6_policy_blocks_by_tunnel_address_family() {
+        let v4: std::net::IpAddr = "10.8.0.2".parse().unwrap();
+        let v6: std::net::IpAddr = "fd00::2".parse().unwrap();
+        // auto: block exactly when the tunnel carries no v6.
+        assert!(Ipv6LeakPolicy::Auto.blocks(v4));
+        assert!(!Ipv6LeakPolicy::Auto.blocks(v6));
+        assert!(Ipv6LeakPolicy::Block.blocks(v4));
+        assert!(Ipv6LeakPolicy::Block.blocks(v6));
+        assert!(!Ipv6LeakPolicy::Tunnel.blocks(v4));
+        assert!(!Ipv6LeakPolicy::Off.blocks(v4));
     }
 
     #[test]

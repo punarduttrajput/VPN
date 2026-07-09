@@ -156,6 +156,68 @@ pub fn resolve_coordinator_ips(coordinator: &str) -> Vec<IpAddr> {
         .unwrap_or_default()
 }
 
+/// Parse a list of string IPs, skipping (and logging) malformed entries rather
+/// than failing bring-up — leak protection degrades visibly, never fatally.
+fn parse_ips_lossy(list: &[String]) -> Vec<IpAddr> {
+    list.iter()
+        .filter_map(|s| match s.trim().parse() {
+            Ok(ip) => Some(ip),
+            Err(e) => {
+                log::warn!("ignoring invalid DNS server '{s}': {e}");
+                None
+            }
+        })
+        .collect()
+}
+
+/// Resolve the DNS servers to enforce this session (PRD leak-protection.md):
+/// the config's local override when non-empty, else the coordinator-advertised
+/// list — the same order as relay selection. Empty means the session runs
+/// DNS-unprotected (the caller surfaces that). Best-effort: a control-plane
+/// hiccup here degrades to "unprotected", it never blocks bring-up.
+pub async fn resolve_dns(cfg: &ConnectConfig) -> Vec<IpAddr> {
+    let local = parse_ips_lossy(&cfg.dns_servers);
+    if !local.is_empty() {
+        return local;
+    }
+    let Ok(public_key) = ferrum_core::keys::public_base64_from_private(&cfg.private_key) else {
+        return Vec::new(); // bring_up will surface the key error itself
+    };
+    let mut control = match ferrum_client_core::ControlClient::connect(cfg.coordinator.clone()).await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("fetching advertised DNS: connecting to coordinator failed: {e}");
+            return Vec::new();
+        }
+    };
+    if let Some(token) = cfg.token.clone() {
+        control = control.with_token(token);
+    }
+    match control.advertised_dns(&public_key).await {
+        Ok(Some(list)) => parse_ips_lossy(&list),
+        Ok(None) => Vec::new(),
+        Err(e) => {
+            log::warn!("fetching advertised DNS failed: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// Whether this session should block off-tunnel IPv6 (PRD leak-protection.md).
+/// `auto` (the default) blocks: the coordinator allocates IPv4 tunnel
+/// addresses today, so v6 always rides outside the tunnel unless blocked.
+pub fn ipv6_block(cfg: &ConnectConfig) -> bool {
+    match cfg.ipv6_policy.trim().to_ascii_lowercase().as_str() {
+        "" | "auto" | "block" => true,
+        "tunnel" | "off" => false,
+        other => {
+            log::warn!("unknown ipv6 policy '{other}'; defaulting to auto (block)");
+            true
+        }
+    }
+}
+
 /// Validate + bring up the data plane on `client`, running until `shutdown`.
 ///
 /// Returns `Err(msg)` for a configuration/registration/TUN error that happens
@@ -413,6 +475,48 @@ mod tests {
         assert!(matches!(parse_mode("  quic "), Ok(TransportMode::Quic)));
         assert!(matches!(parse_mode("Masque"), Ok(TransportMode::Masque)));
         assert!(parse_mode("wireguard").is_err());
+    }
+
+    #[test]
+    fn ipv6_block_follows_policy_and_defaults_to_block() {
+        let mut cfg = ConnectConfig {
+            coordinator: "http://10.0.0.1:50051".into(),
+            private_key: String::new(),
+            name: String::new(),
+            endpoint: String::new(),
+            tags: vec![],
+            listen_port: 51820,
+            transport_mode: "udp".into(),
+            masque_proxy: None,
+            server_name: None,
+            stun_server: None,
+            relay: None,
+            token: None,
+            kill_switch: false,
+            dns_servers: vec![],
+            ipv6_policy: String::new(),
+        };
+        // Empty/auto/block all block (coordinator-assigned addresses are v4).
+        assert!(ipv6_block(&cfg));
+        cfg.ipv6_policy = "Block".into();
+        assert!(ipv6_block(&cfg));
+        cfg.ipv6_policy = "off".into();
+        assert!(!ipv6_block(&cfg));
+        cfg.ipv6_policy = "tunnel".into();
+        assert!(!ipv6_block(&cfg));
+        // Unknown values fail safe (block), with a logged warning.
+        cfg.ipv6_policy = "banana".into();
+        assert!(ipv6_block(&cfg));
+    }
+
+    #[test]
+    fn parse_ips_lossy_skips_bad_entries() {
+        let ips = parse_ips_lossy(&[
+            "10.99.0.53".to_string(),
+            "not-an-ip".to_string(),
+            " fd00::53 ".to_string(),
+        ]);
+        assert_eq!(ips.len(), 2);
     }
 
     #[test]

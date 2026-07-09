@@ -81,6 +81,15 @@ pub struct ConnectConfig {
     /// in the OS firewall as the tunnel goes up/down).
     #[serde(default)]
     pub kill_switch: bool,
+    /// DNS resolvers (bare IPs) to enforce while connected — a local override
+    /// of the coordinator-advertised list (PRD leak-protection.md; empty means
+    /// use whatever the coordinator advertises). A GUI field lands in M5.
+    #[serde(default)]
+    pub dns_servers: Vec<String>,
+    /// IPv6 leak policy: `"auto"` (default when empty) | `"block"` | `"tunnel"`
+    /// | `"off"` — see `ferrum_core::config::Ipv6LeakPolicy`.
+    #[serde(default)]
+    pub ipv6_policy: String,
 }
 
 /// A message from the GUI to the service.
@@ -197,6 +206,8 @@ mod tests {
             relay: None,
             token: None,
             kill_switch: true,
+            dns_servers: vec!["10.99.0.53".into()],
+            ipv6_policy: "auto".into(),
         }
     }
 
