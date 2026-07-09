@@ -234,24 +234,31 @@ impl RelayXdpLoader {
         let mut tick = tokio::time::interval(STATS_POLL);
         loop {
             tick.tick().await;
-            match self.stats.lock().await.get(&0, 0) {
+            // Take the lock ONCE for both reads, in its own scope. The
+            // previous shape — `match self.stats.lock().await.get(..)` with
+            // a second `lock().await` inside the match arm — deadlocked
+            // silently on the first tick: a temporary in a match scrutinee
+            // (the `MutexGuard` here) lives until the end of the whole
+            // `match`, and tokio's `Mutex` isn't reentrant. Found live on
+            // the first real traffic run (2026-07-09): the kernel counters
+            // climbed while `/metrics` stayed at zero forever.
+            let (frames_res, bytes_res) = {
+                let stats = self.stats.lock().await;
                 // `PerCpuArray::get` returns `Result<PerCpuValues<u64>,
-                // MapError>` (confirmed against the real source) — one
-                // value per CPU; the total is just their sum (PRD FR4 — a
-                // plain aggregate, no per-flow breakdown).
-                Ok(per_cpu_frames) => {
+                // MapError>` — one value per CPU; the total is their sum
+                // (PRD FR4 — a plain aggregate, no per-flow breakdown).
+                // Frame counter at index 0, byte counter at index 1 (see
+                // `relay-ebpf/src/main.rs`'s `STAT_FRAMES`/`STAT_BYTES`).
+                (stats.get(&0, 0), stats.get(&1, 0))
+            };
+            match (frames_res, bytes_res) {
+                (Ok(per_cpu_frames), Ok(per_cpu_bytes)) => {
                     let frames: u64 = per_cpu_frames.iter().sum();
-                    // Byte counter lives at index 1 of the same map (see
-                    // `relay-ebpf/src/main.rs`'s `STAT_BYTES`).
-                    match self.stats.lock().await.get(&1, 0) {
-                        Ok(per_cpu_bytes) => {
-                            let bytes: u64 = per_cpu_bytes.iter().sum();
-                            self.metrics.set_xdp_totals(frames, bytes);
-                        }
-                        Err(e) => warn!("relay xdp: reading byte counter failed: {e}"),
-                    }
+                    let bytes: u64 = per_cpu_bytes.iter().sum();
+                    self.metrics.set_xdp_totals(frames, bytes);
                 }
-                Err(e) => warn!("relay xdp: reading frame counter failed: {e}"),
+                (Err(e), _) => warn!("relay xdp: reading frame counter failed: {e}"),
+                (_, Err(e)) => warn!("relay xdp: reading byte counter failed: {e}"),
             }
         }
     }

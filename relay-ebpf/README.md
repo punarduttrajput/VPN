@@ -3,24 +3,39 @@
 The relay's XDP fast path — see [PRD/phase-6-ebpf-xdp-relay.md](../PRD/phase-6-ebpf-xdp-relay.md)
 for the design and [src/main.rs](src/main.rs) for the program itself.
 
-**Status: built, verifier-accepted, and attached (2026-07-09).** On a real
+**Status: verified end-to-end with live traffic (2026-07-10).** On a real
 Linux host (kernel 7.0, rustup nightly + the prebuilt `bpf-linker` v0.10.4
 release binary), this program compiles clean, **passes the kernel eBPF
-verifier**, and attaches through the production loader (`ferrum relay
---xdp-iface lo --xdp-program …` → `relay xdp fast path enabled`). Two real
-bugs were found and fixed on that first load, both predicted by the "what
-to check first" list below (details in `STATUS.md`'s 2026-07-09 entry): the
-userspace loader dropped `aya-log`'s `EbpfLogger` before `BPF_PROG_LOAD`
-(closing the `AYA_LOGS` map fd out from under the already-patched
-instructions → EBADF before verification), and the verifier rejected
-`checksum_update`'s `while`-carry-fold as "infinite loop detected" (now a
-fixed two-fold). **Still remaining: live traffic through the fast path** —
-XDP doesn't fire on loopback, so end-to-end forwarding, the
-checksum-correctness capture (item 3 below), and the NFR1 benchmark (steps
-2–4 under "Verify") still need two hosts or a netns+veth pair.
-`src/main.rs` documents its own reasoning inline (byte-order convention,
-checksum math, bounds-check placement) so that remaining pass can find and
-fix anything wrong, rather than starting from nothing.
+verifier**, attaches through the production loader (`ferrum relay
+--xdp-iface … --xdp-program …` → `relay xdp fast path enabled`), and
+**forwards live relay `Data` frames entirely in-kernel** on a netns+veth
+test bed: 2000/2000 frames delivered client→client with
+`ferrum_relay_xdp_frames_forwarded_total` = 2000 and the userspace
+`frames_forwarded_total` staying at **0**, every fast-pathed packet
+carrying a **valid IPv4 header checksum** in a tcpdump capture (the RFC
+1624 incremental update confirmed against real packets), and 99.97%
+delivery under a ~1 Gbps flood vs the userspace relay's 92.6% (see the
+"Verified" section below and `STATUS.md`'s 2026-07-09/-10 entries).
+
+Getting there took **five real bugs across two passes**, all in the
+categories the "what to check first" list below predicted: the first
+load found the loader's `EbpfLogger` drop (EBADF before `BPF_PROG_LOAD`)
+and the verifier-rejected `while`-carry-fold in `checksum_update` (now a
+fixed two-fold); live traffic then found `AddrKey`'s **implicit `repr(C)`
+padding** (BPF map keys compare byte-wise; undefined padding ⇒ 100%
+lookup miss), a **tokio-mutex deadlock** in the loader's stats poll (a
+match-scrutinee `MutexGuard` outliving into a second `lock().await`), and
+a **missing UDP source-port rewrite** (the inbound packet's src port is
+the *sender's* ephemeral port, not the relay's — clients drop frames not
+from exactly `relay_ip:relay_port`). `src/main.rs` documents its own
+reasoning inline (byte-order convention, checksum math, bounds-check
+placement, and each of those fixes at the site it lives).
+
+**Still open for FR1/NFR1:** the ≥10 Gbps benchmark. The veth number
+above is a *functional* comparison — generic (SKB) mode on a veth pair
+with a single-socket sender saturates around 1 Gbps offered. The line-rate
+claim needs real hardware, native (driver) XDP mode, and a multi-queue
+sender.
 
 This crate is its own standalone Cargo workspace (`[workspace]` in its
 `Cargo.toml`, and listed in the repo root's `exclude`) — it is never touched
@@ -54,12 +69,43 @@ BPF toolchain here never breaks anything else in this repo.
    pointing to valid bpf_map") before verification. The logger is now
    initialized *after* `program.load()` and kept alive in a spawned
    flush task.
-3. **The RFC 1624 incremental IPv4 checksum update — ⬜ still open.**
-   Arithmetically unchanged by the two-fold fix, but still never run
-   against a real packet (XDP doesn't fire on loopback). The check stands:
-   capture a fast-pathed packet with `tcpdump`/Wireshark and confirm it
-   reports a **valid** IPv4 checksum — Wireshark will flag a bad one
-   immediately.
+3. **The RFC 1624 incremental IPv4 checksum update — ✅ verified live
+   (2026-07-10).** A tcpdump capture on the far side of the veth showed
+   all 2000 fast-pathed packets with a valid IPv4 header checksum
+   (validated word-sum == 0xFFFF per packet), UDP checksum zeroed as
+   designed, and the key field rewritten to the sender's key.
+
+## What live traffic found that attach-only couldn't (2026-07-10)
+
+The netns+veth pass (see "Verify" below for the recipe) found three more
+real bugs, none of which the verifier or a loopback attach could surface —
+worth knowing about for any future map or rewrite change:
+
+4. **BPF hash-map keys must have zero implicit padding.** `AddrKey` was
+   `#[repr(C)] { ip: u32, port: u16 }` — size 8 with two *implicit*
+   trailing padding bytes. The kernel compares map keys byte-wise over the
+   full `key_size`, and Rust leaves implicit padding undefined on both the
+   BPF stack and in userspace's `Pod` byte-copy — so every `ADDR_TO_KEY`
+   lookup missed and 100% of traffic silently fell through to userspace
+   (fail-open masking the bug; only the flat XDP counters gave it away).
+   Fix: an explicit always-zero `_pad: [u8; 2]` field with `AddrKey::new`
+   as the only constructor, pinned by a `size_of == 8` unit test in
+   `ferrum-relay-xdp-common`.
+5. **The loader's stats poll deadlocked on its first tick** —
+   `match self.stats.lock().await.get(..)` keeps the `MutexGuard` (a match-
+   scrutinee temporary) alive across a second `lock().await` of the same
+   tokio mutex inside the arm. Kernel counters climbed; `/metrics` stayed
+   at 0 forever, with no error logged. Fix in `relay_xdp.rs`: take the
+   lock once for both index reads in a scoped block.
+6. **The UDP source port must be explicitly rewritten to the relay's
+   port.** The original code (and the PRD's FR1 text) called it
+   "unchanged," reasoning from the relay's outbound socket — but in an
+   in-place rewrite of the *inbound* packet, that field holds the sending
+   client's ephemeral port. `RelayMeshTransport::recv_from` drops anything
+   not from exactly `relay_ip:relay_port`, so every fast-pathed frame was
+   delivered and then filtered out client-side. Diagnosed byte-for-byte
+   with `relay_traffic`'s `rawdump` mode after `/proc/net/snmp` showed the
+   frames *were* reaching a socket.
 
 ## Build
 
@@ -100,18 +146,57 @@ Risks section).
 
 ## Verify
 
+Steps 1–3 were **done live on 2026-07-10** with the netns+veth recipe
+below; step 4's real-hardware half is the remaining open item.
+
 1. `sudo bpftool prog show` — confirm the program loaded and is attached to
-   the named interface.
-2. Register two test clients against the relay and exchange a few `Data`
-   frames (e.g. two short-lived `RelayMeshTransport` instances, or the
-   existing `relay.rs` integration test's pattern against a real interface
-   instead of loopback — XDP doesn't fire on loopback in most configs, so
-   this specifically needs two real hosts or netns-with-veth).
+   the named interface. (`bpftool map dump name STATS` is also the
+   ground-truth read of the fast-path counters, bypassing the loader.)
+2. Register two test clients against the relay and exchange `Data` frames.
+   The committed harness for this is
+   `crates/transport/examples/relay_traffic.rs` (two fixed-key roles over
+   `RelayMeshTransport`; `recv`/`send` verify modes, `bench-recv`/
+   `bench-send` flood modes, and a `rawdump` mode that prints every raw
+   datagram byte-for-byte — the tool that found the src-port bug). XDP
+   doesn't fire on loopback, so this needs two hosts or netns+veth; the
+   recipe that works (both clients in the root netns, relay + XDP inside a
+   netns):
+
+   ```sh
+   ip netns add frxdp
+   ip link add veth-host type veth peer name veth-relay
+   ip link set veth-relay netns frxdp
+   ip addr add 10.99.0.1/24 dev veth-host && ip link set veth-host up
+   ip netns exec frxdp ip addr add 10.99.0.2/24 dev veth-relay
+   ip netns exec frxdp ip link set veth-relay up
+   ip netns exec frxdp ip route add default via 10.99.0.1   # FR2 gateway
+   ethtool -K veth-host tx off rx off gso off gro off       # real checksums
+   ip netns exec frxdp ethtool -K veth-relay tx off rx off gso off gro off
+   ip netns exec frxdp ping -c1 10.99.0.1                   # warm ARP
+   ip netns exec frxdp ferrum relay --listen 0.0.0.0:51821 \
+     --metrics-listen 10.99.0.2:9101 \
+     --xdp-iface veth-relay --xdp-program target/bpfel-unknown-none/release/ferrum-relay-ebpf &
+   relay_traffic 10.99.0.2:51821 b recv 2000 30 &   # root netns, unprivileged
+   relay_traffic 10.99.0.2:51821 a send 2000 1400 5000
+   ```
+
+   Note that tcpdump **inside** the netns on `veth-relay` will *not* show
+   fast-pathed frames — generic XDP consumes them before the tap — while a
+   capture on `veth-host` shows the rewritten packets. That asymmetry is
+   itself a useful "the fast path is on" signal.
 3. Confirm packets stop reaching `RelayServer::serve`'s own `recv_from`
-   loop for that flow once it's warm (add a temporary log line, or watch
-   `ferrum_relay_frames_forwarded_total` stop incrementing for it) while
-   the relay's new `ferrum_relay_xdp_frames_forwarded_total` /
-   `ferrum_relay_xdp_bytes_forwarded_total` Prometheus counters climb (PRD
-   FR4 — separate metric names, not a label on the existing ones).
-4. Benchmark against the existing userspace relay (same two hosts, `--xdp-
-   iface` unset vs. set) to validate the NFR1 target.
+   loop once the maps are warm: `ferrum_relay_frames_forwarded_total`
+   stays flat (measured: exactly 0) while
+   `ferrum_relay_xdp_frames_forwarded_total` /
+   `ferrum_relay_xdp_bytes_forwarded_total` climb (PRD FR4 — separate
+   metric names, not a label on the existing ones). Capture on the far
+   veth end and check the IPv4 checksums validate (done — all 2000 valid;
+   Wireshark/`tcpdump -v` flags a bad one immediately).
+4. Benchmark against the existing userspace relay. **Measured on this bed**
+   (generic mode, single-socket sender — a functional comparison only):
+   at ~1.04 Gbps offered / 1400-byte payloads, the XDP path delivered
+   99.97% (1039 Mbps, ~92.8k pps) with the relay process forwarding zero
+   packets in userspace, vs the userspace relay's 92.6% (971 Mbps — 7.4%
+   socket-overrun loss). **The ≥10 Gbps NFR1 claim remains open**: it
+   needs real hardware, native (driver) XDP mode, and a multi-queue
+   line-rate sender.

@@ -4,9 +4,9 @@
 |---|---|
 | **Product** | Ferrum (Rust) |
 | **Phase** | 6 of 6 — Scale & Acceleration (FR1 drill-down) |
-| **Status** | Implemented (M1–M4); M5 partially done — the kernel program builds, passes the verifier, and attaches on a real Linux host (2026-07-09); live-traffic verification + the NFR1 benchmark remain |
+| **Status** | Implemented and live-traffic verified (M1–M5, 2026-07-10): forwards real `Data` frames in-kernel on a netns+veth bed with valid checksums and exact counter accounting; only the NFR1 ≥10 Gbps real-hardware benchmark remains open |
 | **Owner** | punarduttrajput |
-| **Last updated** | 2026-07-09 |
+| **Last updated** | 2026-07-10 |
 | **Depends on** | [phase-6-scale-acceleration.md](phase-6-scale-acceleration.md) FR1; the Phase 4 relay (`RelayServer` / `RelayMeshTransport`, `crates/transport/src/relay.rs`) |
 
 ---
@@ -147,11 +147,16 @@ or act on anything below the relay's own tiny framing (a 1-byte tag + a
     source MAC ← this relay's own MAC.
   - IPv4: source address ← this relay's own IP; destination address ←
     the resolved destination IP; recompute the IPv4 header checksum.
-  - UDP: source port ← the relay's own listen port (unchanged — the
-    existing relay always sends from the one socket it's bound on);
-    destination port ← the resolved destination port; UDP checksum is
-    zeroed (valid for IPv4 per RFC 768, and this is the standard XDP
-    L4LB shortcut — Katran does the same).
+  - UDP: source port ← the relay's own listen port — an **explicit
+    rewrite**: the inbound packet's source port is the *sending client's*
+    ephemeral port, and clients (`RelayMeshTransport::recv_from`) drop
+    frames not from exactly `relay_ip:relay_port`. (This spec originally
+    called the field "unchanged," reasoning from the relay's outbound
+    socket — wrong for an in-place rewrite of the inbound packet; caught
+    live 2026-07-10, when every fast-pathed frame was delivered and then
+    filtered out client-side.) Destination port ← the resolved
+    destination port; UDP checksum is zeroed (valid for IPv4 per RFC 768,
+    and this is the standard XDP L4LB shortcut — Katran does the same).
   - Payload: overwrite the 32-byte key field with the *sender's* key
     (from lookup 1) — this is the exact transformation
     `RelayServer::serve` does today (`data_frame(&src_key, payload)`).
@@ -318,15 +323,24 @@ existing `libc` pattern).
    (can't run, but syntax/type-checks — matching the GSO/GRO precedent).
 4. **M4** — CLI flags + feature wiring (FR5); confirm every existing test
    and build on this host is unaffected with the feature off.
-5. **M5 — Linux follow-up (partially done, 2026-07-09):** ✅ built for real
+5. **M5 — Linux follow-up (✅ done, 2026-07-10):** ✅ built for real
    (rustup nightly + the prebuilt `bpf-linker` v0.10.4 musl binary), ✅
-   loaded + verifier-accepted + attached via `--xdp-iface lo
-   --xdp-program …` (`relay xdp fast path enabled`; two first-load bugs
-   fixed — the loader's `EbpfLogger` drop and the checksum carry-fold
-   loop, both logged in STATUS.md). ⏳ Remaining: **live traffic** through
-   the fast path (XDP doesn't fire on loopback — needs netns+veth or two
-   hosts), the Wireshark checksum capture check, and the NFR1 benchmark
-   against the userspace relay.
+   loaded + verifier-accepted + attached via the production loader
+   (`relay xdp fast path enabled`; two first-load bugs fixed — the
+   loader's `EbpfLogger` drop and the checksum carry-fold loop), ✅
+   **live traffic through the fast path** on a netns+veth bed
+   (2000/2000 frames delivered in-kernel, userspace forward counter at 0,
+   exact counter reconciliation; three more live-only bugs found and
+   fixed — `AddrKey`'s implicit map-key padding, the stats-poll tokio-
+   mutex deadlock, and the missing UDP src-port rewrite; all in
+   STATUS.md's 2026-07-10 entry), ✅ the checksum capture check (all
+   fast-pathed packets carry a valid IPv4 header checksum — RFC 1624
+   confirmed on real packets), ✅ a first benchmark vs the userspace
+   relay (99.97% vs 92.6% delivery at ~1 Gbps offered on veth/generic
+   mode; committed harness: `crates/transport/examples/relay_traffic.rs`).
+   ⏳ Remaining (tracked, out of this milestone's environment): the NFR1
+   **≥10 Gbps** figure itself — needs real hardware, native (driver) XDP
+   mode, and a multi-queue line-rate sender.
 
 ---
 
@@ -343,11 +357,17 @@ existing `libc` pattern).
 - ✅ **Done on a real Linux host (2026-07-09):** `relay-ebpf` compiles
   under `bpf-linker` and **passes the kernel verifier** when loaded via
   the production loader (attached to `lo` in SKB mode; clean teardown).
-- ⏳ **Still deferred** (tracked, not claimed done): live relay `Data`
-  frames actually take the fast path (needs netns+veth or two hosts —
-  XDP doesn't fire on loopback), fast-pathed packets carry a valid IPv4
-  checksum (Wireshark check), and the NFR1 throughput target holds
-  against the existing userspace relay as a baseline.
+- ✅ **Done on a real Linux host (2026-07-10):** live relay `Data` frames
+  take the fast path end-to-end (netns+veth; 2000/2000 delivered,
+  `ferrum_relay_xdp_frames_forwarded_total` = 2000 while the userspace
+  `frames_forwarded_total` stayed 0), and every fast-pathed packet
+  carries a valid IPv4 header checksum in a capture (RFC 1624 update
+  confirmed on real packets; UDP checksum zeroed per the FR1 shortcut).
+- ⏳ **Still deferred** (tracked, not claimed done): the NFR1 ≥10 Gbps
+  throughput figure. The veth/generic-mode benchmark (99.97% delivery at
+  ~1.04 Gbps offered vs the userspace relay's 92.6%) is a functional
+  comparison only — the line-rate claim needs real hardware, native
+  (driver) XDP mode, and a multi-queue sender.
 
 ---
 

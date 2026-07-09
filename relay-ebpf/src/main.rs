@@ -10,25 +10,22 @@
 //! or a flow it hasn't been told about yet) is `XDP_PASS`ed through to the
 //! existing userspace relay loop, unchanged.
 //!
-//! **This file is unbuilt and unverified on the host it was authored on** —
-//! see the crate's `README.md` and the PRD's Risks section. It targets
-//! `bpfel-unknown-none` via `aya-ebpf`, which needs a real Linux kernel to
-//! load against (the eBPF verifier is not something you can satisfy by
-//! inspection) and a `bpf-linker`+nightly toolchain to even produce the
-//! `.o` this program compiles to.
+//! **Status: verified end-to-end with live traffic (2026-07-10)** — this
+//! program builds (nightly + `bpf-linker`, `bpfel-unknown-none`), passes
+//! the kernel eBPF verifier, attaches via the production loader, and
+//! forwards real relay `Data` frames in-kernel with valid rewritten IPv4
+//! checksums (netns+veth test bed; see the crate `README.md`'s "Verify"
+//! section and STATUS.md's 2026-07-09/-10 entries). It was authored blind
+//! on an offline-Windows host; getting from "compiles" to "forwards"
+//! found five real bugs, each documented at the site of its fix (the
+//! `checksum_update` fold, `AddrKey`'s padding via `AddrKey::new`, the
+//! UDP src-port rewrite below, plus two loader-side bugs in
+//! `relay_xdp.rs`).
 //!
 //! The `aya-ebpf = "0.2.1"` map/program API calls here (`#[map]`/`#[xdp]`,
 //! `HashMap`/`Array`/`PerCpuArray`'s exact method signatures, `XdpContext`,
-//! `xdp_action`) *were* checked against that version's actual downloaded
-//! source rather than guessed — this crate's dependency itself doesn't need
-//! a BPF toolchain to fetch, just to compile for the `bpfel-unknown-none`
-//! target, so `cargo fetch` alone was enough to read the real API. What
-//! remains genuinely unverified, and needs a real kernel to check, is
-//! everything that source can't tell you: whether the eBPF **verifier**
-//! accepts this program's control flow and bounds checks, and whether the
-//! RFC 1624 incremental IPv4 checksum update is arithmetically correct
-//! against a real packet (both flagged again at their own definitions
-//! below).
+//! `xdp_action`) were checked against that version's actual downloaded
+//! source rather than guessed, and held up on the first real build.
 #![no_std]
 #![no_main]
 
@@ -268,10 +265,13 @@ fn try_fastpath(ctx: &XdpContext) -> Result<u32, ()> {
     };
 
     // --- Two map lookups, mirroring `Clients` exactly (PRD FR1) ---
-    let src_addr = AddrKey {
-        ip: src_ip,
-        port: src_port,
-    };
+    // `AddrKey::new` zeroes the struct's explicit padding — a BPF hash map
+    // compares keys byte-wise over the full `key_size`, so every byte must
+    // be deterministic on both sides. (The first live-traffic run,
+    // 2026-07-09, missed 100% of lookups on exactly this: the old struct
+    // had *implicit* padding, undefined on both the BPF stack and the
+    // userspace mirror.)
+    let src_addr = AddrKey::new(src_ip, src_port);
     // SAFETY (both lookups): `HashMap::get` is `unsafe fn` in the real
     // `aya-ebpf = "0.2.1"` source — not because the FFI call itself is
     // risky, but because the kernel doesn't guarantee `insert`/`remove`
@@ -281,11 +281,32 @@ fn try_fastpath(ctx: &XdpContext) -> Result<u32, ()> {
     // so that hazard doesn't apply here. Passing the keys by value (`Copy`
     // types) rather than by reference sidesteps any ambiguity in exactly
     // which `Borrow<K>` impl would apply.
-    let sender_key = *unsafe { ADDR_TO_KEY.get(src_addr) }.ok_or(())?;
-    let dest_addr = *unsafe { KEY_TO_ADDR.get(dst_key) }.ok_or(())?;
+    //
+    // The misses below are `debug!`-logged rather than silent: they only
+    // fire for Data frames already on the relay's own port (never for
+    // unrelated traffic), and they're exactly the signal needed to
+    // distinguish "fast path not matching" from "no traffic" during
+    // bring-up. The success path deliberately has NO per-packet log — at
+    // line rate a ring-buffer write per forwarded frame is real overhead,
+    // and the `STATS` counters already tell that story.
+    let Some(sender_key) = (unsafe { ADDR_TO_KEY.get(src_addr) }).copied() else {
+        debug!(
+            ctx,
+            "relay xdp: data frame, addr_to_key miss (unregistered sender)"
+        );
+        return Ok(xdp_action::XDP_PASS);
+    };
+    let Some(dest_addr) = (unsafe { KEY_TO_ADDR.get(dst_key) }).copied() else {
+        debug!(
+            ctx,
+            "relay xdp: data frame, key_to_addr miss (unknown destination)"
+        );
+        return Ok(xdp_action::XDP_PASS);
+    };
     // `Array::get` is safe — see the `RELAY_PORT` lookup above.
     let gw = GATEWAY.get(0).copied().ok_or(())?;
     if !gw.is_resolved() {
+        debug!(ctx, "relay xdp: data frame, gateway not resolved yet");
         return Err(());
     }
 
@@ -318,11 +339,20 @@ fn try_fastpath(ctx: &XdpContext) -> Result<u32, ()> {
     );
     write_u16(ctx, ip_off + IPV4_CHECKSUM_OFF, new_checksum)?;
 
-    // UDP: src port unchanged (the relay always forwards from the one
-    // listen port it's bound on, exactly like `RelayServer::serve`'s single
-    // socket); dst port = the resolved destination's port. Checksum is
-    // zeroed rather than recomputed — valid for IPv4 per RFC 768 §4, and
-    // the same shortcut XDP-based L4 forwarders conventionally take.
+    // UDP: src port ← the relay's own listen port. This must be an
+    // explicit REWRITE: the inbound packet's source port is the *sending
+    // client's* ephemeral port, and a forwarded frame has to look exactly
+    // like `RelayServer::serve`'s single bound socket sent it — clients
+    // (`RelayMeshTransport::recv_from`) drop anything not from precisely
+    // `relay_ip:relay_port`. (The PRD's FR1 text called this field
+    // "unchanged", reasoning from the relay's *outbound* perspective —
+    // wrong for an in-place rewrite of the inbound packet; caught live
+    // 2026-07-09: every fast-pathed frame arrived from the sender's port
+    // and was filtered out by the receiving client.) Dst port = the
+    // resolved destination's port. Checksum is zeroed rather than
+    // recomputed — valid for IPv4 per RFC 768 §4, and the same shortcut
+    // XDP-based L4 forwarders conventionally take.
+    write_u16(ctx, udp_off + UDP_SRC_PORT_OFF, relay_port)?;
     write_u16(ctx, udp_off + UDP_DST_PORT_OFF, dest_addr.port)?;
     write_u16(ctx, udp_off + UDP_CHECKSUM_OFF, 0)?;
 
@@ -332,7 +362,8 @@ fn try_fastpath(ctx: &XdpContext) -> Result<u32, ()> {
 
     let frame_len = (ctx.data_end() - ctx.data()) as u64;
     note_fastpathed(frame_len);
-    debug!(ctx, "relay xdp fast path: forwarded");
+    // No per-packet success log — see the lookup comment above; the STATS
+    // counters are the observable.
     Ok(xdp_action::XDP_TX)
 }
 
