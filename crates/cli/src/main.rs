@@ -16,7 +16,9 @@ use tracing::info;
 mod telemetry;
 
 use ferrum_client_core::data_plane::run_mesh_session_supervised;
-use ferrum_client_core::{ClientIdentity, ControlClient, FerrumClient, ReconnectPolicy};
+use ferrum_client_core::{
+    resolve_dns_servers, ClientIdentity, ControlClient, FerrumClient, ReconnectPolicy,
+};
 use ferrum_core::config::{Cidr, Config, TransportMode};
 use ferrum_core::keys::KeyPair;
 use ferrum_transport::{JitteredTransport, UdpMeshTransport, UdpTransport};
@@ -538,6 +540,21 @@ async fn up_mesh(
                 .context("publishing candidates to coordinator")?;
         }
     }
+    // Leak-protection M1 (PRD leak-protection.md): resolve the DNS servers this
+    // node will use once enforcement lands — a local `[dns] servers` override
+    // wins, else the coordinator-advertised list. Enforcement is M2; for now
+    // log the resolution so operators can see it (and that DNS is unprotected).
+    let advertised_dns = control.advertised_dns(&public_key).await.unwrap_or(None);
+    let dns = resolve_dns_servers(&config.dns.servers, advertised_dns);
+    if dns.is_empty() {
+        tracing::warn!("no DNS servers configured or advertised; DNS is unprotected");
+    } else {
+        info!(
+            ?dns,
+            "resolved DNS servers (not yet enforced — leak-protection M2)"
+        );
+    }
+
     // The supervised session opens its own (token-carrying) control channels.
     drop(control);
 

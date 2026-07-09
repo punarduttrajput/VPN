@@ -36,6 +36,14 @@ pub struct Config {
     /// Phase 1 configs keep working unchanged.
     #[serde(default)]
     pub transport: TransportConfig,
+    /// DNS leak protection (PRD `leak-protection.md`). Defaults to empty, so
+    /// existing configs keep working unchanged.
+    #[serde(default)]
+    pub dns: DnsConfig,
+    /// Leak-protection policy knobs (PRD `leak-protection.md`). Defaults keep
+    /// existing configs working unchanged.
+    #[serde(default)]
+    pub leak_protection: LeakProtectionConfig,
 }
 
 /// Which network transport carries the encrypted tunnel (PRD Phase 2, FR6).
@@ -94,6 +102,43 @@ pub struct TransportConfig {
     /// off. Both peers configure this independently.
     #[serde(default)]
     pub jitter_ms: Option<u16>,
+}
+
+/// The `[dns]` config block (PRD `leak-protection.md`, FR2): resolvers to use
+/// while the tunnel is up, reachable *through* the tunnel (mesh addresses).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DnsConfig {
+    /// Resolver IP addresses (not `ip:port` — DNS uses its standard ports).
+    /// A non-empty list is a **local override**; when empty (the default),
+    /// the coordinator-advertised list is used instead — the same
+    /// local-override-else-advertised order as `transport.relay`.
+    #[serde(default)]
+    pub servers: Vec<String>,
+}
+
+/// IPv6 leak policy while connected (PRD `leak-protection.md`, FR2/G3).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Ipv6LeakPolicy {
+    /// Block IPv6 off-tunnel when the tunnel has no v6 address; route it
+    /// through the tunnel when it does. The safe default.
+    #[default]
+    Auto,
+    /// Always block IPv6 leaving outside the tunnel (loopback + link-local
+    /// exempt).
+    Block,
+    /// Require IPv6 to route through the tunnel (the tunnel must carry v6).
+    Tunnel,
+    /// No IPv6 leak protection.
+    Off,
+}
+
+/// The `[leak_protection]` config block (PRD `leak-protection.md`).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LeakProtectionConfig {
+    /// IPv6 policy; defaults to `auto`.
+    #[serde(default)]
+    pub ipv6: Ipv6LeakPolicy,
 }
 
 /// Configuration for the remote peer.
@@ -238,6 +283,13 @@ impl Config {
             relay
                 .parse::<SocketAddr>()
                 .map_err(|e| Error::ConfigInvalid(format!("transport.relay '{relay}': {e}")))?;
+        }
+
+        // DNS servers are bare IPs (DNS uses its standard ports), not ip:port.
+        for server in &self.dns.servers {
+            server.parse::<std::net::IpAddr>().map_err(|e| {
+                Error::ConfigInvalid(format!("dns.servers '{server}' is not an IP address: {e}"))
+            })?;
         }
 
         Ok(())
@@ -442,6 +494,40 @@ mod tests {
         );
         let cfg: Config = toml::from_str(&toml_str).unwrap();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn dns_and_leak_protection_default_off() {
+        let cfg: Config = toml::from_str(&valid_toml()).unwrap();
+        assert!(cfg.dns.servers.is_empty());
+        assert_eq!(cfg.leak_protection.ipv6, Ipv6LeakPolicy::Auto);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn parses_dns_and_leak_protection_blocks() {
+        let toml_str = format!(
+            "{}\n[dns]\nservers = [\"10.99.0.53\", \"fd00::53\"]\n\n[leak_protection]\nipv6 = \"block\"\n",
+            valid_toml()
+        );
+        let cfg: Config = toml::from_str(&toml_str).unwrap();
+        assert_eq!(cfg.dns.servers, vec!["10.99.0.53", "fd00::53"]);
+        assert_eq!(cfg.leak_protection.ipv6, Ipv6LeakPolicy::Block);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_dns_server_that_is_not_an_ip() {
+        // ip:port is the usual mistake — DNS servers are bare IPs.
+        let toml_str = format!("{}\n[dns]\nservers = [\"10.99.0.53:53\"]\n", valid_toml());
+        let cfg: Config = toml::from_str(&toml_str).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_ipv6_policy() {
+        let toml_str = format!("{}\n[leak_protection]\nipv6 = \"nope\"\n", valid_toml());
+        assert!(toml::from_str::<Config>(&toml_str).is_err());
     }
 
     #[test]
