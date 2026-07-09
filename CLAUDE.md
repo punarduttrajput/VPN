@@ -73,7 +73,7 @@ cargo test  -p ferrum-tunnel --features real-tun,helper-ipc  # privileged-helper
 [crates/client-core/bindings/README.md](crates/client-core/bindings/README.md).
 Real-device/throughput checks live in [scripts/verify-linux.sh](scripts/verify-linux.sh)
 (root + iproute2 + iperf3; runs both peers in netns). Opt-in env flags:
-`TEST_QUIC=1`, `TEST_MESH=1`, `MESH_QUIC=1`, `STRICT_THROUGHPUT=1`.
+`TEST_QUIC=1`, `TEST_MESH=1`, `MESH_QUIC=1`, `TEST_LEAKGUARD=1`, `STRICT_THROUGHPUT=1`.
 
 ## Conventions
 

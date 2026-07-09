@@ -65,6 +65,13 @@
           <input id="kill_switch" type="checkbox" />
           Kill-switch <span id="kill-switch-state" class="badge">off</span>
         </label>
+        <!-- Leak-protection state for this session (PRD leak-protection.md M5):
+             set from the backend's "leak-protection" event at connect, reset on
+             disconnect. Warns honestly when DNS has no resolver to hide behind. -->
+        <div class="chips">
+          <span id="dns-chip" class="chip off" title="Whether system DNS is pointed at a tunnel resolver while connected">DNS: —</span>
+          <span id="v6-chip" class="chip off" title="Whether off-tunnel IPv6 is blocked while connected">IPv6: —</span>
+        </div>
         <p id="privilege-note" class="hint"></p>
       </section>
 
@@ -92,6 +99,17 @@
           </label>
           <label>Relay override (ip:port, optional)
             <input id="relay" type="text" placeholder="leave empty to use coordinator's" />
+          </label>
+          <label>DNS override (IPs, comma-separated, optional)
+            <input id="dns_servers" type="text" placeholder="leave empty to use coordinator's" />
+          </label>
+          <label>IPv6 leak policy
+            <select id="ipv6_policy">
+              <option value="" selected>auto — block unless the tunnel carries IPv6</option>
+              <option value="block">block</option>
+              <option value="tunnel">tunnel</option>
+              <option value="off">off</option>
+            </select>
           </label>
         </div>
       </details>
