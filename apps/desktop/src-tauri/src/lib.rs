@@ -26,11 +26,10 @@
 //! Both privilege models share [`dataplane`] for the actual bring-up and
 //! [`ipc::ConnectConfig`] as the parameter bundle.
 
-mod identity;
 pub mod dataplane;
+mod identity;
 pub mod ipc;
 mod killswitch;
-#[cfg(not(windows))]
 mod leakguard;
 
 #[cfg(windows)]

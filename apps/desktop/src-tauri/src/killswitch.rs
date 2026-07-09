@@ -36,11 +36,13 @@
 
 use std::net::IpAddr;
 
-/// A single platform-neutral firewall rule the kill-switch needs installed. This
-/// is the Windows analog of `ferrum_tunnel::firewall::engage_script`'s text: a
-/// declarative description of the leak-block ruleset that the WFP layer
-/// ([`wfp`]) translates into concrete filters, kept pure so the *rule logic*
-/// is unit-testable without WFP or admin.
+/// A single platform-neutral firewall rule the kill-switch or leak guard needs
+/// installed. This is the Windows analog of the Linux `nft` script text: a
+/// declarative description of a ruleset that the WFP layer ([`wfp`])
+/// translates into concrete filters, kept pure so the *rule logic* is
+/// unit-testable without WFP or admin. The kill-switch and the leak guard
+/// ([`crate::leakguard`]) each build their own spec list and install it under
+/// their own WFP namespace ([`wfp::Namespace`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
 pub enum FilterSpec {
@@ -53,6 +55,18 @@ pub enum FilterSpec {
     /// Permit egress to one remote address — the coordinator/relay endpoints, so
     /// the control plane can still reconnect through the block.
     AllowRemote(IpAddr),
+    /// Block plaintext DNS (53) and DoT (853) to any remote, v4 + v6 — the leak
+    /// guard's DNS lock. Lowest weight, so the resolver/tunnel permits win.
+    BlockDnsPorts,
+    /// Permit DNS (53/853) to one approved resolver (leak guard).
+    AllowDnsTo(IpAddr),
+    /// Block all outbound IPv6 — the leak guard's v6 policy. Lowest weight.
+    BlockAllV6,
+    /// Permit IPv6 link-local destinations (`fe80::/10`) — LAN housekeeping the
+    /// v6 block must not break (mirrors the Linux exemption; kernel-originated
+    /// neighbor discovery never reaches the ALE connect layer, so it needs no
+    /// exemption here).
+    AllowV6LinkLocal,
 }
 
 /// Build the ordered set of [`FilterSpec`]s that engage the kill-switch on `iface`,
@@ -114,7 +128,7 @@ impl KillSwitch {
         }
         #[cfg(target_os = "windows")]
         {
-            match wfp::engage(&engage_filters(iface, allow_ips)) {
+            match wfp::engage(&wfp::KILL_SWITCH, &engage_filters(iface, allow_ips)) {
                 Ok(ids) => {
                     self.filter_ids = ids;
                     self.applied = true;
@@ -161,7 +175,7 @@ impl KillSwitch {
             if !self.applied {
                 return;
             }
-            match wfp::disengage(&self.filter_ids) {
+            match wfp::disengage(&wfp::KILL_SWITCH, &self.filter_ids) {
                 Ok(()) => log::info!("kill-switch disengaged"),
                 Err(e) => log::warn!("kill-switch disengage: {e}"),
             }
@@ -236,7 +250,7 @@ pub(crate) fn ask_helper(
 /// process dies mid-engage (same as the Linux table); [`KillSwitch::disengage`] on
 /// drop / app-exit and on the release signal handles teardown.
 #[cfg(target_os = "windows")]
-mod wfp {
+pub(crate) mod wfp {
     use super::FilterSpec;
     use std::net::IpAddr;
     use windows::core::{Result, GUID, PCWSTR, PWSTR};
@@ -245,14 +259,36 @@ mod wfp {
     use windows::Win32::NetworkManagement::Ndis::NET_LUID_LH;
     use windows::Win32::NetworkManagement::WindowsFilteringPlatform::*;
 
-    // Stable keys identifying our provider + sublayer (our private WFP namespace,
-    // like the dedicated `nft` table on Linux). Distinct random GUIDs.
-    const PROVIDER_KEY: GUID = GUID::from_u128(0xfe110a73_5b2c_4d8e_9f01_a2b3c4d5e6f7);
-    const SUBLAYER_KEY: GUID = GUID::from_u128(0xfe110a73_5b2c_4d8e_9f02_a2b3c4d5e6f7);
+    /// A private WFP namespace — provider + sublayer keys and a display name —
+    /// the analog of a dedicated `nft` table on Linux. The kill-switch and the
+    /// leak guard each install under their own, so either engages/tears down
+    /// without touching the other's filters.
+    pub(crate) struct Namespace {
+        provider: GUID,
+        sublayer: GUID,
+        name: &'static str,
+    }
 
-    // Weights within our sublayer: permits beat the catch-all block.
+    /// The kill-switch's namespace (stable random GUIDs).
+    pub(crate) const KILL_SWITCH: Namespace = Namespace {
+        provider: GUID::from_u128(0xfe110a73_5b2c_4d8e_9f01_a2b3c4d5e6f7),
+        sublayer: GUID::from_u128(0xfe110a73_5b2c_4d8e_9f02_a2b3c4d5e6f7),
+        name: "Ferrum Kill-Switch",
+    };
+
+    /// The leak guard's namespace (PRD leak-protection.md M3).
+    pub(crate) const LEAK_GUARD: Namespace = Namespace {
+        provider: GUID::from_u128(0xfe110a73_5b2c_4d8e_9f03_a2b3c4d5e6f7),
+        sublayer: GUID::from_u128(0xfe110a73_5b2c_4d8e_9f04_a2b3c4d5e6f7),
+        name: "Ferrum Leak-Guard",
+    };
+
+    // Weights within one sublayer: permits beat the catch-all block.
     const WEIGHT_BLOCK: u8 = 0;
     const WEIGHT_PERMIT: u8 = 10;
+
+    // Remote ports the leak guard's DNS lock covers: plaintext DNS + DoT.
+    const DNS_PORTS: [u16; 2] = [53, 853];
 
     // FwpmEngineOpen0 authentication service: Windows authentication (RPC_C_AUTHN_WINNT).
     const RPC_C_AUTHN_WINNT: u32 = 10;
@@ -267,9 +303,9 @@ mod wfp {
         WIN32_ERROR(rc).ok()
     }
 
-    /// Engage the kill-switch by installing `specs` as WFP filters. Returns the
-    /// runtime ids of the installed filters (for [`disengage`]).
-    pub fn engage(specs: &[FilterSpec]) -> Result<Vec<u64>> {
+    /// Install `specs` as WFP filters under `ns`. Returns the runtime ids of
+    /// the installed filters (for [`disengage`]).
+    pub fn engage(ns: &Namespace, specs: &[FilterSpec]) -> Result<Vec<u64>> {
         unsafe {
             let mut engine = HANDLE::default();
             check(FwpmEngineOpen0(
@@ -280,7 +316,7 @@ mod wfp {
                 &mut engine,
             ))?;
 
-            let result = install(engine, specs);
+            let result = install(engine, ns, specs);
 
             if result.is_err() {
                 // Roll back the whole batch; nothing committed.
@@ -291,14 +327,14 @@ mod wfp {
         }
     }
 
-    unsafe fn install(engine: HANDLE, specs: &[FilterSpec]) -> Result<Vec<u64>> {
+    unsafe fn install(engine: HANDLE, ns: &Namespace, specs: &[FilterSpec]) -> Result<Vec<u64>> {
         check(FwpmTransactionBegin0(engine, 0))?;
-        ensure_provider(engine)?;
-        ensure_sublayer(engine)?;
+        ensure_provider(engine, ns)?;
+        ensure_sublayer(engine, ns)?;
 
         let mut ids = Vec::new();
         for spec in specs {
-            add_spec(engine, spec, &mut ids)?;
+            add_spec(engine, ns, spec, &mut ids)?;
         }
 
         check(FwpmTransactionCommit0(engine))?;
@@ -308,14 +344,26 @@ mod wfp {
     /// Add the filter(s) for one spec. Backing storage for pointer-valued condition
     /// values (the v6 address, the interface LUID) lives in this stack frame and
     /// stays valid across the synchronous `FwpmFilterAdd0` call inside `add_one`.
-    unsafe fn add_spec(engine: HANDLE, spec: &FilterSpec, ids: &mut Vec<u64>) -> Result<()> {
+    unsafe fn add_spec(
+        engine: HANDLE,
+        ns: &Namespace,
+        spec: &FilterSpec,
+        ids: &mut Vec<u64>,
+    ) -> Result<()> {
         match spec {
             FilterSpec::BlockAll => {
                 for layer in [
                     FWPM_LAYER_ALE_AUTH_CONNECT_V4,
                     FWPM_LAYER_ALE_AUTH_CONNECT_V6,
                 ] {
-                    ids.push(add_one(engine, layer, FWP_ACTION_BLOCK, WEIGHT_BLOCK, &[])?);
+                    ids.push(add_one(
+                        engine,
+                        ns,
+                        layer,
+                        FWP_ACTION_BLOCK,
+                        WEIGHT_BLOCK,
+                        &[],
+                    )?);
                 }
             }
             FilterSpec::AllowLoopback => {
@@ -329,6 +377,7 @@ mod wfp {
                 ] {
                     ids.push(add_one(
                         engine,
+                        ns,
                         layer,
                         FWP_ACTION_PERMIT,
                         WEIGHT_PERMIT,
@@ -345,6 +394,7 @@ mod wfp {
                     ] {
                         ids.push(add_one(
                             engine,
+                            ns,
                             layer,
                             FWP_ACTION_PERMIT,
                             WEIGHT_PERMIT,
@@ -356,7 +406,8 @@ mod wfp {
                 // is up, or on a host without the Windows TUN). Loopback + the
                 // coordinator allowlist still let the control plane reconnect.
                 None => log::debug!(
-                    "kill-switch: tunnel interface {alias} not present; skipping interface permit"
+                    "{}: tunnel interface {alias} not present; skipping interface permit",
+                    ns.name
                 ),
             },
             FilterSpec::AllowRemote(IpAddr::V4(v4)) => {
@@ -366,6 +417,7 @@ mod wfp {
                 )];
                 ids.push(add_one(
                     engine,
+                    ns,
                     FWPM_LAYER_ALE_AUTH_CONNECT_V4,
                     FWP_ACTION_PERMIT,
                     WEIGHT_PERMIT,
@@ -382,6 +434,92 @@ mod wfp {
                 )];
                 ids.push(add_one(
                     engine,
+                    ns,
+                    FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+                    FWP_ACTION_PERMIT,
+                    WEIGHT_PERMIT,
+                    &cond,
+                )?);
+            }
+            FilterSpec::BlockDnsPorts => {
+                // Two conditions on the same field are OR'd by WFP: one filter
+                // per layer covers both ports.
+                let conds = [
+                    uint16_cond(FWPM_CONDITION_IP_REMOTE_PORT, DNS_PORTS[0]),
+                    uint16_cond(FWPM_CONDITION_IP_REMOTE_PORT, DNS_PORTS[1]),
+                ];
+                for layer in [
+                    FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+                    FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+                ] {
+                    ids.push(add_one(
+                        engine,
+                        ns,
+                        layer,
+                        FWP_ACTION_BLOCK,
+                        WEIGHT_BLOCK,
+                        &conds,
+                    )?);
+                }
+            }
+            FilterSpec::AllowDnsTo(IpAddr::V4(v4)) => {
+                // Address AND (53 OR 853): same-field conditions OR, fields AND.
+                let conds = [
+                    uint32_cond(FWPM_CONDITION_IP_REMOTE_ADDRESS, u32::from(*v4)),
+                    uint16_cond(FWPM_CONDITION_IP_REMOTE_PORT, DNS_PORTS[0]),
+                    uint16_cond(FWPM_CONDITION_IP_REMOTE_PORT, DNS_PORTS[1]),
+                ];
+                ids.push(add_one(
+                    engine,
+                    ns,
+                    FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+                    FWP_ACTION_PERMIT,
+                    WEIGHT_PERMIT,
+                    &conds,
+                )?);
+            }
+            FilterSpec::AllowDnsTo(IpAddr::V6(v6)) => {
+                let mut bytes = FWP_BYTE_ARRAY16 {
+                    byteArray16: v6.octets(),
+                };
+                let conds = [
+                    bytearray16_cond(FWPM_CONDITION_IP_REMOTE_ADDRESS, &mut bytes),
+                    uint16_cond(FWPM_CONDITION_IP_REMOTE_PORT, DNS_PORTS[0]),
+                    uint16_cond(FWPM_CONDITION_IP_REMOTE_PORT, DNS_PORTS[1]),
+                ];
+                ids.push(add_one(
+                    engine,
+                    ns,
+                    FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+                    FWP_ACTION_PERMIT,
+                    WEIGHT_PERMIT,
+                    &conds,
+                )?);
+            }
+            FilterSpec::BlockAllV6 => {
+                ids.push(add_one(
+                    engine,
+                    ns,
+                    FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+                    FWP_ACTION_BLOCK,
+                    WEIGHT_BLOCK,
+                    &[],
+                )?);
+            }
+            FilterSpec::AllowV6LinkLocal => {
+                let mut range = FWP_V6_ADDR_AND_MASK {
+                    addr: {
+                        let mut a = [0u8; 16];
+                        a[0] = 0xfe;
+                        a[1] = 0x80;
+                        a
+                    },
+                    prefixLength: 10,
+                };
+                let cond = [v6_range_cond(FWPM_CONDITION_IP_REMOTE_ADDRESS, &mut range)];
+                ids.push(add_one(
+                    engine,
+                    ns,
                     FWPM_LAYER_ALE_AUTH_CONNECT_V6,
                     FWP_ACTION_PERMIT,
                     WEIGHT_PERMIT,
@@ -394,20 +532,21 @@ mod wfp {
 
     unsafe fn add_one(
         engine: HANDLE,
+        ns: &Namespace,
         layer: GUID,
         action: FWP_ACTION_TYPE,
         weight: u8,
         conds: &[FWPM_FILTER_CONDITION0],
     ) -> Result<u64> {
-        let mut name = wide("Ferrum kill-switch");
+        let mut name = wide(ns.name);
         let filter = FWPM_FILTER0 {
             displayData: FWPM_DISPLAY_DATA0 {
                 name: PWSTR(name.as_mut_ptr()),
                 description: PWSTR::null(),
             },
-            providerKey: &PROVIDER_KEY as *const GUID as *mut GUID,
+            providerKey: &ns.provider as *const GUID as *mut GUID,
             layerKey: layer,
-            subLayerKey: SUBLAYER_KEY,
+            subLayerKey: ns.sublayer,
             weight: FWP_VALUE0 {
                 r#type: FWP_UINT8,
                 Anonymous: FWP_VALUE0_0 { uint8: weight },
@@ -425,9 +564,9 @@ mod wfp {
         Ok(id)
     }
 
-    /// Disengage by deleting the filters we installed (by id), then our sublayer and
-    /// provider. Idempotent: a missing object on teardown is fine (already gone).
-    pub fn disengage(filter_ids: &[u64]) -> Result<()> {
+    /// Disengage by deleting the filters `ns` installed (by id), then its sublayer
+    /// and provider. Idempotent: a missing object on teardown is fine (already gone).
+    pub fn disengage(ns: &Namespace, filter_ids: &[u64]) -> Result<()> {
         unsafe {
             let mut engine = HANDLE::default();
             check(FwpmEngineOpen0(
@@ -438,7 +577,7 @@ mod wfp {
                 &mut engine,
             ))?;
 
-            let result = remove(engine, filter_ids);
+            let result = remove(engine, ns, filter_ids);
 
             if result.is_err() {
                 let _ = FwpmTransactionAbort0(engine);
@@ -448,22 +587,22 @@ mod wfp {
         }
     }
 
-    unsafe fn remove(engine: HANDLE, filter_ids: &[u64]) -> Result<()> {
+    unsafe fn remove(engine: HANDLE, ns: &Namespace, filter_ids: &[u64]) -> Result<()> {
         check(FwpmTransactionBegin0(engine, 0))?;
         for &id in filter_ids {
             // Ignore not-found so teardown is idempotent after a partial/stale state.
             let _ = FwpmFilterDeleteById0(engine, id);
         }
-        let _ = FwpmSubLayerDeleteByKey0(engine, &SUBLAYER_KEY);
-        let _ = FwpmProviderDeleteByKey0(engine, &PROVIDER_KEY);
+        let _ = FwpmSubLayerDeleteByKey0(engine, &ns.sublayer);
+        let _ = FwpmProviderDeleteByKey0(engine, &ns.provider);
         check(FwpmTransactionCommit0(engine))?;
         Ok(())
     }
 
-    unsafe fn ensure_provider(engine: HANDLE) -> Result<()> {
-        let mut name = wide("Ferrum Kill-Switch");
+    unsafe fn ensure_provider(engine: HANDLE, ns: &Namespace) -> Result<()> {
+        let mut name = wide(ns.name);
         let provider = FWPM_PROVIDER0 {
-            providerKey: PROVIDER_KEY,
+            providerKey: ns.provider,
             displayData: FWPM_DISPLAY_DATA0 {
                 name: PWSTR(name.as_mut_ptr()),
                 description: PWSTR::null(),
@@ -473,15 +612,15 @@ mod wfp {
         ignore_already_exists(FwpmProviderAdd0(engine, &provider, None))
     }
 
-    unsafe fn ensure_sublayer(engine: HANDLE) -> Result<()> {
-        let mut name = wide("Ferrum Kill-Switch");
+    unsafe fn ensure_sublayer(engine: HANDLE, ns: &Namespace) -> Result<()> {
+        let mut name = wide(ns.name);
         let sublayer = FWPM_SUBLAYER0 {
-            subLayerKey: SUBLAYER_KEY,
+            subLayerKey: ns.sublayer,
             displayData: FWPM_DISPLAY_DATA0 {
                 name: PWSTR(name.as_mut_ptr()),
                 description: PWSTR::null(),
             },
-            providerKey: &PROVIDER_KEY as *const GUID as *mut GUID,
+            providerKey: &ns.provider as *const GUID as *mut GUID,
             weight: 0x100,
             ..Default::default()
         };
@@ -525,6 +664,28 @@ mod wfp {
             conditionValue: FWP_CONDITION_VALUE0 {
                 r#type: FWP_UINT32,
                 Anonymous: FWP_CONDITION_VALUE0_0 { uint32: flag },
+            },
+        }
+    }
+
+    fn uint16_cond(field: GUID, val: u16) -> FWPM_FILTER_CONDITION0 {
+        FWPM_FILTER_CONDITION0 {
+            fieldKey: field,
+            matchType: FWP_MATCH_EQUAL,
+            conditionValue: FWP_CONDITION_VALUE0 {
+                r#type: FWP_UINT16,
+                Anonymous: FWP_CONDITION_VALUE0_0 { uint16: val },
+            },
+        }
+    }
+
+    fn v6_range_cond(field: GUID, val: *mut FWP_V6_ADDR_AND_MASK) -> FWPM_FILTER_CONDITION0 {
+        FWPM_FILTER_CONDITION0 {
+            fieldKey: field,
+            matchType: FWP_MATCH_EQUAL,
+            conditionValue: FWP_CONDITION_VALUE0 {
+                r#type: FWP_V6_ADDR_MASK,
+                Anonymous: FWP_CONDITION_VALUE0_0 { v6AddrMask: val },
             },
         }
     }

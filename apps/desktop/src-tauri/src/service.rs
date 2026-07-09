@@ -27,11 +27,12 @@ use tokio::io::{ReadHalf, WriteHalf};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::sync::{mpsc, watch};
 
-use ferrum_client_core::{ClientEvent, FerrumClient};
+use ferrum_client_core::{ClientEvent, ConnectionState, FerrumClient};
 
 use crate::dataplane::{self, state_name, TUN_IFACE};
 use crate::ipc::{self, ConnectConfig, Event, Request, ServerMessage, PIPE_NAME};
 use crate::killswitch::KillSwitch;
+use crate::leakguard::LeakGuard;
 
 /// Map a core [`ClientEvent`] to the pipe-side [`Event`] the GUI consumes.
 fn map_event(ev: ClientEvent) -> Event {
@@ -123,6 +124,14 @@ async fn run_session(
     let coordinator_ips: Vec<IpAddr> = dataplane::resolve_coordinator_ips(&cfg.coordinator);
     // The service owns kill-switch *enforcement* (WFP needs elevation, which it has).
     let kill_switch = Arc::new(Mutex::new(KillSwitch::default()));
+    // Leak protection (PRD leak-protection.md M3): resolved before bring-up so
+    // the event forwarder can engage as the session reaches `Connected`.
+    let leak_guard = Arc::new(Mutex::new(LeakGuard::default()));
+    let leak_dns: Vec<IpAddr> = dataplane::resolve_dns(&cfg).await;
+    let leak_block_v6 = dataplane::ipv6_block(&cfg);
+    if leak_dns.is_empty() {
+        log::warn!("no DNS servers configured or advertised; DNS is unprotected this session");
+    }
 
     // Outbound frames flow through one mpsc so the writer task is the sole writer.
     let (out_tx, mut out_rx) = mpsc::channel::<ServerMessage>(64);
@@ -147,23 +156,41 @@ async fn run_session(
         }
     });
 
-    // Event forwarder: mirror the core's events to the GUI and enforce the
-    // kill-switch as its block/release signal flips.
+    // Event forwarder: mirror the core's events to the GUI, enforce the
+    // kill-switch as its block/release signal flips, and engage/disengage the
+    // leak guard as the session comes up / goes down.
     let event_tx = out_tx.clone();
     let ks_events = kill_switch.clone();
     let coord_ips = coordinator_ips.clone();
+    let lg_events = leak_guard.clone();
+    let lg_dns = leak_dns.clone();
     let event_task = tokio::spawn(async move {
         use tokio::sync::broadcast::error::RecvError;
         loop {
             match events.recv().await {
                 Ok(ev) => {
-                    if let ClientEvent::TrafficBlocked(blocked) = &ev {
-                        let mut ks = ks_events.lock().unwrap();
-                        if *blocked {
-                            ks.engage(TUN_IFACE, &coord_ips);
-                        } else {
-                            ks.disengage();
+                    match &ev {
+                        ClientEvent::TrafficBlocked(blocked) => {
+                            let mut ks = ks_events.lock().unwrap();
+                            if *blocked {
+                                ks.engage(TUN_IFACE, &coord_ips);
+                            } else {
+                                ks.disengage();
+                            }
                         }
+                        // Only once the tunnel is up (never at boot / before a
+                        // captive portal — NFR2); a repeat `Connected` after a
+                        // reconnect is a no-op inside the guard.
+                        ClientEvent::StateChanged(ConnectionState::Connected) => {
+                            lg_events
+                                .lock()
+                                .unwrap()
+                                .engage(TUN_IFACE, &lg_dns, leak_block_v6);
+                        }
+                        ClientEvent::StateChanged(ConnectionState::Disconnected) => {
+                            lg_events.lock().unwrap().disengage();
+                        }
+                        _ => {}
                     }
                     if event_tx
                         .send(ServerMessage::Event(map_event(ev)))
@@ -220,9 +247,11 @@ async fn run_session(
         let _ = out_tx.send(ServerMessage::Event(Event::Error(e))).await;
     }
 
-    // Teardown: ensure the firewall block is lifted and the tasks stop.
+    // Teardown: ensure the firewall block is lifted, DNS restored, and the
+    // tasks stop — a dead GUI (pipe EOF) or a service stop never strands either.
     sstop_tx.send(true).ok();
     kill_switch.lock().unwrap().disengage();
+    leak_guard.lock().unwrap().disengage();
     event_task.abort();
     request_task.abort();
     // Drop the last sender so the writer task drains and exits, then join it.
