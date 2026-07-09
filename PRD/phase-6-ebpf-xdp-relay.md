@@ -4,9 +4,9 @@
 |---|---|
 | **Product** | Ferrum (Rust) |
 | **Phase** | 6 of 6 — Scale & Acceleration (FR1 drill-down) |
-| **Status** | Draft |
+| **Status** | Implemented (M1–M4); M5 partially done — the kernel program builds, passes the verifier, and attaches on a real Linux host (2026-07-09); live-traffic verification + the NFR1 benchmark remain |
 | **Owner** | punarduttrajput |
-| **Last updated** | 2026-07-06 |
+| **Last updated** | 2026-07-09 |
 | **Depends on** | [phase-6-scale-acceleration.md](phase-6-scale-acceleration.md) FR1; the Phase 4 relay (`RelayServer` / `RelayMeshTransport`, `crates/transport/src/relay.rs`) |
 
 ---
@@ -308,18 +308,25 @@ existing `libc` pattern).
    and testable on any host, including this one).
 2. **M2** — `relay-ebpf`: the XDP program source, in its own standalone
    workspace with a README documenting the exact Linux build/attach steps.
-   **Unbuilt and unverified on this authoring host** — see §10.
+   **Update 2026-07-09: built, verifier-accepted, and attached on a real
+   Linux host** — compiled clean on the first attempt; the verifier's one
+   rejection (the checksum carry-fold `while` loop, "infinite loop
+   detected") is fixed as a fixed two-fold. See `relay-ebpf/README.md`.
 3. **M3** — `relay_xdp.rs` userspace loader: map population mirroring
    `Clients::register`, gateway MAC resolution, stats merge. Cross-compile-
    checked here via the installed `x86_64-unknown-linux-gnu` target
    (can't run, but syntax/type-checks — matching the GSO/GRO precedent).
 4. **M4** — CLI flags + feature wiring (FR5); confirm every existing test
    and build on this host is unaffected with the feature off.
-5. **M5 — Linux follow-up (not done here):** build `relay-ebpf` for real
-   (`rustup toolchain install nightly` + `rust-src` + `cargo install
-   bpf-linker`), load it with `--xdp-iface`/`--xdp-program` against a real
-   interface, and benchmark against the existing userspace relay to
-   validate NFR1.
+5. **M5 — Linux follow-up (partially done, 2026-07-09):** ✅ built for real
+   (rustup nightly + the prebuilt `bpf-linker` v0.10.4 musl binary), ✅
+   loaded + verifier-accepted + attached via `--xdp-iface lo
+   --xdp-program …` (`relay xdp fast path enabled`; two first-load bugs
+   fixed — the loader's `EbpfLogger` drop and the checksum carry-fold
+   loop, both logged in STATUS.md). ⏳ Remaining: **live traffic** through
+   the fast path (XDP doesn't fire on loopback — needs netns+veth or two
+   hosts), the Wireshark checksum capture check, and the NFR1 benchmark
+   against the userspace relay.
 
 ---
 
@@ -333,10 +340,14 @@ existing `libc` pattern).
 - ✅ `ferrum-relay-xdp-common`'s unit tests pass on this host.
 - ✅ `relay_xdp.rs` cross-compile-checks clean on
   `--target x86_64-unknown-linux-gnu`.
-- ⏳ **Deferred to a real Linux host** (tracked, not claimed done here):
-  `relay-ebpf` actually compiles under `bpf-linker`, passes the kernel
-  verifier when loaded, and sustains the NFR1 throughput target against
-  the existing userspace relay as a baseline.
+- ✅ **Done on a real Linux host (2026-07-09):** `relay-ebpf` compiles
+  under `bpf-linker` and **passes the kernel verifier** when loaded via
+  the production loader (attached to `lo` in SKB mode; clean teardown).
+- ⏳ **Still deferred** (tracked, not claimed done): live relay `Data`
+  frames actually take the fast path (needs netns+veth or two hosts —
+  XDP doesn't fire on loopback), fast-pathed packets carry a valid IPv4
+  checksum (Wireshark check), and the NFR1 throughput target holds
+  against the existing userspace relay as a baseline.
 
 ---
 

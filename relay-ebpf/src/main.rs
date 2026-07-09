@@ -37,7 +37,7 @@ use aya_ebpf::macros::{map, xdp};
 use aya_ebpf::maps::{Array, HashMap, PerCpuArray};
 use aya_ebpf::programs::XdpContext;
 use aya_log_ebpf::debug;
-use ferrum_relay_xdp_common::{AddrKey, GatewayInfo, DATA_HEADER, KEY_LEN, TAG_DATA};
+use ferrum_relay_xdp_common::{AddrKey, GatewayInfo, KEY_LEN, TAG_DATA};
 
 /// Mirrors `Clients::by_addr` (`relay.rs`) — a sender's source address to
 /// their public key, so a forwarded frame's rewritten payload can carry the
@@ -197,9 +197,15 @@ fn checksum_update(old_checksum: u16, changed_words: &[(u16, u16)]) -> u16 {
         sum += (!old) as u32;
         sum += new as u32;
     }
-    while (sum >> 16) != 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
+    // Fold with a FIXED two folds, not a `while (sum >> 16) != 0` loop: the
+    // eBPF verifier rejects the loop form ("infinite loop detected" — its
+    // interval analysis can't prove the carry stops regenerating; found on
+    // the first real load, 2026-07-09). Two folds always suffice for this
+    // accumulator: the caller passes at most a handful of word pairs (4
+    // here), so `sum` is at most ~9 * 0xFFFF — the first fold leaves at
+    // most a single carry bit above bit 15, and the second absorbs it.
+    sum = (sum & 0xFFFF) + (sum >> 16);
+    sum = (sum & 0xFFFF) + (sum >> 16);
     !(sum as u16)
 }
 
