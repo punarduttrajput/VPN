@@ -162,6 +162,15 @@ impl FfiFerrumClient {
         self.inner.address()
     }
 
+    /// The DNS resolvers the coordinator advertises for this network (PRD
+    /// leak-protection.md), captured at connect — empty when it advertises
+    /// none. A shell applies its own local override first, then points the OS
+    /// resolver at these (e.g. `VpnService.Builder.addDnsServer` on Android)
+    /// while connected.
+    pub fn advertised_dns(&self) -> Vec<String> {
+        self.inner.advertised_dns()
+    }
+
     /// The current peer list.
     pub fn peers(&self) -> Vec<PeerStatus> {
         self.inner.peers()

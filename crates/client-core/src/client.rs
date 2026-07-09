@@ -159,6 +159,11 @@ struct Inner {
     state: ConnectionState,
     address: Option<String>,
     peers: Vec<PeerStatus>,
+    /// DNS resolvers the coordinator advertises for this network (PRD
+    /// leak-protection.md), captured at connect so a shell can point the OS
+    /// resolver at them (subject to its own local override). Empty when the
+    /// coordinator advertises none.
+    dns_servers: Vec<String>,
     /// Whether the kill-switch is armed (the user's policy choice).
     kill_switch: bool,
     /// Last broadcast value of the derived "block traffic" signal, so
@@ -238,6 +243,18 @@ impl FerrumClient {
             .lock()
             .expect("client mutex poisoned")
             .address
+            .clone()
+    }
+
+    /// The DNS resolvers the coordinator advertises for this network (PRD
+    /// leak-protection.md), captured at connect — empty when it advertises
+    /// none (or before a connect). A shell applies its own local override
+    /// first, then points the OS resolver at these while connected.
+    pub fn advertised_dns(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .expect("client mutex poisoned")
+            .dns_servers
             .clone()
     }
 
@@ -377,10 +394,20 @@ impl FerrumClient {
 
         let peers: Vec<PeerStatus> = plan.peers.into_iter().map(PeerStatus::from_spec).collect();
         let count = peers.len();
+
+        // Advertised DNS (PRD leak-protection.md): best-effort — a client on a
+        // pre-DNS coordinator still connects, just without resolvers to apply.
+        let dns_servers = control
+            .advertised_dns(&identity.public_key)
+            .await
+            .unwrap_or(None)
+            .unwrap_or_default();
+
         {
             let mut inner = self.inner.lock().expect("client mutex poisoned");
             inner.address = Some(plan.address);
             inner.peers = peers;
+            inner.dns_servers = dns_servers;
         }
         self.emit(ClientEvent::PeersUpdated(count as u32));
         Ok(())
@@ -424,6 +451,7 @@ impl FerrumClient {
             let mut inner = self.inner.lock().expect("client mutex poisoned");
             inner.peers.clear();
             inner.address = None;
+            inner.dns_servers.clear();
         }
         self.emit(ClientEvent::PeersUpdated(0));
         self.set_state(ConnectionState::Disconnected);
@@ -576,6 +604,39 @@ mod tests {
         assert_eq!(c.status(), ConnectionState::Disconnected);
         assert!(c.peers().is_empty());
         assert!(c.address().is_none());
+        assert!(c.advertised_dns().is_empty());
+    }
+
+    /// Advertised DNS (PRD leak-protection.md) is captured at connect and
+    /// cleared on disconnect; a coordinator advertising none yields empty.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connect_captures_advertised_dns_and_disconnect_clears_it() {
+        let registry = StdArc::new(StdMutex::new(Registry::new(Ipv4Addr::new(10, 8, 0, 0), 24)));
+        let svc = CoordinatorService::new(registry)
+            .with_dns_servers(vec!["10.99.0.53".into(), "fd00::53".into()]);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(CoordinatorServer::new(svc))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+
+        let c = FerrumClient::new();
+        c.connect(format!("http://{addr}"), &identity("AAA", "phone", ""))
+            .await
+            .unwrap();
+        assert_eq!(c.advertised_dns(), vec!["10.99.0.53", "fd00::53"]);
+
+        c.disconnect();
+        assert!(c.advertised_dns().is_empty());
+
+        // A coordinator advertising no DNS yields empty after connect too.
+        let url = start_coordinator().await;
+        c.connect(url, &identity("AAA", "phone", "")).await.unwrap();
+        assert!(c.advertised_dns().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
