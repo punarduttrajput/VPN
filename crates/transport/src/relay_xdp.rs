@@ -55,7 +55,10 @@ pub enum RelayXdpError {
     #[error("loading the eBPF object at {path}: {source}")]
     Load {
         path: String,
-        source: aya::EbpfError,
+        // Boxed: `aya::EbpfError` is 128+ bytes, and carrying it inline
+        // makes every `Result<_, RelayXdpError>` that large too
+        // (clippy::result_large_err).
+        source: Box<aya::EbpfError>,
     },
     #[error("attaching the XDP program to interface {iface}: {source}")]
     Attach {
@@ -111,15 +114,8 @@ impl RelayXdpLoader {
         // a `Skb` variant, in the version that's really resolvable now.
         let mut ebpf = Ebpf::load_file(program_path).map_err(|source| RelayXdpError::Load {
             path: program_path.display().to_string(),
-            source,
+            source: Box::new(source),
         })?;
-        // Surface the eBPF program's `aya_log_ebpf::debug!` calls through
-        // this process's own `tracing` output. Best-effort: an older
-        // kernel/object without the log map just means no fast-path debug
-        // lines, never a reason to fail attaching.
-        if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf) {
-            debug!("relay xdp: no eBPF logger to attach (continuing): {e}");
-        }
         let program: &mut Xdp = ebpf
             .program_mut(PROGRAM_NAME)
             .ok_or(RelayXdpError::ProgramNotFound(PROGRAM_NAME))?
@@ -135,6 +131,20 @@ impl RelayXdpLoader {
                 iface: iface.to_string(),
                 source: e.into(),
             })?;
+
+        // Surface the eBPF program's `aya_log_ebpf::debug!` calls through
+        // this process's own logger. Best-effort: an older kernel/object
+        // without the log map just means no fast-path debug lines, never a
+        // reason to fail attaching. This MUST happen after `program.load()`
+        // above: `EbpfLogger::init` takes ownership of the `AYA_LOGS` map
+        // fd out of `ebpf`, and dropping the logger closes that fd — done
+        // before `BPF_PROG_LOAD`, that invalidates the map fd already
+        // patched into the program's instructions and the kernel rejects
+        // the load with EBADF ("fd N is not pointing to valid bpf_map";
+        // hit for real on the first live load, 2026-07-09). After a
+        // successful load the kernel holds its own reference to every map
+        // the program uses, so a failed/dropped logger here is harmless.
+        spawn_ebpf_log_reader(&mut ebpf);
 
         let mut relay_port_map: Array<_, u16> = ebpf
             .take_map("RELAY_PORT")
@@ -292,6 +302,48 @@ impl RelayXdpHook for RelayXdpLoader {
             warn!("relay xdp: mirroring key->addr failed: {e}");
         }
     }
+}
+
+/// Start forwarding the XDP program's `aya_log_ebpf::debug!` records to this
+/// process's `log` output (which `tracing` picks up through its `log`
+/// bridge). `aya-log 0.3`'s `EbpfLogger` is not self-driving: `init` only
+/// takes the `AYA_LOGS` ring-buffer map, and the caller must both keep the
+/// logger alive (it owns that map's fd — its `#[must_use]` warns that
+/// dropping it "will close the map FD") and drive `flush()` when the fd is
+/// readable — so the logger moves into a spawned task built on the pattern
+/// in `aya-log`'s own module docs. Every failure path is best-effort
+/// `debug!`-and-return: by the time this runs the program is already loaded
+/// and attached, and fast-path debug lines are never worth failing that.
+fn spawn_ebpf_log_reader(ebpf: &mut Ebpf) {
+    let logger = match aya_log::EbpfLogger::init(ebpf) {
+        Ok(logger) => logger,
+        Err(e) => {
+            debug!("relay xdp: no eBPF logger to attach (continuing): {e}");
+            return;
+        }
+    };
+    let mut logger =
+        match tokio::io::unix::AsyncFd::with_interest(logger, tokio::io::Interest::READABLE) {
+            Ok(logger) => logger,
+            Err(e) => {
+                debug!("relay xdp: could not register the eBPF log reader (continuing): {e}");
+                return;
+            }
+        };
+    tokio::spawn(async move {
+        loop {
+            match logger.readable_mut().await {
+                Ok(mut guard) => {
+                    guard.get_inner_mut().flush();
+                    guard.clear_ready();
+                }
+                Err(e) => {
+                    debug!("relay xdp: eBPF log reader stopped: {e}");
+                    break;
+                }
+            }
+        }
+    });
 }
 
 /// Resolve this relay's own MAC/IP on `iface` plus its default gateway's
