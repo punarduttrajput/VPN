@@ -1,0 +1,238 @@
+# PRD — Phase 6 Addendum: Anycast Edge & Autoscaling
+
+| Field | Value |
+|---|---|
+| **Product** | Ferrum (Rust) |
+| **Phase** | 6 of 6 — Scale & Acceleration (FR2 + FR3 drill-down) |
+| **Status** | Draft — M1 (health/readiness + relay graceful drain) in progress (2026-07-12) |
+| **Owner** | punarduttrajput |
+| **Last updated** | 2026-07-12 |
+| **Depends on** | [phase-6-scale-acceleration.md](phase-6-scale-acceleration.md) FR2/FR3/FR6; the Phase 4 relay (`RelayServer`, `crates/transport/src/relay.rs`); the Phase 3 coordinator (`ferrum-coordinator`) and its relay advertisement (`--relay` → `NetworkMapResponse.relay`); the Phase 6 FR4 metrics endpoints |
+
+---
+
+## 1. Summary
+
+[phase-6-scale-acceleration.md](phase-6-scale-acceleration.md) FR2 calls for an
+anycast-fronted edge (BGP announcement, health-aware withdrawal) and FR3 for
+horizontal autoscaling of coordinators and relays (scale on load, zero-downtime
+rolling deploys, graceful connection draining). Both are written as if the
+fleet already exists; neither can be *fully* verified on this project's single
+Linux development box — there is no BGP-capable provider, no PoP fleet, no
+cloud orchestrator.
+
+What **is** buildable and verifiable here is the software contract every one of
+those infrastructure behaviors depends on, and that contract is currently
+missing entirely:
+
+- **No health signal.** Neither the relay nor the coordinator exposes a
+  liveness or readiness endpoint. An anycast route-controller, load balancer,
+  or orchestrator has nothing to probe; "health-aware withdrawal" (FR2) and
+  rolling deploys (FR3) have no input signal.
+- **No graceful drain.** `ferrum relay` dies on the first SIGTERM: every
+  relayed session on it drops at once. "Drain connections gracefully on
+  scale-in" (FR3) has no mechanism.
+- **No dynamic relay advertisement.** The coordinator advertises one static
+  `--relay` string fixed at process start (`CoordinatorService::with_relay`).
+  A newly scaled-out relay can't enter service, and a draining/dead one can't
+  leave it, without restarting the coordinator — which defeats both FR2's
+  withdrawal and FR3's < 90 s scale-out target (parent NFR4).
+
+This addendum specifies that contract as concrete, locally testable Rust
+milestones (M1–M3), then layers the infrastructure pieces that consume it
+(M4 anycast/BGP, M5 IaC/autoscaling) as committed configuration + documentation
+whose full verification is explicitly marked **external** (needs real network
+infrastructure), the same honesty rule the XDP addendum used for its ≥10 Gbps
+NFR.
+
+---
+
+## 2. Goals & Non-Goals
+
+### Goals
+- G1. A **liveness/readiness surface** (`/healthz`, `/readyz`) on both the
+  relay and the coordinator, served from the existing hand-rolled
+  `--metrics-listen` HTTP endpoints (no new dependency, no new port).
+- G2. **Graceful relay drain**: a draining relay immediately signals
+  not-ready (so anycast/LB/coordinator stop steering new clients to it),
+  refuses *new* client registrations, but keeps forwarding for its existing
+  clients through a configurable grace window — zero mid-session drops caused
+  by the drain itself.
+- G3. **Dynamic relay advertisement**: relays announce themselves to the
+  coordinator with a liveness heartbeat; the coordinator advertises a live,
+  healthy relay in the network map and pushes changes over the existing
+  `WatchNetworkMap` stream, so connected clients fail over without restart.
+- G4. **Anycast integration as configuration**: a committed, documented BGP
+  (bird2) health-gated announce/withdraw setup keyed on `/readyz`, so a real
+  deployment is a config drop, not a design project.
+- G5. Everything additive and opt-in: no flag given → both binaries behave
+  exactly as today.
+
+### Non-Goals
+- ❌ Running our own BGP stack in Rust. Route announcement is the BGP
+  daemon's job (bird2/FRR); Ferrum's job is the health signal that gates it.
+- ❌ A cluster scheduler. Autoscaling *policies* target whatever orchestrator
+  a deployment uses (systemd + cloud ASG, Nomad, k8s); Ferrum provides the
+  metrics, health, and drain semantics they need.
+- ❌ Coordinator multi-writer HA (shared PostgreSQL, leader election). The
+  parent PRD names it; it is a separate work item with real schema
+  consequences (`Store` is SQLite write-through today) and is out of scope
+  for this addendum beyond documenting the boundary.
+- ❌ DDoS mitigation (parent FR6) beyond what drain/health already give —
+  separate addendum when reached.
+
+---
+
+## 3. Current state (what this builds on)
+
+- **Relay** (`crates/transport/src/relay.rs`): `RelayServer` holds a live
+  `key <-> addr` table (no expiry — entries persist until overwritten by a
+  roam/reassign), forwards `Data` frames, and exposes `RelayMetrics`
+  (Prometheus text) via `ferrum relay --metrics-listen`. Clients
+  (`RelayMeshTransport`) re-register every 25 s (`KEEPALIVE`). The optional
+  XDP fast path mirrors the table into kernel maps via `RelayXdpHook` —
+  **any drain semantics must fire the same refusal on both paths** (a
+  drained relay must not keep fast-pathing a *new* flow the userspace path
+  would have refused; existing flows keep working on both paths by design).
+- **Coordinator**: `--relay <addr>` → `CoordinatorService::with_relay` →
+  `NetworkMapResponse.relay`, static for the process lifetime. Clients
+  resolve local-override-else-advertised (`up-mesh`, `run_mesh_session`,
+  FFI). `WatchNetworkMap` already pushes map changes live.
+- **Data plane**: `run_mesh_relayed` + `tunnel::path`'s `PathMachine` already
+  handle per-peer relay↔direct transitions; the Phase 5 supervisor
+  (`run_mesh_session_supervised`) already rebuilds the whole session (and
+  re-resolves the relay) with backoff on any drop. Client-side failover
+  machinery therefore mostly exists — what's missing is the *signal* that a
+  relay is going away.
+- **Observability**: both binaries already serve `/metrics` from a tiny
+  hand-rolled HTTP/1 listener (CLI `serve_relay_metrics`, coordinator
+  `serve_metrics`); SLO alerting (including relay-forwarding burn rate) is
+  live in `deploy/observability/`.
+
+---
+
+## 4. Functional Requirements
+
+### FR1 — Health & readiness endpoints (M1)
+- `GET /healthz` → `200 ok` while the process is serving (liveness).
+- `GET /readyz` → `200 ready` normally; `503 draining` once drain begins
+  (readiness). Bodies are constant strings — nothing user- or peer-derived
+  ever appears (parent NFR5).
+- Served by the **existing** `--metrics-listen` listeners on both the relay
+  and the coordinator; no listener configured → no endpoints (unchanged
+  default), and the relay/coordinator run exactly as today.
+- This endpoint is the input for every downstream consumer: the M4 BGP
+  health gate, an LB target-group check, an orchestrator's
+  readiness/liveness probes, and the M2 coordinator heartbeat judgment.
+
+### FR2 — Graceful relay drain (M1)
+- `RelayServer::begin_drain()`: flips an atomic drain flag. While draining:
+  - `/readyz` returns 503.
+  - `Register` frames from **unknown keys are refused** (dropped + counted);
+    re-registrations (keepalives) from already-registered keys are still
+    honored, so existing sessions' NAT mappings stay fresh.
+  - `Data` forwarding continues unchanged for registered clients.
+- `ferrum relay`: first SIGTERM/Ctrl-C → `begin_drain()` + log, then keep
+  serving for `--drain-grace <secs>` (default **20**; `0` = exit
+  immediately, the pre-existing behavior). A second signal during the grace
+  window exits immediately. Rationale for 20 s: an anycast health check at
+  a typical 3 × 2 s fail threshold withdraws in ≤ 6 s, and the M2
+  coordinator heartbeat judgment fits well inside it, leaving new
+  connections nowhere to land while existing ones ride out the window.
+- New aggregate metrics (NFR5-clean): `ferrum_relay_draining` (gauge 0/1),
+  `ferrum_relay_registers_refused_total` (counter).
+
+### FR3 — Relay registry & dynamic advertisement (M2)
+- New coordinator RPC (shape to be finalized in M2): a relay announces
+  `addr` + heartbeats every N seconds; the coordinator marks a relay dead
+  after K missed beats (or on an explicit goodbye sent when drain begins)
+  and stops advertising it.
+- `NetworkMapResponse.relay` becomes the currently-selected live relay;
+  changes push over `WatchNetworkMap`, and the client session re-resolves
+  (the supervisor already rebuilds on session drop; a pushed relay change
+  must also retarget the relay underlay without a full drop where possible).
+- Static `--relay` remains as a fixed fallback/override for single-relay
+  deployments (unchanged semantics when used).
+- Scale-out acceptance: start a second relay → it heartbeats → coordinator
+  advertises it to new/rebalanced clients, end-to-end in **< 90 s** (parent
+  NFR4) — verifiable entirely in-process/netns.
+
+### FR4 — Client drain handling & zero-drop rolling deploy (M3)
+- Optional relay→client `GOAWAY` frame (new wire tag `0x03`) sent to
+  registered clients when drain begins, so clients re-resolve their relay
+  *proactively* instead of riding the grace window down. Old clients ignore
+  unknown tags (verified — `RelayMeshTransport::recv_from` skips non-`Data`
+  frames), so the frame is backward-compatible.
+- Acceptance (netns bed, mirroring the XDP verification style): two meshed
+  peers relaying traffic; roll the relay (start replacement → drain old →
+  stop old) → **zero data-plane outage longer than the path machine's
+  failover time, zero dropped sessions**.
+
+### FR5 — Anycast/BGP health gate (M4)
+- Committed `deploy/anycast/` (bird2 config template + a health-gate unit
+  that polls `/readyz` and enables/disables the announced prefix, + README):
+  a PoP announces the anycast prefix only while its relay is ready.
+- Local verification: config syntax (`bird -p`) + the health-gate logic
+  against a real draining relay. **External (documented, not claimed):**
+  real BGP announcement/withdrawal convergence and the parent NFR2
+  (< 20 ms RTT for 90% of users) — needs a provider and a fleet.
+
+### FR6 — Autoscaling policies & IaC (M5)
+- Scaling signals from existing metrics (`ferrum_relay_clients_registered`,
+  `ferrum_relay_bytes_forwarded_total` rate, coordinator RPC latency SLI) +
+  the FR1 probes + the FR2 drain lifecycle = everything an ASG/orchestrator
+  needs; committed as documented policy templates alongside Terraform/
+  Ansible skeletons (parent FR5). **External:** live scale-out/-in against
+  a real cloud; NFR4 is *pre*-verified in-process by FR3's acceptance.
+
+---
+
+## 5. Non-Functional Requirements
+
+| ID | Requirement | Target | Verifiable here? |
+|---|---|---|---|
+| NFR-A1 | Drain data-plane impact | Zero drops attributable to drain within the grace window | ✅ netns/in-process |
+| NFR-A2 | Readiness propagation | `/readyz` flips within 1 poll interval of `begin_drain()` | ✅ in-process |
+| NFR-A3 | Scale-out reaction (parent NFR4) | New relay advertised & serving < 90 s | ✅ in-process/netns |
+| NFR-A4 | Privacy (parent NFR5) | Health/heartbeat surfaces carry zero user/peer identity | ✅ tests + constant bodies |
+| NFR-A5 | Anycast entry RTT (parent NFR2) | Nearest-PoP; < 20 ms p90 | ❌ external (fleet) |
+| NFR-A6 | Deploy safety (parent NFR6) | Rolling relay deploy, zero dropped sessions | ✅ netns (M3) |
+
+---
+
+## 6. Milestones
+
+1. **M1 — Health/readiness + graceful relay drain** *(in progress
+   2026-07-12)*: FR1 + FR2; unit + integration tests (drain refuses new
+   keys, keeps existing flows, metrics/endpoints correct).
+2. **M2 — Relay registry & dynamic advertisement**: FR3; heartbeat RPC,
+   health-aware selection, live push, < 90 s scale-out test.
+3. **M3 — Client drain handling + rolling-deploy verification**: FR4;
+   `GOAWAY`, netns zero-drop roll.
+4. **M4 — Anycast/BGP health gate**: FR5; `deploy/anycast/`, gate verified
+   against a draining relay; BGP convergence documented as external.
+5. **M5 — Autoscaling policies + IaC**: FR6; templates + docs; cloud
+   verification external.
+
+---
+
+## 7. Risks & Mitigations
+
+| Risk | Impact | Mitigation |
+|---|---|---|
+| Drain refuses a *roaming existing* client (its keepalive arrives from a new addr, looking like a new key→addr pair) | A NATted client that rebinds mid-drain loses the relay | Refusal keys on **unknown key**, not unknown addr — a roam re-registers a known key and stays honored |
+| XDP fast path keeps serving a flow userspace would refuse | Drain semantics diverge between paths | New flows only enter the XDP maps via `RelayXdpHook::on_register`, which fires only after userspace *accepts* a registration — refusal upstream starves both paths identically; test in M1 |
+| Coordinator advertises a relay that just died between heartbeats | Clients briefly steered at a dead relay | Client supervisor + path machine already retry/fail over; heartbeat interval × K bounds the window; M2 tunes constants |
+| Anycast flow-shift breaks long UDP flows on route change | Mid-session relay swap | Relay is stateless per-frame and clients re-register on the new node (keepalive), same as a roam — document; verified logically in netns (M3) |
+| Health endpoint leaks state (NFR5) | Privacy regression | Constant-string bodies; no counts, no addrs, no keys in `/healthz`/`/readyz` |
+
+---
+
+## 8. Outcome
+
+After M1–M3, a Ferrum deployment can be rolled, scaled out, and scaled in
+without dropping user sessions, and exposes the exact health surface anycast
+routing and autoscalers consume — all tested on this box. M4–M5 make the
+remaining infrastructure work a matter of applying committed configuration,
+with the externally-verifiable claims (BGP convergence, p90 RTT, live cloud
+scaling) explicitly left unclaimed until a real fleet exists.

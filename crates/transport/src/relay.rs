@@ -30,7 +30,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -98,6 +98,12 @@ pub struct RelayMetrics {
     /// potentially dashboards depending on their unlabeled shape.
     xdp_frames_forwarded_total: AtomicU64,
     xdp_bytes_forwarded_total: AtomicU64,
+    /// 1 while the relay is draining (PRD `phase-6-anycast-autoscaling.md`
+    /// FR2), else 0.
+    draining: AtomicU64,
+    /// Register frames refused because they arrived from an unknown key while
+    /// draining.
+    registers_refused_total: AtomicU64,
 }
 
 impl RelayMetrics {
@@ -120,6 +126,16 @@ impl RelayMetrics {
     /// forward).
     fn note_dropped(&self) {
         self.frames_dropped_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The relay entered (or left) the draining state.
+    fn set_draining(&self, draining: bool) {
+        self.draining.store(draining as u64, Ordering::Relaxed);
+    }
+
+    /// A register frame from an unknown key was refused while draining.
+    fn note_register_refused(&self) {
+        self.registers_refused_total.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Publish the XDP fast path's current cumulative totals (PRD FR4) — the
@@ -176,6 +192,18 @@ impl RelayMetrics {
             "ferrum_relay_xdp_bytes_forwarded_total",
             "Total payload bytes forwarded entirely in-kernel by the XDP fast path (0 if not enabled).",
             self.xdp_bytes_forwarded_total.load(Ordering::Relaxed),
+        );
+        gauge(
+            &mut out,
+            "ferrum_relay_draining",
+            "1 while the relay is draining (refusing new clients before shutdown), else 0.",
+            self.draining.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "ferrum_relay_registers_refused_total",
+            "Total register frames refused from unknown keys while draining.",
+            self.registers_refused_total.load(Ordering::Relaxed),
         );
         out
     }
@@ -241,6 +269,10 @@ pub struct RelayServer {
     clients: Mutex<Clients>,
     metrics: Arc<RelayMetrics>,
     xdp_hook: Mutex<Option<Arc<dyn RelayXdpHook>>>,
+    /// Set by [`begin_drain`](Self::begin_drain): refuse registrations from
+    /// unknown keys while continuing to serve existing clients (PRD
+    /// `phase-6-anycast-autoscaling.md` FR2).
+    draining: AtomicBool,
 }
 
 /// The relay's bidirectional `key <-> addr` table.
@@ -286,6 +318,7 @@ impl RelayServer {
             clients: Mutex::new(Clients::default()),
             metrics: Arc::new(RelayMetrics::default()),
             xdp_hook: Mutex::new(None),
+            draining: AtomicBool::new(false),
         })
     }
 
@@ -309,6 +342,28 @@ impl RelayServer {
         *self.xdp_hook.lock().expect("relay xdp hook poisoned") = Some(hook);
     }
 
+    /// Enter the draining state (PRD `phase-6-anycast-autoscaling.md` FR2) —
+    /// call on the shutdown signal, ahead of actually stopping [`serve`](Self::serve).
+    ///
+    /// While draining the relay refuses register frames from **unknown** keys
+    /// (so no new client can land on a relay that's going away — and, because
+    /// the XDP fast path only learns flows through an *accepted* registration,
+    /// the refusal starves both paths identically), but keeps honoring
+    /// keepalive re-registrations from already-registered keys — including
+    /// roams to a new address — and keeps forwarding their data frames, so
+    /// existing sessions ride out the drain window undisturbed. A readiness
+    /// probe (`/readyz`) should report 503 from this point on.
+    pub fn begin_drain(&self) {
+        self.draining.store(true, Ordering::Relaxed);
+        self.metrics.set_draining(true);
+    }
+
+    /// Whether [`begin_drain`](Self::begin_drain) has been called — the
+    /// readiness signal for a `/readyz` endpoint.
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::Relaxed)
+    }
+
     /// Forward frames until the socket errors. Register frames update the table;
     /// data frames are forwarded to the destination key's current address,
     /// rewritten to carry the *source* key. Unknown senders or destinations are
@@ -326,8 +381,17 @@ impl RelayServer {
                 Some(&TAG_REGISTER) if n == 1 + KEY_LEN => {
                     let mut key = [0u8; KEY_LEN];
                     key.copy_from_slice(&frame[1..1 + KEY_LEN]);
+                    let draining = self.is_draining();
                     let (delta, count) = {
                         let mut clients = self.clients.lock().expect("relay table poisoned");
+                        // Draining: only known keys may (re-)register — their
+                        // keepalives and roams stay honored so existing
+                        // sessions survive; new clients must go elsewhere.
+                        if draining && !clients.by_key.contains_key(&key) {
+                            self.metrics.note_register_refused();
+                            debug!(%from, "relay draining: refusing unknown client");
+                            continue;
+                        }
                         let delta = clients.register(key, from);
                         (delta, clients.by_key.len())
                     };
@@ -581,6 +645,10 @@ mod tests {
         // XDP totals default to zero when the fast path isn't enabled.
         assert!(t.contains("ferrum_relay_xdp_frames_forwarded_total 0\n"));
         assert!(t.contains("ferrum_relay_xdp_bytes_forwarded_total 0\n"));
+        // Drain metrics default to "not draining, nothing refused".
+        assert!(t.contains("# TYPE ferrum_relay_draining gauge"));
+        assert!(t.contains("ferrum_relay_draining 0\n"));
+        assert!(t.contains("ferrum_relay_registers_refused_total 0\n"));
     }
 
     #[test]
@@ -749,6 +817,97 @@ mod tests {
             text.contains("ferrum_relay_frames_dropped_total 0\n"),
             "{text}"
         );
+    }
+
+    /// Draining (PRD `phase-6-anycast-autoscaling.md` FR2): a draining relay
+    /// refuses register frames from unknown keys but keeps honoring existing
+    /// clients' keepalives (including roams) and keeps forwarding their data.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_refuses_new_clients_but_serves_existing() {
+        let server = Arc::new(
+            RelayServer::bind("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap(),
+        );
+        let relay = server.local_addr().unwrap();
+        let metrics = server.metrics();
+        tokio::spawn({
+            let server = server.clone();
+            async move {
+                let _ = server.serve().await;
+            }
+        });
+
+        // Two clients register before the drain starts.
+        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        a.send_to(&register_frame(&key(1)), relay).await.unwrap();
+        b.send_to(&register_frame(&key(2)), relay).await.unwrap();
+        for _ in 0..50 {
+            if metrics
+                .render()
+                .contains("ferrum_relay_clients_registered 2\n")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert!(!server.is_draining());
+        server.begin_drain();
+        assert!(server.is_draining());
+        assert!(metrics.render().contains("ferrum_relay_draining 1\n"));
+
+        // A new client's registration is refused: the table stays at 2.
+        let c = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        c.send_to(&register_frame(&key(3)), relay).await.unwrap();
+        for _ in 0..50 {
+            if metrics
+                .render()
+                .contains("ferrum_relay_registers_refused_total 1\n")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let t = metrics.render();
+        assert!(
+            t.contains("ferrum_relay_registers_refused_total 1\n"),
+            "{t}"
+        );
+        assert!(t.contains("ferrum_relay_clients_registered 2\n"), "{t}");
+
+        // An existing client's keepalive re-registration is still honored,
+        // even from a new source address (a mid-drain roam).
+        let a2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        a2.send_to(&register_frame(&key(1)), relay).await.unwrap();
+        for _ in 0..50 {
+            if metrics
+                .render()
+                .contains("ferrum_relay_registers_total 3\n")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let t = metrics.render();
+        assert!(t.contains("ferrum_relay_registers_total 3\n"), "{t}");
+        assert!(
+            t.contains("ferrum_relay_registers_refused_total 1\n"),
+            "{t}"
+        );
+
+        // Existing clients' data still forwards: A (from its roamed socket)
+        // reaches B mid-drain.
+        a2.send_to(&data_frame(&key(2), b"still flowing"), relay)
+            .await
+            .unwrap();
+        let mut buf = [0u8; 128];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), b.recv_from(&mut buf))
+            .await
+            .expect("draining relay did not forward for an existing client")
+            .unwrap();
+        assert_eq!(&buf[..n], &data_frame(&key(1), b"still flowing")[..]);
     }
 
     /// A data frame for an unregistered destination key is dropped (no panic, no

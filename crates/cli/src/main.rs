@@ -43,9 +43,21 @@ enum Command {
         #[arg(long, default_value = "0.0.0.0:51821")]
         listen: String,
         /// Optional address to serve privacy-preserving Prometheus metrics on
-        /// (`GET /metrics`), e.g. `0.0.0.0:9096` (Phase 6 FR4).
+        /// (`GET /metrics`), e.g. `0.0.0.0:9096` (Phase 6 FR4). The same
+        /// listener answers liveness (`GET /healthz`) and readiness
+        /// (`GET /readyz` — 503 while draining) probes for anycast health
+        /// gates, load balancers, and orchestrators (PRD
+        /// `phase-6-anycast-autoscaling.md` FR1).
         #[arg(long)]
         metrics_listen: Option<String>,
+        /// Seconds to keep serving *existing* clients after the first shutdown
+        /// signal, while refusing new registrations and failing readiness
+        /// (`/readyz` → 503) so traffic steering moves on before the relay
+        /// exits (PRD `phase-6-anycast-autoscaling.md` FR2). `0` restores the
+        /// old exit-immediately behavior; a second signal during the grace
+        /// window also exits immediately.
+        #[arg(long, default_value_t = 20)]
+        drain_grace: u64,
         /// Optional OTLP collector endpoint to export tracing spans to, e.g.
         /// `http://localhost:4317` (Phase 6 FR4; requires the `otlp` feature).
         #[arg(long)]
@@ -133,6 +145,7 @@ fn main() -> Result<()> {
         Command::Relay {
             listen,
             metrics_listen,
+            drain_grace,
             otlp_endpoint,
             xdp_iface,
             xdp_program,
@@ -142,6 +155,7 @@ fn main() -> Result<()> {
             .block_on(relay(
                 &listen,
                 metrics_listen.as_deref(),
+                drain_grace,
                 otlp_endpoint.as_deref(),
                 xdp_iface.as_deref(),
                 xdp_program.as_deref(),
@@ -187,12 +201,19 @@ fn keygen() {
 /// Phase 4 M3: run the public-key-keyed relay until interrupted. The relay only
 /// forwards opaque (already-encrypted) datagrams between registered peers, so it
 /// needs no keys of its own. With `metrics_listen` set, also serve
-/// privacy-preserving Prometheus metrics on `GET /metrics` (Phase 6 FR4).
-/// `xdp_iface`/`xdp_program` opt into the eBPF fast path (PRD
+/// privacy-preserving Prometheus metrics on `GET /metrics` (Phase 6 FR4) plus
+/// `GET /healthz` / `GET /readyz` probes (PRD `phase-6-anycast-autoscaling.md`
+/// FR1). `xdp_iface`/`xdp_program` opt into the eBPF fast path (PRD
 /// `phase-6-ebpf-xdp-relay.md`) — see [`enable_xdp_fastpath`].
+///
+/// Shutdown (FR2): with `drain_grace > 0`, the first signal starts a drain —
+/// readiness fails, new clients are refused, existing clients keep being
+/// served — and the relay exits when the grace elapses (or on a second
+/// signal). With `drain_grace == 0` the first signal exits immediately.
 async fn relay(
     listen: &str,
     metrics_listen: Option<&str>,
+    drain_grace: u64,
     otlp_endpoint: Option<&str>,
     xdp_iface: Option<&str>,
     xdp_program: Option<&str>,
@@ -205,26 +226,52 @@ async fn relay(
     let addr: SocketAddr = listen
         .parse()
         .with_context(|| format!("parsing --listen '{listen}'"))?;
-    let server = ferrum_transport::RelayServer::bind(addr)
-        .await
-        .with_context(|| format!("binding relay on {addr}"))?;
+    let server = std::sync::Arc::new(
+        ferrum_transport::RelayServer::bind(addr)
+            .await
+            .with_context(|| format!("binding relay on {addr}"))?,
+    );
 
     if let Some(metrics_addr) = metrics_listen {
         let metrics_addr: SocketAddr = metrics_addr
             .parse()
             .with_context(|| format!("parsing --metrics-listen '{metrics_addr}'"))?;
         let metrics = server.metrics();
-        info!(%metrics_addr, "relay metrics enabled");
-        tokio::spawn(serve_relay_metrics(metrics_addr, metrics));
+        info!(%metrics_addr, "relay metrics + health endpoints enabled");
+        tokio::spawn(serve_relay_metrics(metrics_addr, metrics, server.clone()));
     }
 
     enable_xdp_fastpath(&server, addr.port(), xdp_iface, xdp_program).await;
 
     info!(%addr, "relay listening (Ctrl-C to stop)");
+    // The serve loop runs as its own task so it keeps forwarding for existing
+    // clients while the drain window below counts down.
+    let mut serve = tokio::spawn({
+        let server = server.clone();
+        async move { server.serve().await }
+    });
     tokio::select! {
-        result = server.serve() => result.context("relay server")?,
-        _ = shutdown_signal() => info!("relay stopped"),
+        result = &mut serve => result.context("relay serve task")?.context("relay server")?,
+        _ = shutdown_signal() => {
+            if drain_grace == 0 {
+                info!("relay stopped");
+            } else {
+                server.begin_drain();
+                info!(
+                    grace_secs = drain_grace,
+                    "relay draining: readiness failing, new clients refused (signal again to stop now)"
+                );
+                tokio::select! {
+                    result = &mut serve => result.context("relay serve task")?.context("relay server")?,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(drain_grace)) => {
+                        info!("relay drain grace elapsed; stopped");
+                    }
+                    _ = shutdown_signal() => info!("relay stopped (second signal during drain)"),
+                }
+            }
+        }
     }
+    serve.abort();
     Ok(())
 }
 
@@ -287,9 +334,15 @@ async fn enable_xdp_fastpath(
 /// Serve the relay's privacy-preserving metrics (PRD Phase 6 FR4) on a tiny
 /// HTTP/1 endpoint at `GET /metrics` — enough for a Prometheus scraper,
 /// hand-rolled over a `TcpListener` so the CLI gains no HTTP-server dependency.
+/// The same listener answers `GET /healthz` (liveness) and `GET /readyz`
+/// (readiness — 503 once the relay is draining), the probe surface for anycast
+/// health gates, LBs, and orchestrators (PRD `phase-6-anycast-autoscaling.md`
+/// FR1). Probe bodies are constant strings — nothing user- or peer-derived
+/// (NFR5).
 async fn serve_relay_metrics(
     addr: SocketAddr,
     metrics: std::sync::Arc<ferrum_transport::RelayMetrics>,
+    server: std::sync::Arc<ferrum_transport::RelayServer>,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -306,6 +359,7 @@ async fn serve_relay_metrics(
             continue;
         };
         let metrics = metrics.clone();
+        let server = server.clone();
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
             let n = stream.read(&mut buf).await.unwrap_or(0);
@@ -317,6 +371,14 @@ async fn serve_relay_metrics(
                     body.len(),
                     body
                 )
+            } else if buf[..n].starts_with(b"GET /healthz") {
+                plain_response("200 OK", "ok")
+            } else if buf[..n].starts_with(b"GET /readyz") {
+                if server.is_draining() {
+                    plain_response("503 Service Unavailable", "draining")
+                } else {
+                    plain_response("200 OK", "ready")
+                }
             } else {
                 "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                     .to_string()
@@ -325,6 +387,15 @@ async fn serve_relay_metrics(
             let _ = stream.shutdown().await;
         });
     }
+}
+
+/// A minimal `text/plain` HTTP/1 response for the health probes.
+fn plain_response(status: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
 }
 
 /// FR1–FR3: load config, build the session + TUN device + UDP socket, run loop.
