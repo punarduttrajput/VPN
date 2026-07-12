@@ -15,6 +15,7 @@
 
 use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -190,6 +191,14 @@ where
     // Resolve the relay underlay: a local override wins, else whatever the
     // coordinator advertises for this network. Connect it once; the mesh runner
     // aligns its peer table from the map. `None` => direct-only.
+    //
+    // When the relay came from the coordinator's advertisement (no local
+    // override), the session also *tracks* it: the coordinator can retarget
+    // the advertisement live — a relay drains, dies, or a first one scales
+    // out (PRD `phase-6-anycast-autoscaling.md` FR3) — and the watch stream
+    // pushes the change. The session then ends with an error so the
+    // supervisor rebuilds it against the newly-advertised relay.
+    let local_override = relay.is_some();
     let relay = match relay {
         Some(addr) => Some(addr),
         None => control
@@ -197,6 +206,7 @@ where
             .await
             .unwrap_or(None),
     };
+    let tracked_relay = (!local_override).then(|| relay.clone());
     let relay = match relay {
         Some(addr) => Some(connect_relay(&addr, private_key_b64).await?),
         None => None,
@@ -204,17 +214,32 @@ where
 
     let mut stream = control.watch(&identity.public_key).await?;
     let (tx, rx) = mpsc::channel::<Vec<MeshPeer>>(8);
+    // Fired by the watcher when the advertised relay no longer matches the one
+    // this session connected to; ends the mesh loop below.
+    let relay_changed = Arc::new(tokio::sync::Notify::new());
 
     let watch_client = client.clone();
     let priv_b64 = private_key_b64.to_string();
+    let relay_changed_tx = relay_changed.clone();
     let watcher = tokio::spawn(async move {
         loop {
-            match stream.next().await {
-                Ok(Some(specs)) => {
+            match stream.next_update().await {
+                Ok(Some(update)) => {
                     // Keep the facade's peer view + event stream fresh regardless
                     // of whether the specs build into sessions.
-                    watch_client.apply_peers(specs.clone());
-                    match build_mesh_peers(&priv_b64, &specs) {
+                    watch_client.apply_peers(update.peers.clone());
+                    if let Some(connected) = &tracked_relay {
+                        if update.relay != *connected {
+                            info!(
+                                had_relay = connected.is_some(),
+                                has_relay = update.relay.is_some(),
+                                "coordinator retargeted the advertised relay; session will restart"
+                            );
+                            relay_changed_tx.notify_one();
+                            break;
+                        }
+                    }
+                    match build_mesh_peers(&priv_b64, &update.peers) {
                         Ok(peers) => {
                             if tx.send(peers).await.is_err() {
                                 break; // data plane stopped
@@ -232,17 +257,43 @@ where
         }
     });
 
+    // The mesh ends on the caller's shutdown *or* on a relay retarget; the two
+    // are told apart afterwards so a retarget surfaces as a restartable error.
+    let retarget = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mesh_shutdown = {
+        let relay_changed = relay_changed.clone();
+        let retarget = retarget.clone();
+        async move {
+            tokio::select! {
+                _ = shutdown => {}
+                _ = relay_changed.notified() => {
+                    retarget.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+    };
+
     // Start the mesh empty; the watch stream delivers the current peer set
     // immediately, then updates as the network changes. With a relay configured
     // the mesh runs both underlays and selects per peer; otherwise direct only.
     let result = match relay {
-        Some(relay) => run_mesh_relayed(device, transport, relay, Vec::new(), rx, shutdown).await,
-        None => run_mesh(device, transport, Vec::new(), rx, shutdown).await,
+        Some(relay) => {
+            run_mesh_relayed(device, transport, relay, Vec::new(), rx, mesh_shutdown).await
+        }
+        None => run_mesh(device, transport, Vec::new(), rx, mesh_shutdown).await,
     }
     .map_err(|e| Error::DataPlane(e.to_string()));
 
     watcher.abort();
     client.disconnect();
+    if result.is_ok() && retarget.load(std::sync::atomic::Ordering::Relaxed) {
+        // A clean end we caused ourselves: report it as an error so the
+        // supervisor restarts the session against the new advertised relay
+        // (rather than treating it as the caller's shutdown and exiting).
+        return Err(Error::DataPlane(
+            "advertised relay changed; restarting session to retarget".into(),
+        ));
+    }
     result
 }
 
@@ -616,6 +667,87 @@ mod tests {
             endpoint: "127.0.0.1:51820".into(),
             tags: vec![],
         }
+    }
+
+    /// When the session's relay came from the coordinator's advertisement (no
+    /// local override) and the advertisement changes — here: a first relay
+    /// scales out and heartbeats — the session ends with a restartable error
+    /// so the supervisor rebuilds it against the new relay (PRD
+    /// `phase-6-anycast-autoscaling.md` FR3).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_mesh_session_restarts_when_advertised_relay_changes() {
+        let url = start_coordinator().await;
+
+        let me = ferrum_core::keys::KeyPair::generate();
+        let device = MockTun::default();
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let transport = UdpMeshTransport::from_socket(sock);
+
+        let client = FerrumClient::new();
+        let identity = node_identity(&me);
+
+        let (_stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let runner_client = client.clone();
+        let priv_b64 = me.private_base64();
+        let url_runner = url.clone();
+        let handle = tokio::spawn(async move {
+            run_mesh_session(
+                &runner_client,
+                &url_runner,
+                &identity,
+                &priv_b64,
+                &[],
+                device,
+                transport,
+                None, // no local override: the advertised relay is tracked
+                async move {
+                    let _ = stop_rx.await;
+                },
+            )
+            .await
+        });
+
+        wait_for(Duration::from_secs(5), || {
+            client.status() == ConnectionState::Connected
+        })
+        .await;
+
+        // `Connected` fires before the session resolves the advertised relay
+        // and opens its watch stream; a heartbeat landing in that window would
+        // be resolved at startup (correct, but no retarget to observe). Prove
+        // the watch stream is live first: a registering peer must show up in
+        // the facade's peer view, which only the watch stream updates.
+        let _sink = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = ferrum_core::keys::KeyPair::generate();
+        let mut b = ControlClient::connect(url.clone()).await.unwrap();
+        b.register(
+            &peer.public_base64(),
+            "node-b",
+            &_sink.local_addr().unwrap().to_string(),
+            &[],
+        )
+        .await
+        .unwrap();
+        wait_for(Duration::from_secs(5), || client.peers().len() == 1).await;
+
+        // A relay announces itself: the advertisement goes (none) -> addr, the
+        // watch push delivers it, and the session ends asking for a restart.
+        let mut relay_ctl = ControlClient::connect(url.clone()).await.unwrap();
+        relay_ctl
+            .relay_heartbeat("127.0.0.1:51899", false)
+            .await
+            .unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("session did not end on relay retarget")
+            .expect("runner task panicked");
+        let err = result.expect_err("session should end with a restartable error");
+        assert!(
+            err.to_string().contains("advertised relay changed"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(client.status(), ConnectionState::Disconnected);
     }
 
     /// The supervisor retries a failing data-plane build with backoff and reaches

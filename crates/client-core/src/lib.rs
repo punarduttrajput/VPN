@@ -32,7 +32,8 @@ uniffi::setup_scaffolding!();
 
 use ferrum_control_proto::coordinator::coordinator_client::CoordinatorClient;
 use ferrum_control_proto::coordinator::{
-    NetworkMapRequest, PeerInfo, PublishCandidatesRequest, RegisterDeviceRequest, RotateKeyRequest,
+    NetworkMapRequest, PeerInfo, PublishCandidatesRequest, RegisterDeviceRequest,
+    RelayHeartbeatRequest, RotateKeyRequest,
 };
 use thiserror::Error;
 use tonic::transport::Channel;
@@ -241,6 +242,20 @@ impl ControlClient {
         Ok(resp.assigned_cidr)
     }
 
+    /// Announce a relay to the coordinator (or refresh its liveness) so it can
+    /// be advertised to devices in the network map (PRD
+    /// `phase-6-anycast-autoscaling.md` FR3). `draining: true` is the goodbye:
+    /// the coordinator withdraws the relay from advertisement immediately.
+    /// Returns the coordinator-directed heartbeat cadence in seconds.
+    pub async fn relay_heartbeat(&mut self, addr: &str, draining: bool) -> Result<u32, Error> {
+        let req = self.request(RelayHeartbeatRequest {
+            addr: addr.to_string(),
+            draining,
+        });
+        let resp = self.inner.relay_heartbeat(req).await?.into_inner();
+        Ok(resp.interval_secs)
+    }
+
     /// Register then fetch the map, returning a ready-to-apply [`TunnelPlan`].
     pub async fn plan(
         &mut self,
@@ -286,13 +301,31 @@ pub struct NetworkMapStream {
     inner: tonic::Streaming<ferrum_control_proto::coordinator::NetworkMapResponse>,
 }
 
+/// One pushed network-map update, carrying everything a session tracks live:
+/// the peer set plus the coordinator's currently-advertised relay (`None`
+/// when it advertises none) — so a client can notice the advertised relay
+/// changing under it (PRD `phase-6-anycast-autoscaling.md` FR3) without an
+/// extra RPC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapUpdate {
+    pub peers: Vec<PeerSpec>,
+    pub relay: Option<String>,
+}
+
 impl NetworkMapStream {
     /// Await the next peer set, or `None` when the stream ends.
     pub async fn next(&mut self) -> Result<Option<Vec<PeerSpec>>, Error> {
+        Ok(self.next_update().await?.map(|u| u.peers))
+    }
+
+    /// Await the next full [`MapUpdate`] (peers + advertised relay), or `None`
+    /// when the stream ends.
+    pub async fn next_update(&mut self) -> Result<Option<MapUpdate>, Error> {
         match self.inner.message().await? {
-            Some(resp) => Ok(Some(
-                resp.peers.into_iter().map(peer_spec_from_info).collect(),
-            )),
+            Some(resp) => Ok(Some(MapUpdate {
+                peers: resp.peers.into_iter().map(peer_spec_from_info).collect(),
+                relay: Some(resp.relay).filter(|r| !r.is_empty()),
+            })),
             None => Ok(None),
         }
     }

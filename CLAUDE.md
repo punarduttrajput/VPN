@@ -234,15 +234,23 @@ on the new environment before assuming it's still blocked.
   entries; verification harness committed as `crates/transport/examples/relay_traffic.rs`.
   Remaining for FR1: the NFR1 ≥10 Gbps figure (real hardware + native/driver XDP mode + a
   multi-queue sender). **Anycast/autoscaling (FR2/FR3) started** (2026-07-12; PRD:
-  [PRD/phase-6-anycast-autoscaling.md](PRD/phase-6-anycast-autoscaling.md)): M1 landed —
-  `/healthz` + `/readyz` probes on both binaries' `--metrics-listen` listeners and **graceful
-  relay drain** (`ferrum relay --drain-grace`, default 20 s: first signal fails readiness and
-  refuses *new* clients while existing ones keep being served — including mid-drain roams —
-  then exits on grace elapse or a second signal; `ferrum_relay_draining` /
-  `ferrum_relay_registers_refused_total` metrics). Next: M2 relay registry/heartbeat +
-  dynamic relay advertisement (replacing the static `--relay` string; < 90 s scale-out), M3
-  client `GOAWAY` + zero-drop rolling deploy, M4 bird2 health-gated anycast announce, M5
-  autoscaling/IaC templates.
+  [PRD/phase-6-anycast-autoscaling.md](PRD/phase-6-anycast-autoscaling.md)): **M1 + M2
+  landed.** M1 — `/healthz` + `/readyz` probes on both binaries' `--metrics-listen`
+  listeners and **graceful relay drain** (`ferrum relay --drain-grace`, default 20 s: first
+  signal fails readiness and refuses *new* clients while existing ones keep being served —
+  including mid-drain roams — then exits on grace elapse or a second signal;
+  `ferrum_relay_draining` / `ferrum_relay_registers_refused_total` metrics). M2 — **relay
+  registry & dynamic advertisement**: a `RelayHeartbeat` RPC (relays self-announce via
+  `ferrum relay --coordinator <url> --advertise <ip:port>`, heartbeating at the
+  coordinator-directed 15 s cadence; drain sends an immediate `draining: true` goodbye), a
+  coordinator registry with 45 s TTL + sweeper withdrawal and **stable earliest-joined
+  selection**, advertisement changes pushed live over `WatchNetworkMap`
+  (`NetworkMapStream::next_update` carries the relay), and clients on an
+  advertised (non-overridden) relay **restart their session via the supervisor when the
+  advertisement retargets** — live-verified end-to-end (announce → advertised ≈ 1 s;
+  goodbye → withdrawal push ≈ 3 ms; static `--relay` unchanged, disables the registry).
+  Next: M3 client `GOAWAY` + zero-drop rolling deploy, M4 bird2 health-gated anycast
+  announce, M5 autoscaling/IaC templates.
 
 ## Recommended next work (highest-value, buildable in Rust)
 

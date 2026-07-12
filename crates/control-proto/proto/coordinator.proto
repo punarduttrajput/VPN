@@ -20,6 +20,13 @@ service Coordinator {
   // distributed to permitted peers via the network map; republishing replaces
   // the set and pushes a fresh map to watchers.
   rpc PublishCandidates(PublishCandidatesRequest) returns (PublishCandidatesResponse);
+  // Announce a relay to the coordinator and keep it alive (PRD Phase 6,
+  // phase-6-anycast-autoscaling.md FR3 — dynamic relay advertisement). A relay
+  // heartbeats periodically; the coordinator advertises a live relay in the
+  // network map (unless a static `--relay` override is configured) and
+  // withdraws one that misses its heartbeats or says it is draining. Watchers
+  // are pushed a fresh map whenever the advertised relay changes.
+  rpc RelayHeartbeat(RelayHeartbeatRequest) returns (RelayHeartbeatResponse);
   // Rotate a device's static public key (PRD Phase 3, FR3 — key rotation).
   // The device keeps its identity in the network: its assigned tunnel IP, name,
   // endpoint, tags, and candidates are preserved; only the public key changes.
@@ -70,6 +77,17 @@ message PublishCandidatesRequest {
 }
 
 message PublishCandidatesResponse {}
+
+message RelayHeartbeatRequest {
+  string addr = 1;   // the relay's client-reachable UDP listener, "ip:port"
+  bool draining = 2; // goodbye: withdraw this relay from advertisement now
+}
+
+message RelayHeartbeatResponse {
+  // Send the next heartbeat within this many seconds; a relay silent for a
+  // few multiples of this is withdrawn from advertisement.
+  uint32 interval_secs = 1;
+}
 
 message RotateKeyRequest {
   string old_public_key = 1; // the device's current public key
