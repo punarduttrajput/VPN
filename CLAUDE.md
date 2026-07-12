@@ -233,7 +233,16 @@ on the new environment before assuming it's still blocked.
   missing UDP src-port rewrite) — see `relay-ebpf/README.md` and STATUS.md's 2026-07-09/-10
   entries; verification harness committed as `crates/transport/examples/relay_traffic.rs`.
   Remaining for FR1: the NFR1 ≥10 Gbps figure (real hardware + native/driver XDP mode + a
-  multi-queue sender). Anycast, autoscaling not started.
+  multi-queue sender). **Anycast/autoscaling (FR2/FR3) started** (2026-07-12; PRD:
+  [PRD/phase-6-anycast-autoscaling.md](PRD/phase-6-anycast-autoscaling.md)): M1 landed —
+  `/healthz` + `/readyz` probes on both binaries' `--metrics-listen` listeners and **graceful
+  relay drain** (`ferrum relay --drain-grace`, default 20 s: first signal fails readiness and
+  refuses *new* clients while existing ones keep being served — including mid-drain roams —
+  then exits on grace elapse or a second signal; `ferrum_relay_draining` /
+  `ferrum_relay_registers_refused_total` metrics). Next: M2 relay registry/heartbeat +
+  dynamic relay advertisement (replacing the static `--relay` string; < 90 s scale-out), M3
+  client `GOAWAY` + zero-drop rolling deploy, M4 bird2 health-gated anycast announce, M5
+  autoscaling/IaC templates.
 
 ## Recommended next work (highest-value, buildable in Rust)
 

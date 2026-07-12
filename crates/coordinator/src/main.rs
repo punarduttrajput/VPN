@@ -22,6 +22,12 @@ fn arg_value(flag: &str) -> Option<String> {
 /// a `TcpListener` so the coordinator gains no HTTP-server dependency. Runs on its
 /// own port (separate from the gRPC `--listen`). `device_count` is sampled from
 /// the registry at scrape time.
+///
+/// The same listener answers `GET /healthz` (liveness) and `GET /readyz`
+/// (readiness) probes for load balancers and orchestrators (PRD
+/// `phase-6-anycast-autoscaling.md` FR1). The coordinator has no drain state
+/// yet (that's the M2 relay-registry work), so readiness mirrors liveness;
+/// both bodies are constant strings — nothing user-derived (NFR5).
 async fn serve_metrics(addr: SocketAddr, metrics: Arc<Metrics>, registry: Arc<Mutex<Registry>>) {
     let listener = match TcpListener::bind(addr).await {
         Ok(l) => l,
@@ -30,7 +36,7 @@ async fn serve_metrics(addr: SocketAddr, metrics: Arc<Metrics>, registry: Arc<Mu
             return;
         }
     };
-    info!(%addr, "metrics endpoint listening on GET /metrics");
+    info!(%addr, "metrics endpoint listening on GET /metrics (+ /healthz, /readyz)");
     loop {
         let Ok((mut stream, _)) = listener.accept().await else {
             continue;
@@ -41,8 +47,7 @@ async fn serve_metrics(addr: SocketAddr, metrics: Arc<Metrics>, registry: Arc<Mu
             // The request is tiny; one read captures the request line we need.
             let mut buf = [0u8; 1024];
             let n = stream.read(&mut buf).await.unwrap_or(0);
-            let is_metrics_get = buf[..n].starts_with(b"GET /metrics");
-            let response = if is_metrics_get {
+            let response = if buf[..n].starts_with(b"GET /metrics") {
                 let device_count = registry
                     .lock()
                     .expect("registry mutex poisoned")
@@ -54,6 +59,10 @@ async fn serve_metrics(addr: SocketAddr, metrics: Arc<Metrics>, registry: Arc<Mu
                     body.len(),
                     body
                 )
+            } else if buf[..n].starts_with(b"GET /healthz") {
+                plain_response("200 OK", "ok")
+            } else if buf[..n].starts_with(b"GET /readyz") {
+                plain_response("200 OK", "ready")
             } else {
                 "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                     .to_string()
@@ -62,6 +71,15 @@ async fn serve_metrics(addr: SocketAddr, metrics: Arc<Metrics>, registry: Arc<Mu
             let _ = stream.shutdown().await;
         });
     }
+}
+
+/// A minimal `text/plain` HTTP/1 response for the health probes.
+fn plain_response(status: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
 }
 
 #[tokio::main]
