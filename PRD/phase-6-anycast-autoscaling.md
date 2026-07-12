@@ -4,7 +4,7 @@
 |---|---|
 | **Product** | Ferrum (Rust) |
 | **Phase** | 6 of 6 — Scale & Acceleration (FR2 + FR3 drill-down) |
-| **Status** | Draft — M1 (health/readiness + relay graceful drain) in progress (2026-07-12) |
+| **Status** | M1 (health/readiness + relay graceful drain) and M2 (relay registry & dynamic advertisement) implemented and live-verified (2026-07-12); M3–M5 open |
 | **Owner** | punarduttrajput |
 | **Last updated** | 2026-07-12 |
 | **Depends on** | [phase-6-scale-acceleration.md](phase-6-scale-acceleration.md) FR2/FR3/FR6; the Phase 4 relay (`RelayServer`, `crates/transport/src/relay.rs`); the Phase 3 coordinator (`ferrum-coordinator`) and its relay advertisement (`--relay` → `NetworkMapResponse.relay`); the Phase 6 FR4 metrics endpoints |
@@ -142,20 +142,36 @@ NFR.
 - New aggregate metrics (NFR5-clean): `ferrum_relay_draining` (gauge 0/1),
   `ferrum_relay_registers_refused_total` (counter).
 
-### FR3 — Relay registry & dynamic advertisement (M2)
-- New coordinator RPC (shape to be finalized in M2): a relay announces
-  `addr` + heartbeats every N seconds; the coordinator marks a relay dead
-  after K missed beats (or on an explicit goodbye sent when drain begins)
-  and stops advertising it.
-- `NetworkMapResponse.relay` becomes the currently-selected live relay;
-  changes push over `WatchNetworkMap`, and the client session re-resolves
-  (the supervisor already rebuilds on session drop; a pushed relay change
-  must also retarget the relay underlay without a full drop where possible).
-- Static `--relay` remains as a fixed fallback/override for single-relay
-  deployments (unchanged semantics when used).
-- Scale-out acceptance: start a second relay → it heartbeats → coordinator
-  advertises it to new/rebalanced clients, end-to-end in **< 90 s** (parent
-  NFR4) — verifiable entirely in-process/netns.
+### FR3 — Relay registry & dynamic advertisement (M2) — ✅ implemented 2026-07-12
+- **`RelayHeartbeat` RPC** (`coordinator.proto`): a relay announces its
+  client-reachable `addr` and heartbeats at the coordinator-directed cadence
+  (`interval_secs`, currently 15 s); `draining: true` is the goodbye. The RPC
+  is authenticated exactly like every other (`ferrum relay --token-file` for
+  OIDC-protected coordinators).
+- **Coordinator relay registry** (`service.rs`): live entries expire after a
+  45 s TTL (3 missed beats) — enforced lazily at map-build time and by a
+  5 s **sweeper task** (`spawn_relay_sweeper`, spawned automatically when no
+  static `--relay` is given) that also pushes a fresh map to watchers when
+  the passage of time alone changed the advertisement. Selection is
+  **stable**: the earliest-joined live relay is advertised; a newly
+  scaled-out relay takes over only when the current one drains or dies.
+  (Known cosmetic quirk: the sweeper's change detection lags the heartbeat
+  handler's by one tick, so one redundant identical map push can follow a
+  relay's arrival — clients treat it as a no-op.)
+- `NetworkMapResponse.relay` is now the currently-selected live relay;
+  changes push over `WatchNetworkMap`. The client session (no local
+  override) **tracks** the advertised relay via the new
+  `NetworkMapStream::next_update()` and, on a retarget, ends with a
+  restartable error so the supervisor rebuilds it against the new relay.
+  (In-place underlay retargeting without a session restart was considered
+  and deferred to M3 alongside `GOAWAY` — the supervised restart is the same
+  path every other drop takes, and peers simply re-handshake.)
+- Static `--relay` remains a fixed override with unchanged semantics; it
+  disables the registry entirely.
+- Scale-out acceptance **met**: in-process test asserts a watcher learns a
+  newly heartbeating relay within seconds (NFR-A3 « 90 s), and the live
+  two-relay run confirmed announce → advertise ≈ 1 s and goodbye →
+  withdrawal push ≈ 3 ms.
 
 ### FR4 — Client drain handling & zero-drop rolling deploy (M3)
 - Optional relay→client `GOAWAY` frame (new wire tag `0x03`) sent to
@@ -202,11 +218,13 @@ NFR.
 
 ## 6. Milestones
 
-1. **M1 — Health/readiness + graceful relay drain** *(in progress
-   2026-07-12)*: FR1 + FR2; unit + integration tests (drain refuses new
-   keys, keeps existing flows, metrics/endpoints correct).
-2. **M2 — Relay registry & dynamic advertisement**: FR3; heartbeat RPC,
-   health-aware selection, live push, < 90 s scale-out test.
+1. **M1 — Health/readiness + graceful relay drain** ✅ *(2026-07-12)*:
+   FR1 + FR2; unit + integration tests (drain refuses new keys, keeps
+   existing flows, metrics/endpoints correct) + live probe/drain run.
+2. **M2 — Relay registry & dynamic advertisement** ✅ *(2026-07-12)*: FR3;
+   heartbeat RPC, TTL/sweeper withdrawal, stable selection, live watch push,
+   client retarget-restart, < 90 s scale-out test + live two-relay
+   handover run.
 3. **M3 — Client drain handling + rolling-deploy verification**: FR4;
    `GOAWAY`, netns zero-drop roll.
 4. **M4 — Anycast/BGP health gate**: FR5; `deploy/anycast/`, gate verified

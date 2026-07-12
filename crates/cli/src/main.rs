@@ -58,6 +58,27 @@ enum Command {
         /// window also exits immediately.
         #[arg(long, default_value_t = 20)]
         drain_grace: u64,
+        /// Coordinator gRPC URL to announce this relay to, e.g.
+        /// `http://10.0.0.1:50051` (PRD `phase-6-anycast-autoscaling.md` FR3).
+        /// The relay heartbeats at the coordinator-directed cadence so the
+        /// coordinator advertises it to devices, and sends a draining goodbye
+        /// when shutdown begins so it is withdrawn immediately (with
+        /// `--drain-grace 0` the goodbye may not get out; the coordinator then
+        /// withdraws on missed heartbeats). Requires `--advertise`.
+        #[arg(long, requires = "advertise")]
+        coordinator: Option<String>,
+        /// The client-reachable `ip:port` of this relay's UDP listener,
+        /// announced to the coordinator (`--listen` is often a wildcard bind,
+        /// so the reachable address must be stated explicitly). Requires
+        /// `--coordinator`.
+        #[arg(long, requires = "coordinator")]
+        advertise: Option<String>,
+        /// Path to a file holding an OIDC bearer token (JWT) for the
+        /// coordinator's RelayHeartbeat RPC — needed only when the coordinator
+        /// runs with OIDC auth. Read from a file to keep it out of the process
+        /// list.
+        #[arg(long)]
+        token_file: Option<String>,
         /// Optional OTLP collector endpoint to export tracing spans to, e.g.
         /// `http://localhost:4317` (Phase 6 FR4; requires the `otlp` feature).
         #[arg(long)]
@@ -146,6 +167,9 @@ fn main() -> Result<()> {
             listen,
             metrics_listen,
             drain_grace,
+            coordinator,
+            advertise,
+            token_file,
             otlp_endpoint,
             xdp_iface,
             xdp_program,
@@ -156,6 +180,9 @@ fn main() -> Result<()> {
                 &listen,
                 metrics_listen.as_deref(),
                 drain_grace,
+                coordinator.as_deref(),
+                advertise.as_deref(),
+                token_file.as_deref(),
                 otlp_endpoint.as_deref(),
                 xdp_iface.as_deref(),
                 xdp_program.as_deref(),
@@ -210,10 +237,21 @@ fn keygen() {
 /// readiness fails, new clients are refused, existing clients keep being
 /// served — and the relay exits when the grace elapses (or on a second
 /// signal). With `drain_grace == 0` the first signal exits immediately.
+///
+/// With `coordinator` + `advertise` set, the relay announces itself over the
+/// `RelayHeartbeat` RPC (PRD `phase-6-anycast-autoscaling.md` FR3) so the
+/// coordinator advertises it to devices, and sends a draining goodbye when
+/// the drain begins so it is withdrawn from advertisement immediately.
+// Nine parameters, all independent CLI flags of the one relay subcommand;
+// grouping them into a struct would only move the noise, so allow the lint.
+#[allow(clippy::too_many_arguments)]
 async fn relay(
     listen: &str,
     metrics_listen: Option<&str>,
     drain_grace: u64,
+    coordinator: Option<&str>,
+    advertise: Option<&str>,
+    token_file: Option<&str>,
     otlp_endpoint: Option<&str>,
     xdp_iface: Option<&str>,
     xdp_program: Option<&str>,
@@ -243,6 +281,33 @@ async fn relay(
 
     enable_xdp_fastpath(&server, addr.port(), xdp_iface, xdp_program).await;
 
+    // Announce this relay to a coordinator (PRD `phase-6-anycast-autoscaling.md`
+    // FR3): heartbeat at the coordinator-directed cadence; `drain_goodbye`
+    // wakes the loop to send an immediate draining goodbye when drain begins.
+    let drain_goodbye = std::sync::Arc::new(tokio::sync::Notify::new());
+    if let (Some(coordinator), Some(advertise)) = (coordinator, advertise) {
+        let token = match token_file {
+            Some(path) => Some(
+                std::fs::read_to_string(path)
+                    .with_context(|| format!("reading --token-file '{path}'"))?
+                    .trim()
+                    .to_string(),
+            ),
+            None => None,
+        };
+        advertise
+            .parse::<SocketAddr>()
+            .with_context(|| format!("parsing --advertise '{advertise}'"))?;
+        info!(%coordinator, %advertise, "announcing relay to coordinator (RelayHeartbeat)");
+        tokio::spawn(relay_heartbeat_loop(
+            coordinator.to_string(),
+            advertise.to_string(),
+            token,
+            server.clone(),
+            drain_goodbye.clone(),
+        ));
+    }
+
     info!(%addr, "relay listening (Ctrl-C to stop)");
     // The serve loop runs as its own task so it keeps forwarding for existing
     // clients while the drain window below counts down.
@@ -257,6 +322,7 @@ async fn relay(
                 info!("relay stopped");
             } else {
                 server.begin_drain();
+                drain_goodbye.notify_one();
                 info!(
                     grace_secs = drain_grace,
                     "relay draining: readiness failing, new clients refused (signal again to stop now)"
@@ -328,6 +394,69 @@ async fn enable_xdp_fastpath(
         tracing::warn!(
             "relay xdp: --xdp-iface/--xdp-program given, but this binary wasn't built with the `xdp` feature (or isn't running on Linux); running userspace-only"
         );
+    }
+}
+
+/// Keep this relay announced to the coordinator (PRD
+/// `phase-6-anycast-autoscaling.md` FR3): heartbeat `advertise` at whatever
+/// cadence the coordinator directs, reconnecting with a flat backoff on any
+/// control-plane failure. When the relay enters its drain (`drain_goodbye`
+/// fires, or `is_draining()` is observed), send one final `draining: true`
+/// goodbye — the coordinator withdraws the relay immediately — and stop. If
+/// the goodbye can't be delivered (coordinator unreachable), stop anyway: the
+/// coordinator withdraws the relay when its heartbeats lapse.
+async fn relay_heartbeat_loop(
+    coordinator: String,
+    advertise: String,
+    token: Option<String>,
+    server: std::sync::Arc<ferrum_transport::RelayServer>,
+    drain_goodbye: std::sync::Arc<tokio::sync::Notify>,
+) {
+    use std::time::Duration;
+    const RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
+    let mut interval = Duration::from_secs(15); // until the coordinator directs one
+
+    loop {
+        let mut control = match ControlClient::connect(coordinator.clone()).await {
+            Ok(c) => match &token {
+                Some(t) => c.with_token(t.clone()),
+                None => c,
+            },
+            Err(e) => {
+                if server.is_draining() {
+                    tracing::warn!(
+                        "relay heartbeat: coordinator unreachable for the draining goodbye ({e}); \
+                         it will withdraw this relay on missed heartbeats"
+                    );
+                    return;
+                }
+                tracing::warn!("relay heartbeat: coordinator unreachable ({e}); retrying");
+                tokio::time::sleep(RECONNECT_BACKOFF).await;
+                continue;
+            }
+        };
+        loop {
+            let draining = server.is_draining();
+            match control.relay_heartbeat(&advertise, draining).await {
+                Ok(secs) => {
+                    if draining {
+                        info!("relay heartbeat: draining goodbye sent; coordinator withdrew us");
+                        return;
+                    }
+                    if secs > 0 {
+                        interval = Duration::from_secs(u64::from(secs));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("relay heartbeat failed ({e}); reconnecting");
+                    break; // reconnect via the outer loop
+                }
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                _ = drain_goodbye.notified() => {} // send the goodbye now
+            }
+        }
     }
 }
 

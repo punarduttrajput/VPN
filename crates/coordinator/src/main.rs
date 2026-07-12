@@ -173,16 +173,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Advertise a network-wide relay fallback (PRD Phase 4): every device learns
     // it from the network map and uses it as the relay underlay unless locally
-    // overridden. Validated as a socket address so a typo fails fast.
+    // overridden. Validated as a socket address so a typo fails fast. Without
+    // the static override, relays announce themselves via the RelayHeartbeat
+    // RPC (PRD phase-6-anycast-autoscaling.md FR3) and the sweeper withdraws
+    // any that go silent, pushing a fresh map to watchers.
     let svc = match arg_value("--relay") {
         Some(relay) => {
             relay
                 .parse::<SocketAddr>()
                 .map_err(|e| format!("--relay '{relay}': {e}"))?;
-            info!(%relay, "advertising relay fallback to devices");
+            info!(%relay, "advertising static relay fallback to devices (relay registry disabled)");
             svc.with_relay(relay)
         }
-        None => svc,
+        None => {
+            info!("no --relay override; advertising self-announced relays (RelayHeartbeat)");
+            svc.spawn_relay_sweeper(std::time::Duration::from_secs(5));
+            svc
+        }
     };
 
     // Advertise DNS resolvers (PRD leak-protection.md): every device points its
