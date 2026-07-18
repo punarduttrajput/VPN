@@ -1,4 +1,4 @@
-package com.plasmacomp.ferrum
+package com.ferrum.vpn
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -17,8 +17,8 @@ import uniffi.ferrum_client_core.*
 class FerrumVpnService : VpnService() {
 
     companion object {
-        const val ACTION_START = "com.plasmacomp.ferrum.START_VPN"
-        const val ACTION_STOP  = "com.plasmacomp.ferrum.STOP_VPN"
+        const val ACTION_START = "com.ferrum.vpn.START_VPN"
+        const val ACTION_STOP  = "com.ferrum.vpn.STOP_VPN"
 
         const val EXTRA_COORDINATOR = "coordinator"
         const val EXTRA_DEVICE_NAME = "device_name"

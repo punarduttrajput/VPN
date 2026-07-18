@@ -5,7 +5,7 @@
 | **Product** | Ferrum (Rust) |
 | **Phase** | 5 of 6 — Client Applications |
 | **Status** | Draft |
-| **Owner** | punarr@plasmacomp.com |
+| **Owner** | punar@ferrum.dev |
 | **Last updated** | 2026-06-16 |
 | **Depends on** | Phases 1–4 |
 

@@ -22,7 +22,7 @@ exclude = ["apps/desktop/src-tauri", "relay-ebpf"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-authors = ["Plasma Comp"]
+authors = ["punar Rajput <punar@ferrum.dev>"]
 
 [workspace.dependencies]
 # crypto / keys

@@ -5,7 +5,7 @@
 | **Product** | Ferrum (Rust) |
 | **Phase** | 1 of 6 — MVP Data Plane |
 | **Status** | Draft |
-| **Owner** | punarr@plasmacomp.com |
+| **Owner** | punar@ferrum.dev |
 | **Last updated** | 2026-06-16 |
 | **Language / Runtime** | Rust (stable), Tokio async |
 

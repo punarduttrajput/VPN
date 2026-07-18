@@ -1,4 +1,4 @@
-package com.plasmacomp.ferrum.ui
+package com.ferrum.vpn.ui
 
 import android.content.Context
 import androidx.compose.foundation.layout.*
@@ -7,9 +7,9 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
-import com.plasmacomp.ferrum.Curve25519Keygen
-import com.plasmacomp.ferrum.KeystoreHelper
-import com.plasmacomp.ferrum.VpnViewModel
+import com.ferrum.vpn.Curve25519Keygen
+import com.ferrum.vpn.KeystoreHelper
+import com.ferrum.vpn.VpnViewModel
 
 @Composable
 fun SettingsScreen(vm: VpnViewModel) {
