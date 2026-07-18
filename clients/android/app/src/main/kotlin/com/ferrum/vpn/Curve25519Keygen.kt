@@ -1,4 +1,4 @@
-package com.plasmacomp.ferrum
+package com.ferrum.vpn
 
 import uniffi.ferrum_client_core.generateKeypair
 

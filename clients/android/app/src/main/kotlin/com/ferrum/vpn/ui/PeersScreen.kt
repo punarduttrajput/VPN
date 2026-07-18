@@ -1,4 +1,4 @@
-package com.plasmacomp.ferrum.ui
+package com.ferrum.vpn.ui
 
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -11,7 +11,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
-import com.plasmacomp.ferrum.VpnViewModel
+import com.ferrum.vpn.VpnViewModel
 import uniffi.ferrum_client_core.PeerPath
 import uniffi.ferrum_client_core.PeerStatus
 

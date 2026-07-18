@@ -12,4 +12,4 @@
 -dontwarn com.sun.jna.**
 
 # Rust library name
--keep class com.plasmacomp.ferrum.** { *; }
+-keep class com.ferrum.vpn.** { *; }

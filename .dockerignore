@@ -1,0 +1,10 @@
+.git/
+target/
+**/target/
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+clients/android/**/build/
+clients/android/.gradle/
+deploy/*/secrets/

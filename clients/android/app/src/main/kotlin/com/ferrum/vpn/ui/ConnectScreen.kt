@@ -1,4 +1,4 @@
-package com.plasmacomp.ferrum.ui
+package com.ferrum.vpn.ui
 
 import android.app.Activity
 import android.content.Intent
@@ -15,7 +15,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.plasmacomp.ferrum.VpnViewModel
+import com.ferrum.vpn.VpnViewModel
 import uniffi.ferrum_client_core.ConnectionState
 
 @Composable

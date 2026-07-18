@@ -5,7 +5,7 @@
 | **Product** | Ferrum (Rust) |
 | **Phase** | 2 of 6 — Transport & Obfuscation Layer |
 | **Status** | Draft |
-| **Owner** | punarr@plasmacomp.com |
+| **Owner** | punar@ferrum.dev |
 | **Last updated** | 2026-06-16 |
 | **Depends on** | Phase 1 (MVP tunnel) |
 

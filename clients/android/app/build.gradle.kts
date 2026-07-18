@@ -106,11 +106,11 @@ val keystoreFile = rootDir.resolve("keystore.properties")
 if (keystoreFile.exists()) keystoreProps.load(keystoreFile.inputStream())
 
 android {
-    namespace = "com.plasmacomp.ferrum"
+    namespace = "com.ferrum.vpn"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.plasmacomp.ferrum"
+        applicationId = "com.ferrum.vpn"
         minSdk = 26
         targetSdk = 35
         versionCode = 1

@@ -5,7 +5,7 @@
 | **Product** | Ferrum (Rust) |
 | **Phase** | 3 of 6 — Control Plane |
 | **Status** | Draft |
-| **Owner** | punarr@plasmacomp.com |
+| **Owner** | punar@ferrum.dev |
 | **Last updated** | 2026-06-16 |
 | **Depends on** | Phase 1 (tunnel), Phase 2 (transport) |
 

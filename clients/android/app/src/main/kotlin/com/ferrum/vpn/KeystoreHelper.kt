@@ -1,4 +1,4 @@
-package com.plasmacomp.ferrum
+package com.ferrum.vpn
 
 import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
