@@ -12,6 +12,7 @@ const appScreen = $("app-screen");
 const setupName = $("setup-name");
 const setupCoordinator = $("setup-coordinator");
 const setupEndpoint = $("setup-endpoint");
+const setupToken = $("setup-token");
 const setupGenerateBtn = $("setup-generate");
 const setupImportToggleBtn = $("setup-import-toggle");
 const setupImportField = $("setup-import-field");
@@ -66,6 +67,7 @@ setupSaveBtn.addEventListener("click", async () => {
     name: setupName.value.trim() || "desktop",
     endpoint: setupEndpoint.value.trim(),
     coordinator: setupCoordinator.value.trim(),
+    token: setupToken.value.trim() || null,
   };
   if (!profile.private_key) {
     setupErrorMsg("generate or import a private key first");
@@ -91,6 +93,7 @@ function showSetupScreen() {
 
 function showAppScreen() {
   profileNameEl.textContent = `${identity.name} · ${identity.coordinator}`;
+  tokenEl.value = identity.token || "";
   setupScreen.classList.add("hidden");
   appScreen.classList.remove("hidden");
 }
@@ -100,6 +103,7 @@ changeIdentityBtn.addEventListener("click", async () => {
   identity = null;
   setupPrivateKey.value = "";
   setupPublicKey.value = "";
+  setupToken.value = "";
   setupGeneratedField.classList.add("hidden");
   setupImportField.classList.add("hidden");
   setupErrorMsg("");
@@ -115,6 +119,8 @@ const peerCountEl = $("peer-count");
 const logEl = $("log");
 const connectBtn = $("connect");
 const disconnectBtn = $("disconnect");
+const tokenEl = $("token");
+const saveTokenBtn = $("save-token");
 const killSwitchEl = $("kill_switch");
 const killSwitchStateEl = $("kill-switch-state");
 const transportModeEl = $("transport_mode");
@@ -194,6 +200,16 @@ async function refreshPeers() {
   }
 }
 
+saveTokenBtn.addEventListener("click", async () => {
+  identity.token = tokenEl.value.trim() || null;
+  try {
+    await invoke("save_identity", { profile: identity });
+    log("coordinator token saved");
+  } catch (e) {
+    log(`could not save token: ${e}`, true);
+  }
+});
+
 connectBtn.addEventListener("click", async () => {
   try {
     setState("Connecting");
@@ -204,6 +220,7 @@ connectBtn.addEventListener("click", async () => {
         name: identity.name,
         endpoint: identity.endpoint,
         tags: [],
+        token: identity.token || null,
       },
       listenPort: Number($("listen_port").value),
       transport: {

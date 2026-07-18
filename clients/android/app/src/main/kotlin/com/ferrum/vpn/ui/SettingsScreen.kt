@@ -18,6 +18,8 @@ fun SettingsScreen(vm: VpnViewModel) {
     val keystore = remember { KeystoreHelper(ctx) }
     var hasKey by remember { mutableStateOf(keystore.hasPrivateKey()) }
     var showKeygenConfirm by remember { mutableStateOf(false) }
+    var hasToken by remember { mutableStateOf(keystore.hasToken()) }
+    var tokenInput by remember { mutableStateOf("") }
 
     Column(
         modifier = Modifier
@@ -86,6 +88,41 @@ fun SettingsScreen(vm: VpnViewModel) {
                 )
             }
             Switch(checked = ui.killSwitch, onCheckedChange = vm::setKillSwitch)
+        }
+
+        HorizontalDivider()
+
+        Text("Coordinator token", style = MaterialTheme.typography.titleMedium)
+        Text(
+            "Required if the coordinator was built with --oidc-issuer — paste a " +
+                "device token minted with mint-token.py (or your IdP). Stored in the " +
+                "Android Keystore, same as the device private key.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        if (hasToken) {
+            Text("A token is stored.", style = MaterialTheme.typography.bodyMedium)
+            OutlinedButton(onClick = {
+                keystore.clearToken()
+                hasToken = false
+            }) { Text("Clear token") }
+        } else {
+            OutlinedTextField(
+                value = tokenInput,
+                onValueChange = { tokenInput = it },
+                label = { Text("Bearer token") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Button(
+                onClick = {
+                    keystore.saveToken(tokenInput)
+                    tokenInput = ""
+                    hasToken = true
+                },
+                enabled = tokenInput.isNotBlank(),
+            ) { Text("Save token") }
         }
 
         HorizontalDivider()

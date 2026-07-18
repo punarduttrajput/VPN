@@ -26,6 +26,11 @@ pub struct Identity {
     pub name: String,
     pub endpoint: String,
     pub coordinator: String,
+    /// OIDC bearer token, required on every gRPC call when the coordinator is
+    /// built with `--oidc-issuer`. `#[serde(default)]` so identities saved
+    /// before this field existed still deserialize.
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
 fn entry() -> Result<keyring::Entry, String> {
@@ -88,10 +93,21 @@ mod tests {
             name: "desktop".to_string(),
             endpoint: "0.0.0.0:51820".to_string(),
             coordinator: "http://127.0.0.1:50051".to_string(),
+            token: Some("tok".to_string()),
         };
         let json = serde_json::to_string(&id).unwrap();
         let back: Identity = serde_json::from_str(&json).unwrap();
         assert_eq!(back.private_key, id.private_key);
         assert_eq!(back.coordinator, id.coordinator);
+        assert_eq!(back.token, id.token);
+    }
+
+    /// Identities saved before `token` existed have no such key in their JSON;
+    /// `#[serde(default)]` must still deserialize them rather than error.
+    #[test]
+    fn identity_without_token_field_deserializes() {
+        let json = r#"{"private_key":"priv","name":"desktop","endpoint":"0.0.0.0:51820","coordinator":"http://127.0.0.1:50051"}"#;
+        let back: Identity = serde_json::from_str(json).unwrap();
+        assert_eq!(back.token, None);
     }
 }

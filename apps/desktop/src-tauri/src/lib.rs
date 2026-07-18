@@ -131,6 +131,10 @@ struct IdentityArg {
     name: String,
     endpoint: String,
     tags: Vec<String>,
+    /// OIDC bearer token, required on every gRPC call when the coordinator is
+    /// built with `--oidc-issuer` (see `FerrumClient::set_token`).
+    #[serde(default)]
+    token: Option<String>,
 }
 
 /// Transport selection from the connect form. Mirrors the CLI's `[transport]`.
@@ -288,7 +292,7 @@ fn build_config(
         server_name: transport.server_name,
         stun_server: transport.stun_server,
         relay: transport.relay,
-        token: None,
+        token: identity.token,
         kill_switch,
         // Leak protection (PRD leak-protection.md M5): the Advanced form's
         // comma-separated override; empty means coordinator-advertised.

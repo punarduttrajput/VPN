@@ -26,6 +26,9 @@
         <label>Advertised endpoint
           <input id="setup-endpoint" type="text" value="0.0.0.0:51820" />
         </label>
+        <label>Coordinator token (optional — required if the coordinator was built with --oidc-issuer)
+          <input id="setup-token" type="password" placeholder="paste bearer token" />
+        </label>
 
         <div class="key-choice">
           <button id="setup-generate" type="button">Generate a new key</button>
@@ -57,6 +60,10 @@
           <span id="profile-name" class="profile-name"></span>
           <button id="change-identity" class="link" type="button">Change identity</button>
         </div>
+        <label>Coordinator token (paste a new one when it expires)
+          <input id="token" type="password" placeholder="paste bearer token" />
+        </label>
+        <button id="save-token" type="button" class="secondary">Save token</button>
         <div class="actions">
           <button id="connect">Connect</button>
           <button id="disconnect" disabled>Disconnect</button>
