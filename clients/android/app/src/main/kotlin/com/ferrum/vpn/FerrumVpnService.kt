@@ -92,6 +92,9 @@ class FerrumVpnService : VpnService() {
 
         val c = FfiFerrumClient()
         client = c
+        // The coordinator requires a bearer token on every RPC when it's built
+        // with --oidc-issuer; set it before connect()/run() (re-read on reconnect).
+        c.setToken(keystore.loadToken())
 
         scope.launch {
             // Step 1: Control-plane connect to learn the coordinator-assigned address.

@@ -9,6 +9,7 @@ import java.security.KeyStore
 
 private const val PREF_FILE = "ferrum_secure_prefs"
 private const val KEY_PRIVATE_KEY = "wg_private_key"
+private const val KEY_OIDC_TOKEN = "oidc_token"
 
 /**
  * Stores the WireGuard private key in EncryptedSharedPreferences backed by
@@ -40,5 +41,19 @@ class KeystoreHelper(context: Context) {
 
     fun clearPrivateKey() {
         prefs.edit().remove(KEY_PRIVATE_KEY).apply()
+    }
+
+    /** The OIDC bearer token the coordinator's gRPC endpoint requires on every
+     *  RPC when it's built with `--oidc-issuer` (see FfiFerrumClient.setToken). */
+    fun saveToken(token: String) {
+        prefs.edit().putString(KEY_OIDC_TOKEN, token).apply()
+    }
+
+    fun loadToken(): String? = prefs.getString(KEY_OIDC_TOKEN, null)
+
+    fun hasToken(): Boolean = prefs.contains(KEY_OIDC_TOKEN)
+
+    fun clearToken() {
+        prefs.edit().remove(KEY_OIDC_TOKEN).apply()
     }
 }
