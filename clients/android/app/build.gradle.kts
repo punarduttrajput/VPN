@@ -31,7 +31,12 @@ val buildRustJni by tasks.registering {
                 "ANDROID_NDK_HOME not set. " +
                 "Install the NDK via Android Studio SDK Manager or set ANDROID_NDK_HOME."
             )
-        val toolchainBin = file("$ndkHome/toolchains/llvm/prebuilt/windows-x86_64/bin")
+        val hostTag = when {
+            org.gradle.internal.os.OperatingSystem.current().isWindows -> "windows-x86_64"
+            org.gradle.internal.os.OperatingSystem.current().isMacOsX -> "darwin-x86_64"
+            else -> "linux-x86_64"
+        }
+        val toolchainBin = file("$ndkHome/toolchains/llvm/prebuilt/$hostTag/bin")
 
         rustTargets.forEach { (triple, abi) ->
             val libOut = jniOutDir.resolve(abi).also { it.mkdirs() }
@@ -55,7 +60,12 @@ val buildRustJni by tasks.registering {
                     "--target", triple,
                 )
                 environment("CARGO_NET_OFFLINE", "false")
+                // Pin the rustup stable toolchain: rustup's nightly here is bleeding-edge
+                // enough that curve25519-dalek's nightly-only `simd` backend probe
+                // (`feature(stdsimd)`) fails to compile (the feature was renamed/removed).
+                environment("RUSTUP_TOOLCHAIN", "stable")
                 environment("CC_${triple.replace('-', '_')}", "$toolchainBin/$clang")
+                environment("AR_${triple.replace('-', '_')}", "$toolchainBin/llvm-ar")
                 environment("CARGO_TARGET_${triple.replace('-', '_').uppercase()}_LINKER", "$toolchainBin/$clang")
                 environment("ANDROID_NDK_HOME", ndkHome)
             }
@@ -92,6 +102,7 @@ val generateKotlinBindings by tasks.registering {
                 "--language", "kotlin",
                 "--out-dir", bindingsKotlinDir.absolutePath,
             )
+            environment("RUSTUP_TOOLCHAIN", "stable")
             environment("CARGO_NET_OFFLINE", "false")
         }
         logger.lifecycle("Kotlin bindings written to $bindingsKotlinDir")
@@ -158,6 +169,8 @@ android {
         resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" }
     }
 }
+
+tasks.named("preBuild") { dependsOn(generateKotlinBindings) }
 
 dependencies {
     implementation(libs.androidx.core.ktx)
