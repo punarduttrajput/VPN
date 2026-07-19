@@ -4,7 +4,7 @@
 |---|---|
 | **Product** | Ferrum (Rust) |
 | **Phase** | Cross-cutting (Phase 3 control plane, Phase 4 relay, Phase 5 clients/helper, Phase 2 transport) |
-| **Status** | Proposed |
+| **Status** | M1 (fail-closed coordinator auth; token/cert↔key binding) implemented and tested (2026-07-19); M2–M4 open |
 | **Owner** | punarduttrajput |
 | **Last updated** | 2026-07-19 |
 | **Depends on** | Phase 3 coordinator (`ferrum-coordinator`, OIDC verifier), Phase 4 relay (`RelayServer`/`RelayMeshTransport`), Phase 5 privileged helpers (`ferrum-helper`), Phase 2 transports (QUIC/MASQUE) |

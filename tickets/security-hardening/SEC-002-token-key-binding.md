@@ -19,13 +19,13 @@ auth session.
 
 ## Acceptance criteria
 
-- [ ] First registration for a verified identity records the identity→public_key
+- [x] First registration for a verified identity records the identity→public_key
       binding.
-- [ ] A later registration for the same identity with a *different* key is
+- [x] A later registration for the same identity with a *different* key is
       rejected (`FailedPrecondition`) unless it goes through an authorized
       rotation path.
-- [ ] Covers both the OIDC path and the mTLS path.
-- [ ] Test: valid token cannot register a second/unbound key; a key swap is
+- [x] Covers both the OIDC path and the mTLS path.
+- [x] Test: valid token cannot register a second/unbound key; a key swap is
       rejected; an authorized rotation succeeds.
 
 ## Implementation notes
@@ -40,3 +40,27 @@ auth session.
 
 Interacts with SEC-001 (authenticated mode). In open mode there is no identity
 to bind to; document that open mode has no key-binding guarantee.
+
+## Resolution (2026-07-19)
+
+`Registry` gained `identity_keys: HashMap<String, String>` (namespaced
+`oidc:<sub>` / `mtls:<fingerprint>` → public key) plus `bind_identity` /
+`rebind_identity`, persisted under `sqlite` via two new `Store` trait methods
+(`load_bindings`/`upsert_binding`, default no-op for `MemoryStore`). The
+identity for the mTLS path is the **SHA-256 fingerprint of the client's leaf
+certificate DER** (via `tonic::Request::peer_certs()`, gated on the `mtls`
+feature, which now also pulls `ring` for the digest) rather than a parsed
+certificate *subject* — deliberately: it needs no X.509 parsing (no new
+parsing dependency, no attack surface in getting subject-string handling
+right) and is strictly more precise than a subject CN, which an operator's CA
+could in principle reissue to a different key holder. mTLS carries no tags
+claim, so tags remain self-declared under mTLS-only auth (unchanged
+behavior) — only the key binding is enforced for that path.
+
+The "authorized rotation path" is the existing `rotate_key` RPC:
+`rebind_identity` requires the caller's identity to already own
+`old_public_key` (rejecting a rotation of a key it doesn't hold, and — a
+related gap fixed as part of this work — `rotate_key` previously trusted any
+valid token to rotate *any* device's key, not just its own), with a
+first-claim allowance for an identity that has never been bound before
+(covers a pre-SEC-002 legacy device rotated for the first time).

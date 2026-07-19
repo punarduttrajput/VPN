@@ -7,14 +7,32 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 use ferrum_control_proto::coordinator::coordinator_server::CoordinatorServer;
-use ferrum_coordinator::{CoordinatorService, Metrics, Policy, Registry};
+use ferrum_coordinator::{AuthMode, CoordinatorService, Metrics, Policy, Registry};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tonic::transport::Server;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 fn arg_value(flag: &str) -> Option<String> {
     std::env::args().skip_while(|a| a != flag).nth(1)
+}
+
+/// Whether a bare (valueless) flag like `--insecure-no-auth` was passed.
+fn has_flag(flag: &str) -> bool {
+    std::env::args().any(|a| a == flag)
+}
+
+/// Repeat the "running without authentication" warning periodically so it
+/// isn't lost in a scrollback the first time it's logged at startup (PRD
+/// security-hardening.md SEC-001).
+async fn warn_insecure_periodically(period: std::time::Duration) {
+    loop {
+        tokio::time::sleep(period).await;
+        warn!(
+            "coordinator is still running with authentication DISABLED (--insecure-no-auth): \
+             any client can join the mesh and self-assign ACL tags"
+        );
+    }
 }
 
 /// Serve the privacy-preserving metrics (PRD Phase 6 FR4) on a tiny HTTP/1
@@ -96,6 +114,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "0.0.0.0:50051".to_string())
         .parse()?;
 
+    // Authentication posture: fail closed by default (PRD security-hardening.md
+    // SEC-001). Resolved once, up front — before the registry, listeners, or
+    // anything else starts — so a misconfigured coordinator never serves a
+    // single RPC. `--insecure-no-auth` is the only supported opt-out, and it
+    // logs a loud warning at startup and periodically thereafter.
+    #[cfg(feature = "oidc")]
+    let oidc_args = (
+        arg_value("--oidc-issuer"),
+        arg_value("--oidc-audience"),
+        arg_value("--oidc-jwks"),
+    );
+    #[cfg(feature = "oidc")]
+    let oidc_configured = match &oidc_args {
+        (Some(_), Some(_), Some(_)) => true,
+        (None, None, None) => false,
+        _ => return Err("OIDC requires --oidc-issuer, --oidc-audience, and --oidc-jwks".into()),
+    };
+    #[cfg(not(feature = "oidc"))]
+    let oidc_configured = false;
+
+    let auth_mode =
+        ferrum_coordinator::resolve_auth_mode(oidc_configured, has_flag("--insecure-no-auth"))
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    if auth_mode == AuthMode::InsecureNoAuth {
+        warn!(
+            "coordinator starting with authentication DISABLED (--insecure-no-auth): any \
+             client can join the mesh and self-assign ACL tags"
+        );
+        tokio::spawn(warn_insecure_periodically(std::time::Duration::from_secs(
+            300,
+        )));
+    }
+
     // Access policy: load from --policy <file> (TOML), else allow-all (full mesh).
     let policy = match arg_value("--policy") {
         Some(path) => {
@@ -139,15 +190,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "admin-api")]
     let admin_registry = registry.clone();
 
-    // OIDC auth: enable when --oidc-issuer/--oidc-audience/--oidc-jwks are all
-    // provided. Tokens are then required on every RPC and device tags come from
-    // the verified claim instead of the (self-declared) request.
+    // OIDC auth (already validated above via `auth_mode`): when configured,
+    // tokens are required on every RPC and device tags come from the verified
+    // claim instead of the (self-declared) request; otherwise this is only
+    // reached because the operator passed the explicit --insecure-no-auth
+    // opt-out.
     #[cfg(feature = "oidc")]
-    let svc = match (
-        arg_value("--oidc-issuer"),
-        arg_value("--oidc-audience"),
-        arg_value("--oidc-jwks"),
-    ) {
+    let svc = match oidc_args {
         (Some(issuer), Some(audience), Some(jwks_path)) => {
             let jwks_doc = std::fs::read_to_string(&jwks_path)?;
             let jwks = ferrum_coordinator::Jwks::from_json(&jwks_doc)?;
@@ -157,11 +206,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!(%issuer, %audience, jwks = %jwks_path, "OIDC authentication enabled");
             CoordinatorService::with_auth(registry, verifier)
         }
-        (None, None, None) => {
-            info!("no --oidc-* flags; authentication disabled (tags are self-declared)");
-            CoordinatorService::new(registry)
-        }
-        _ => return Err("OIDC requires --oidc-issuer, --oidc-audience, and --oidc-jwks".into()),
+        _ => CoordinatorService::new(registry),
     };
     #[cfg(not(feature = "oidc"))]
     let svc = CoordinatorService::new(registry);

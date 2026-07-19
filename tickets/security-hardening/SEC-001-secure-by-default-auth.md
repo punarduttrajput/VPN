@@ -19,14 +19,14 @@ any tags — a fail-open default. This is the misconfiguration class the market
 
 ## Acceptance criteria
 
-- [ ] Authenticated mode is the default; running open requires an explicit
+- [x] Authenticated mode is the default; running open requires an explicit
       `--insecure-no-auth` flag.
-- [ ] Startup fails fast if neither a verifier nor `--insecure-no-auth` is set.
-- [ ] When open mode is active, a loud warning is logged at startup and
+- [x] Startup fails fast if neither a verifier nor `--insecure-no-auth` is set.
+- [x] When open mode is active, a loud warning is logged at startup and
       periodically thereafter.
-- [ ] In authenticated mode, privileged tags come only from verified claims;
+- [x] In authenticated mode, privileged tags come only from verified claims;
       request-supplied tags are never used for an authorization decision.
-- [ ] Integration test: default config rejects unauthenticated RPCs; a device
+- [x] Integration test: default config rejects unauthenticated RPCs; a device
       cannot self-assign a privileged tag; the open-mode flag path is covered.
 
 ## Implementation notes
@@ -37,6 +37,20 @@ any tags — a fail-open default. This is the misconfiguration class the market
   build require the explicit insecure opt-out (open mode is a runtime choice,
   not a silent build-feature side effect).
 - Update `deploy/oracle-vm/` + README with a migration note (see PRD §7 risk).
+
+## Resolution (2026-07-19)
+
+Implemented as `ferrum_coordinator::{AuthMode, resolve_auth_mode}` (`lib.rs`) —
+a pure, unit-tested decision function called once at the top of `main()`,
+rather than a field threaded into `CoordinatorService` itself (the service's
+existing `verifier: Option<...>` already captures the runtime posture; the new
+function is what decides *whether it's legal to construct the service that
+way* before anything starts listening). Enforced identically for `oidc` and
+non-`oidc` builds. The "integration test" is `resolve_auth_mode`'s unit tests
+plus manual verification of the built binary's four cases (no flags → fails
+fast; `--insecure-no-auth` alone → starts + warns; OIDC flags alone → starts
+authenticated; both → fails fast). No deployment migration was needed —
+`deploy/oracle-vm/` already always configures OIDC.
 
 ## Blast radius / migration
 

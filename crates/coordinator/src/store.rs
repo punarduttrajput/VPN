@@ -27,6 +27,18 @@ pub trait Store: Send + Sync {
     /// rotation, PRD Phase 3 FR3, to drop the record under the old key after the
     /// new one is written). Removing an absent key is not an error.
     fn remove(&self, public_key: &str) -> Result<(), StoreError>;
+
+    /// Load all persisted authenticated-identity -> device-public-key bindings
+    /// (PRD security-hardening.md SEC-002), called once at startup. Default:
+    /// none (backends with no durable state have nothing to load).
+    fn load_bindings(&self) -> Result<Vec<(String, String)>, StoreError> {
+        Ok(Vec::new())
+    }
+    /// Persist an identity -> public-key binding, replacing any prior key
+    /// recorded for that identity. Default: a no-op (in-memory only).
+    fn upsert_binding(&self, _identity: &str, _public_key: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
 }
 
 /// A no-op store: devices live only in memory (lost on restart).
