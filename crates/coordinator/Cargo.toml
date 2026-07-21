@@ -13,8 +13,9 @@ path = "src/main.rs"
 default = []
 # Durable device persistence via bundled SQLite (no system library needed).
 sqlite = ["dep:rusqlite", "dep:serde_json"]
-# Mutual TLS on the gRPC channel (tonic rustls + rcgen test PKI).
-mtls = ["tonic/tls", "dep:rcgen", "dep:rustls"]
+# Mutual TLS on the gRPC channel (tonic rustls + rcgen test PKI). `ring` gives
+# the client-certificate fingerprint used for identity->key binding (SEC-002).
+mtls = ["tonic/tls", "dep:rcgen", "dep:rustls", "dep:ring"]
 # OIDC bearer-token authentication: verify JWTs (RS256/ES256) against a JWKS so
 # device tags become a verified authorization boundary. Offline JWT verify via
 # in-tree `ring` (no external IdP needed to test).

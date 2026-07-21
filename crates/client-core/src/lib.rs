@@ -624,4 +624,68 @@ mod tests {
         };
         assert!(!bad_ok, "client trusting the wrong CA must not succeed");
     }
+
+    /// SEC-002: the mTLS client certificate is bound to the first public key
+    /// it registers, exactly like an OIDC token — a connection presenting the
+    /// same client cert cannot swap in a different device key, but the
+    /// authorized rotation path (`rotate_key`, same connection) succeeds.
+    #[cfg(feature = "mtls")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mtls_binds_client_cert_to_its_first_registered_key() {
+        use ferrum_coordinator::pki;
+
+        let pki = pki::generate().unwrap();
+        let registry = Arc::new(Mutex::new(Registry::new(Ipv4Addr::new(10, 8, 0, 0), 24)));
+        let svc = CoordinatorService::new(registry);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tls = pki::server_tls_config(&pki);
+        tokio::spawn(async move {
+            Server::builder()
+                .tls_config(tls)
+                .unwrap()
+                .add_service(CoordinatorServer::new(svc))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let url = format!("https://{addr}");
+
+        let mut client = ControlClient::connect_mtls(
+            url,
+            &pki.ca_pem,
+            &pki.client_cert_pem,
+            &pki.client_key_pem,
+            "localhost",
+        )
+        .await
+        .unwrap();
+
+        // First registration binds this client cert to "AAA".
+        client
+            .register("AAA", "a", "1.1.1.1:51820", &[])
+            .await
+            .unwrap();
+        // Re-registering the same key is idempotent.
+        client
+            .register("AAA", "a", "2.2.2.2:51820", &[])
+            .await
+            .unwrap();
+
+        // The same client cert cannot register a different key.
+        let swap = client.register("BBB", "b", "1.1.1.1:51820", &[]).await;
+        match swap {
+            Err(Error::Rpc(status)) => {
+                assert_eq!(status.code(), tonic::Code::FailedPrecondition)
+            }
+            other => panic!("expected a FailedPrecondition rpc error, got {other:?}"),
+        }
+
+        // The authorized rotation path succeeds and moves the binding.
+        client.rotate_key("AAA", "CCC").await.unwrap();
+        client
+            .register("CCC", "a", "1.1.1.1:51820", &[])
+            .await
+            .unwrap();
+    }
 }

@@ -32,6 +32,10 @@ impl SqliteStore {
                  tunnel_ip  TEXT NOT NULL,
                  tags       TEXT NOT NULL,
                  candidates TEXT NOT NULL DEFAULT '[]'
+             );
+             CREATE TABLE IF NOT EXISTS identity_bindings (
+                 identity   TEXT PRIMARY KEY,
+                 public_key TEXT NOT NULL
              );",
         )
         .map_err(backend)?;
@@ -130,6 +134,31 @@ impl Store for SqliteStore {
         .map_err(backend)?;
         Ok(())
     }
+
+    fn load_bindings(&self) -> Result<Vec<(String, String)>, StoreError> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        let mut stmt = conn
+            .prepare("SELECT identity, public_key FROM identity_bindings")
+            .map_err(backend)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(backend)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(backend)
+    }
+
+    fn upsert_binding(&self, identity: &str, public_key: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().expect("sqlite mutex poisoned");
+        conn.execute(
+            "INSERT INTO identity_bindings (identity, public_key)
+             VALUES (?1, ?2)
+             ON CONFLICT(identity) DO UPDATE SET public_key = ?2",
+            params![identity, public_key],
+        )
+        .map_err(backend)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -191,6 +220,30 @@ mod tests {
         assert_eq!(loaded[0].public_key, "BBB");
         // Removing an absent key is a no-op, not an error.
         store.remove("AAA").unwrap();
+    }
+
+    #[test]
+    fn identity_bindings_roundtrip_and_upsert() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        assert_eq!(store.load_bindings().unwrap(), Vec::new());
+
+        store.upsert_binding("oidc:alice", "keyA").unwrap();
+        store.upsert_binding("oidc:bob", "keyB").unwrap();
+        let mut loaded = store.load_bindings().unwrap();
+        loaded.sort();
+        assert_eq!(
+            loaded,
+            vec![
+                ("oidc:alice".to_string(), "keyA".to_string()),
+                ("oidc:bob".to_string(), "keyB".to_string()),
+            ]
+        );
+
+        // Re-binding the same identity updates in place, not duplicates.
+        store.upsert_binding("oidc:alice", "keyC").unwrap();
+        let loaded = store.load_bindings().unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.contains(&("oidc:alice".to_string(), "keyC".to_string())));
     }
 
     #[test]

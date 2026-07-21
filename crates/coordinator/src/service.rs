@@ -320,6 +320,51 @@ impl CoordinatorService {
         self.authenticate(request)
             .inspect_err(|_| self.metrics.inc_unauthenticated())
     }
+
+    /// The authenticated identity to enforce SEC-002 key binding against, or
+    /// `None` when the request carries no verified identity at all (open
+    /// mode). Namespaced so an OIDC subject and an mTLS fingerprint can never
+    /// collide:
+    /// - a verified OIDC token -> `oidc:<sub>` (also the source of `tags`);
+    /// - otherwise, a client certificate presented over mTLS -> its
+    ///   fingerprint as `mtls:<sha256 hex>`. mTLS carries no tags claim, so
+    ///   tags stay self-declared in this case — only the key binding is
+    ///   enforced.
+    fn bound_identity<T>(
+        &self,
+        #[cfg_attr(not(feature = "mtls"), allow(unused_variables))] request: &Request<T>,
+        claims: &Option<VerifiedClaims>,
+    ) -> Option<String> {
+        if let Some(c) = claims {
+            return Some(format!("oidc:{}", c.subject));
+        }
+        #[cfg(feature = "mtls")]
+        {
+            mtls_identity(request)
+        }
+        #[cfg(not(feature = "mtls"))]
+        {
+            None
+        }
+    }
+}
+
+/// Derive a stable identity from the mTLS client leaf certificate presented on
+/// this connection, if any: the SHA-256 fingerprint of its DER encoding,
+/// hex-encoded (PRD security-hardening.md SEC-002). `None` when the
+/// connection isn't mTLS (no client certificate) or presented none.
+#[cfg(feature = "mtls")]
+fn mtls_identity<T>(request: &Request<T>) -> Option<String> {
+    use std::fmt::Write;
+
+    let certs = request.peer_certs()?;
+    let leaf = certs.first()?;
+    let fp = ring::digest::digest(&ring::digest::SHA256, leaf.as_ref());
+    let mut hex = String::with_capacity(fp.as_ref().len() * 2);
+    for b in fp.as_ref() {
+        let _ = write!(hex, "{b:02x}");
+    }
+    Some(format!("mtls:{hex}"))
 }
 
 /// Extract the `authorization: Bearer <token>` value from request metadata.
@@ -349,6 +394,7 @@ impl Coordinator for CoordinatorService {
     ) -> Result<Response<RegisterDeviceResponse>, Status> {
         let _timer = self.metrics.start_request();
         let claims = self.authenticate_metered(&request)?;
+        let bound_identity = self.bound_identity(&request, &claims);
         self.metrics.inc_register();
         let req = request.into_inner();
         // When authenticated, tags come from the verified token (an authorization
@@ -359,6 +405,12 @@ impl Coordinator for CoordinatorService {
         };
         let ip = {
             let mut reg = self.registry.lock().expect("registry mutex poisoned");
+            // SEC-002: an authenticated caller (OIDC token or mTLS client cert)
+            // may only ever register the public key it first claimed.
+            if let Some(identity) = &bound_identity {
+                reg.bind_identity(identity, &req.public_key)
+                    .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            }
             reg.register(&req.public_key, &req.name, &req.endpoint, tags)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?
         };
@@ -512,11 +564,19 @@ impl Coordinator for CoordinatorService {
         request: Request<RotateKeyRequest>,
     ) -> Result<Response<RotateKeyResponse>, Status> {
         let _timer = self.metrics.start_request();
-        self.authenticate_metered(&request)?;
+        let claims = self.authenticate_metered(&request)?;
+        let bound_identity = self.bound_identity(&request, &claims);
         self.metrics.inc_rotate_key();
         let req = request.into_inner();
         let ip = {
             let mut reg = self.registry.lock().expect("registry mutex poisoned");
+            // SEC-002: the authorized rotation path — an authenticated caller
+            // may only rotate a key it already owns, and may not rotate onto a
+            // key another identity already owns.
+            if let Some(identity) = &bound_identity {
+                reg.rebind_identity(identity, &req.old_public_key, &req.new_public_key)
+                    .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            }
             reg.rotate_key(&req.old_public_key, &req.new_public_key)
                 .map_err(|e| match e {
                     RegistryError::UnknownDevice => Status::not_found(e.to_string()),
@@ -1019,5 +1079,139 @@ mod tests {
             .tags
             .clone();
         assert_eq!(tags, vec!["dev".to_string()]);
+    }
+
+    /// SEC-002: a verified token cannot register a second/unbound public key —
+    /// a leaked or replayed token can't be used to swap in an attacker-chosen
+    /// key — but the same identity's own `rotate_key` call (the authorized
+    /// rotation path) succeeds and moves the binding.
+    #[cfg(feature = "oidc")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oidc_token_is_bound_to_its_first_registered_key() {
+        use crate::auth::testsign::TestSigner;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tonic::Request;
+
+        let signer = TestSigner::new("k1");
+        let verifier =
+            std::sync::Arc::new(signer.verifier("https://idp.example", "ferrum-coordinator"));
+        let registry = Arc::new(Mutex::new(Registry::new(Ipv4Addr::new(10, 8, 0, 0), 24)));
+        let svc = CoordinatorService::with_auth(registry, verifier);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(CoordinatorServer::new(svc))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let mut client = CoordinatorClient::connect(format!("http://{addr}"))
+            .await
+            .unwrap();
+
+        let exp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let token = signer.sign(&format!(
+            r#"{{"iss":"https://idp.example","aud":"ferrum-coordinator","sub":"alice","exp":{exp}}}"#
+        ));
+        fn authed<T>(req: T, token: &str) -> Request<T> {
+            let mut r = Request::new(req);
+            r.metadata_mut()
+                .insert("authorization", format!("Bearer {token}").parse().unwrap());
+            r
+        }
+
+        // First registration binds alice's token to "AAA".
+        client
+            .register_device(authed(
+                RegisterDeviceRequest {
+                    public_key: "AAA".into(),
+                    name: "a".into(),
+                    endpoint: "1.1.1.1:51820".into(),
+                    tags: vec![],
+                },
+                &token,
+            ))
+            .await
+            .unwrap();
+
+        // Re-registering the same key is idempotent.
+        client
+            .register_device(authed(
+                RegisterDeviceRequest {
+                    public_key: "AAA".into(),
+                    name: "a".into(),
+                    endpoint: "2.2.2.2:51820".into(),
+                    tags: vec![],
+                },
+                &token,
+            ))
+            .await
+            .unwrap();
+
+        // The same (still-valid) token cannot register a *different* key.
+        let swap = client
+            .register_device(authed(
+                RegisterDeviceRequest {
+                    public_key: "BBB".into(),
+                    name: "a".into(),
+                    endpoint: "1.1.1.1:51820".into(),
+                    tags: vec![],
+                },
+                &token,
+            ))
+            .await;
+        assert_eq!(
+            swap.unwrap_err().code(),
+            tonic::Code::FailedPrecondition,
+            "a key swap must be rejected"
+        );
+
+        // The authorized rotation path (rotate_key, same token) succeeds and
+        // moves the binding.
+        client
+            .rotate_key(authed(
+                RotateKeyRequest {
+                    old_public_key: "AAA".into(),
+                    new_public_key: "CCC".into(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap();
+
+        // The old key is no longer alice's; registering it again is now a
+        // key swap and is rejected.
+        let stale = client
+            .register_device(authed(
+                RegisterDeviceRequest {
+                    public_key: "AAA".into(),
+                    name: "a".into(),
+                    endpoint: "1.1.1.1:51820".into(),
+                    tags: vec![],
+                },
+                &token,
+            ))
+            .await;
+        assert_eq!(stale.unwrap_err().code(), tonic::Code::FailedPrecondition);
+
+        // The rotated-to key is now alice's; re-registering it works.
+        client
+            .register_device(authed(
+                RegisterDeviceRequest {
+                    public_key: "CCC".into(),
+                    name: "a".into(),
+                    endpoint: "1.1.1.1:51820".into(),
+                    tags: vec![],
+                },
+                &token,
+            ))
+            .await
+            .unwrap();
     }
 }

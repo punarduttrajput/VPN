@@ -29,6 +29,11 @@ pub enum RegistryError {
     /// A key rotation targeted a public key already used by another device.
     #[error("target public key already in use")]
     KeyInUse,
+    /// An authenticated identity attempted to register or rotate to a public
+    /// key already bound to a *different* identity (or attempted to move away
+    /// from a key it does not own) — PRD security-hardening.md SEC-002.
+    #[error("public key is not authorized for this identity")]
+    IdentityKeyMismatch,
     /// The persistence backend failed.
     #[error("persistence error: {0}")]
     Store(String),
@@ -61,6 +66,13 @@ pub struct Registry {
     by_key: HashMap<String, Device>,
     policy: Policy,
     store: Box<dyn Store>,
+    /// Authenticated-identity -> device-public-key bindings (PRD
+    /// security-hardening.md SEC-002). Keyed by a namespaced identity string
+    /// (e.g. `oidc:<sub>`, `mtls:<cert fingerprint>`) so an authenticated
+    /// caller cannot register or rotate onto a public key it hasn't already
+    /// claimed, and a public key already claimed by one identity cannot be
+    /// claimed by another.
+    identity_keys: HashMap<String, String>,
 }
 
 impl Registry {
@@ -78,11 +90,12 @@ impl Registry {
             by_key: HashMap::new(),
             policy,
             store: Box::new(MemoryStore),
+            identity_keys: HashMap::new(),
         }
     }
 
     /// Create a registry backed by a durable [`Store`], loading any persisted
-    /// devices into memory at startup.
+    /// devices (and identity->key bindings) into memory at startup.
     pub fn with_store(
         base: Ipv4Addr,
         prefix: u8,
@@ -96,6 +109,11 @@ impl Registry {
         {
             by_key.insert(d.public_key.clone(), d);
         }
+        let identity_keys = store
+            .load_bindings()
+            .map_err(|e| RegistryError::Store(e.to_string()))?
+            .into_iter()
+            .collect();
         Ok(Self {
             base,
             prefix,
@@ -103,7 +121,80 @@ impl Registry {
             by_key,
             policy,
             store,
+            identity_keys,
         })
+    }
+
+    /// Enforce and record the identity -> public-key binding for an
+    /// authenticated `register_device` call (PRD security-hardening.md
+    /// SEC-002). The first registration for `identity` binds it to
+    /// `public_key`; a later registration for the same identity with a
+    /// *different* key, or for a key already bound to a *different* identity,
+    /// is rejected. Re-registering the same (identity, public_key) pair is a
+    /// no-op.
+    pub fn bind_identity(&mut self, identity: &str, public_key: &str) -> Result<(), RegistryError> {
+        if let Some(bound) = self.identity_keys.get(identity) {
+            return if bound == public_key {
+                Ok(())
+            } else {
+                Err(RegistryError::IdentityKeyMismatch)
+            };
+        }
+        if self.identity_keys.values().any(|k| k == public_key) {
+            return Err(RegistryError::IdentityKeyMismatch);
+        }
+        self.store
+            .upsert_binding(identity, public_key)
+            .map_err(|e| RegistryError::Store(e.to_string()))?;
+        self.identity_keys
+            .insert(identity.to_string(), public_key.to_string());
+        Ok(())
+    }
+
+    /// Move an identity's key binding from `old_key` to `new_key` — the
+    /// authorized rotation path for SEC-002, called from the authenticated
+    /// `rotate_key` RPC. Rejected if `identity` is bound to a key other than
+    /// `old_key` (rotating away a key it doesn't own), or if `new_key` is
+    /// already bound to a *different* identity. An identity with no prior
+    /// binding for `old_key` is allowed through (first authoritative claim —
+    /// covers a pre-SEC-002 device rotated for the first time under this
+    /// identity).
+    pub fn rebind_identity(
+        &mut self,
+        identity: &str,
+        old_key: &str,
+        new_key: &str,
+    ) -> Result<(), RegistryError> {
+        // If `old_key` already belongs to someone, only its owner may rotate
+        // it away.
+        match self.identity_keys.iter().find(|(_, k)| *k == old_key) {
+            Some((owner, _)) if owner != identity => {
+                return Err(RegistryError::IdentityKeyMismatch)
+            }
+            Some(_) => {} // this identity already owns old_key
+            None => {
+                // `old_key` isn't bound to anyone — allow only as this
+                // identity's first-ever claim (a pre-SEC-002 device rotated
+                // for the first time). An identity that already owns a
+                // *different* key may not "rotate away" a key it never held.
+                if self.identity_keys.contains_key(identity) {
+                    return Err(RegistryError::IdentityKeyMismatch);
+                }
+            }
+        }
+        if self
+            .identity_keys
+            .iter()
+            .any(|(id, k)| id != identity && k == new_key)
+        {
+            return Err(RegistryError::IdentityKeyMismatch);
+        }
+        self.store
+            .upsert_binding(identity, new_key)
+            .map_err(|e| RegistryError::Store(e.to_string()))?;
+        self.identity_keys
+            .insert(identity.to_string(), new_key.to_string());
+        Ok(())
     }
 
     /// Register or re-register a device. Re-registering the same public key is
@@ -521,6 +612,96 @@ mod tests {
         assert_eq!(r.policy(), replacement);
     }
 
+    #[test]
+    fn bind_identity_first_use_then_rejects_key_swap() {
+        let mut r = registry();
+        r.bind_identity("oidc:alice", "keyA").unwrap();
+        // Same identity, same key: idempotent.
+        r.bind_identity("oidc:alice", "keyA").unwrap();
+        // Same identity, different key: rejected.
+        assert_eq!(
+            r.bind_identity("oidc:alice", "keyB"),
+            Err(RegistryError::IdentityKeyMismatch)
+        );
+    }
+
+    #[test]
+    fn bind_identity_rejects_key_already_claimed_by_another_identity() {
+        let mut r = registry();
+        r.bind_identity("oidc:alice", "keyA").unwrap();
+        assert_eq!(
+            r.bind_identity("oidc:bob", "keyA"),
+            Err(RegistryError::IdentityKeyMismatch)
+        );
+    }
+
+    #[test]
+    fn rebind_identity_moves_binding_on_authorized_rotation() {
+        let mut r = registry();
+        r.bind_identity("oidc:alice", "keyA").unwrap();
+        r.rebind_identity("oidc:alice", "keyA", "keyB").unwrap();
+        // The binding now follows keyB; keyA is free for reuse by anyone.
+        assert_eq!(
+            r.bind_identity("oidc:bob", "keyA"),
+            Ok(()),
+            "old key is released once its identity has rotated away"
+        );
+        assert_eq!(
+            r.bind_identity("oidc:alice", "keyB"),
+            Ok(()),
+            "the rotated key is now alice's"
+        );
+    }
+
+    #[test]
+    fn rebind_identity_rejects_rotating_a_key_owned_by_another_identity() {
+        let mut r = registry();
+        r.bind_identity("oidc:alice", "keyA").unwrap();
+        assert_eq!(
+            r.rebind_identity("oidc:bob", "keyA", "keyC"),
+            Err(RegistryError::IdentityKeyMismatch),
+            "bob does not own keyA"
+        );
+    }
+
+    #[test]
+    fn rebind_identity_rejects_grabbing_an_unbound_key_once_already_established() {
+        let mut r = registry();
+        r.bind_identity("oidc:alice", "keyA").unwrap();
+        // alice already owns keyA; "legacyKey" belongs to no one on record.
+        // alice may not also grab it via a bogus rotation.
+        assert_eq!(
+            r.rebind_identity("oidc:alice", "legacyKey", "keyD"),
+            Err(RegistryError::IdentityKeyMismatch)
+        );
+    }
+
+    #[test]
+    fn rebind_identity_allows_first_claim_of_an_unbound_legacy_key() {
+        let mut r = registry();
+        // charlie has never been bound to anything; rotating an unbound
+        // (pre-SEC-002) device's key is allowed as a first claim.
+        r.rebind_identity("oidc:charlie", "legacyKey", "keyD")
+            .unwrap();
+        assert_eq!(
+            r.bind_identity("oidc:other", "keyD"),
+            Err(RegistryError::IdentityKeyMismatch),
+            "keyD is now charlie's"
+        );
+    }
+
+    #[test]
+    fn rebind_identity_rejects_stealing_a_key_bound_to_another_identity() {
+        let mut r = registry();
+        r.bind_identity("oidc:alice", "keyA").unwrap();
+        r.bind_identity("oidc:bob", "keyB").unwrap();
+        assert_eq!(
+            r.rebind_identity("oidc:alice", "keyA", "keyB"),
+            Err(RegistryError::IdentityKeyMismatch),
+            "keyB already belongs to bob"
+        );
+    }
+
     #[cfg(feature = "sqlite")]
     #[test]
     fn registry_persists_devices_across_restart() {
@@ -603,5 +784,33 @@ mod tests {
         let map = r2.network_map("peer");
         assert_eq!(map.len(), 1);
         assert_eq!(map[0].public_key, "newkey");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn identity_bindings_persist_through_the_store() {
+        use crate::sqlite::SqliteStore;
+
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut r = Registry::with_store(
+            Ipv4Addr::new(10, 8, 0, 0),
+            24,
+            Policy::allow_all(),
+            Box::new(store),
+        )
+        .unwrap();
+        r.bind_identity("oidc:alice", "keyA").unwrap();
+
+        // A fresh registry over the same store still enforces the binding.
+        let store = r.store;
+        let mut r2 =
+            Registry::with_store(Ipv4Addr::new(10, 8, 0, 0), 24, Policy::allow_all(), store)
+                .unwrap();
+        assert_eq!(
+            r2.bind_identity("oidc:alice", "keyB"),
+            Err(RegistryError::IdentityKeyMismatch),
+            "binding survived the restart"
+        );
+        assert_eq!(r2.bind_identity("oidc:alice", "keyA"), Ok(()));
     }
 }
