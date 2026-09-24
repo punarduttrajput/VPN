@@ -1,8 +1,10 @@
 import { ComponentFixture, TestBed } from '@angular/core/testing';
-import { of } from 'rxjs';
+import { HttpErrorResponse } from '@angular/common/http';
+import { Subject, of, throwError } from 'rxjs';
 
 import { PolicyComponent } from './policy.component';
 import { PolicyService } from '../core/policy.service';
+import { StatusService } from '../core/status.service';
 import { Policy } from '../core/models';
 
 describe('PolicyComponent', () => {
@@ -63,5 +65,102 @@ describe('PolicyComponent', () => {
       allow_all: false,
       rules: [{ src: ['dev', 'admin'], dst: ['server'] }],
     });
+  });
+
+  const saveButton = (): HTMLButtonElement =>
+    [...(fixture.nativeElement as HTMLElement).querySelectorAll('button')].find(
+      (b) => b.textContent?.trim() === 'Save policy',
+    ) as HTMLButtonElement;
+
+  it('enables Save once the policy has loaded', () => {
+    expect(component.canSave()).toBeTrue();
+    expect(saveButton().disabled).toBeFalse();
+  });
+
+  /**
+   * Regression: a failed load used to leave an empty (deny-all) form with Save
+   * enabled, so one click replaced the live policy with `rules: []`.
+   */
+  describe('when loading the policy fails', () => {
+    beforeEach(() => {
+      policyService.get.and.returnValue(
+        throwError(() => new HttpErrorResponse({ status: 503, error: 'coordinator busy' })),
+      );
+      policyService.save.calls.reset();
+      component.refresh();
+      fixture.detectChanges();
+    });
+
+    it('disables Save and never sends a policy', () => {
+      expect(component.canSave()).toBeFalse();
+      expect(saveButton().disabled).toBeTrue();
+
+      component.save(); // even if invoked directly
+      expect(policyService.save).not.toHaveBeenCalled();
+    });
+
+    it('hides the editable form and shows the error instead', () => {
+      const el = fixture.nativeElement as HTMLElement;
+      expect(el.querySelector('#policy-allow-all')).toBeNull();
+      expect(el.querySelector('li.rule-row')).toBeNull();
+      expect(el.querySelector('.load-error')?.textContent).toContain('coordinator busy');
+    });
+
+    it('reports the failure in the status banner', () => {
+      expect(TestBed.inject(StatusService).message()).toEqual({
+        text: 'Failed to load the policy: coordinator busy',
+        kind: 'err',
+      });
+    });
+
+    it('re-enables editing after a successful retry', () => {
+      policyService.get.and.returnValue(of(initialPolicy));
+      component.refresh();
+      fixture.detectChanges();
+      expect(component.canSave()).toBeTrue();
+      expect(component.ruleGroups.length).toBe(1);
+    });
+  });
+
+  it('leaves the banner to authInterceptor on a 401/403', () => {
+    const status = TestBed.inject(StatusService);
+    status.show('token rejected — sign in again', 'err'); // what the interceptor shows
+    policyService.get.and.returnValue(throwError(() => new HttpErrorResponse({ status: 401 })));
+    component.refresh();
+    expect(status.message()?.text).toBe('token rejected — sign in again');
+    expect(component.canSave()).toBeFalse();
+  });
+
+  it('says the save succeeded when only the follow-up reload fails', () => {
+    policyService.get.and.returnValue(
+      throwError(() => new HttpErrorResponse({ status: 503, error: 'coordinator busy' })),
+    );
+    component.save();
+    const msg = TestBed.inject(StatusService).message();
+    expect(policyService.save).toHaveBeenCalled();
+    expect(msg?.kind).toBe('err');
+    expect(msg?.text).toContain('Policy saved, but reloading it failed: coordinator busy');
+  });
+
+  it('blocks Save until the first load completes', async () => {
+    const pending = new Subject<Policy>();
+    policyService.get.and.returnValue(pending);
+    const slow = TestBed.createComponent(PolicyComponent).componentInstance;
+    policyService.save.calls.reset();
+
+    slow.save();
+    expect(policyService.save).not.toHaveBeenCalled();
+
+    pending.next(initialPolicy);
+    pending.complete();
+    expect(slow.canSave()).toBeTrue();
+  });
+
+  it('blocks a second Save while one is in flight', () => {
+    const inFlight = new Subject<void>();
+    policyService.save.and.returnValue(inFlight);
+    component.save();
+    component.save();
+    expect(policyService.save).toHaveBeenCalledTimes(1);
   });
 });

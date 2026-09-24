@@ -16,7 +16,8 @@
 #
 # Scrape targets default to `host.docker.internal:{9095,9096}` — i.e. a coordinator
 # and relay running on the *host*:
-#   ferrum-coordinator --metrics-listen 0.0.0.0:9095 [--otlp-endpoint http://localhost:4317]
+#   ferrum-coordinator --metrics-listen 0.0.0.0:9095 --insecure-no-auth [--otlp-endpoint http://localhost:4317]
+#     (auth is required, SEC-001: use the --oidc-* flags instead of --insecure-no-auth outside local dev)
 #   ferrum relay        --metrics-listen 0.0.0.0:9096 [--otlp-endpoint http://localhost:4317]
 # In a containerized deployment, run the services on the `ferrum` network below and
 # point the scrape jobs at their service names instead (see prometheus/prometheus.yml).

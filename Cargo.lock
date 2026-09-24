@@ -777,8 +777,10 @@ dependencies = [
  "anyhow",
  "aya",
  "aya-log",
+ "blake2",
  "bytes",
  "ferrum-relay-xdp-common",
+ "getrandom 0.2.17",
  "h3",
  "h3-datagram",
  "h3-quinn",
@@ -791,6 +793,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "x25519-dalek",
  "zeroize",
 ]
 
