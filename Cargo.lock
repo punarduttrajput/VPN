@@ -716,6 +716,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "ferrum-control-proto",
+ "ferrum-transport",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

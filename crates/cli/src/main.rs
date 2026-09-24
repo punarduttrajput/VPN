@@ -848,7 +848,8 @@ async fn up_mesh(
     // `transport.relay` override else whatever the coordinator advertises.
     let client = FerrumClient::new();
     client.set_token(token);
-    client.set_tls_fingerprint(tls_pin);
+    // (The session publishes its transport's own TLS pin at each registration
+    // — `run_mesh_session` — so it can't drift from the key in use.)
     let identity = ClientIdentity {
         public_key: public_key.clone(),
         name: name.to_string(),

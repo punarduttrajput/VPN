@@ -160,6 +160,15 @@ where
     M: MeshTransport + Send + 'static,
     F: Future<Output = ()> + Send,
 {
+    // Publish the TLS pin of the transport actually carrying this session
+    // (SEC-004) — derived from the key the shell bound it with — rather than
+    // trusting a separately-set value that could lag a key rotation. Non-TLS
+    // transports publish none.
+    client.set_tls_fingerprint(
+        transport
+            .tls_fingerprint()
+            .map(|fp| ferrum_transport::fingerprint::fingerprint_hex(&fp)),
+    );
     // Control-plane connect: registers, loads the initial peer view, and drives
     // the facade Connecting -> Connected (or -> Failed, returning the error).
     client.connect(coordinator, identity).await?;
@@ -573,6 +582,62 @@ mod tests {
     /// The runner registers (driving the facade to `Connected`), reflects a peer
     /// that joins later into the facade's peer view via the watch stream, and
     /// returns to `Disconnected` on shutdown.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_publishes_its_transports_pin_not_a_stale_one() {
+        // Review fix: the session publishes what its transport reports, so a
+        // pin left over on the facade (e.g. from before a key rotation) can't
+        // be advertised. A UDP transport has no TLS identity: it clears it.
+        let url = start_coordinator().await;
+        let me = ferrum_core::keys::KeyPair::generate();
+        let client = FerrumClient::new();
+        client.set_tls_fingerprint(Some("ab".repeat(32))); // stale
+        let identity = ClientIdentity {
+            public_key: me.public_base64(),
+            name: "node-a".into(),
+            endpoint: "127.0.0.1:51820".into(),
+            tags: vec![],
+        };
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let (runner, url_runner, priv_b64) = (client.clone(), url.clone(), me.private_base64());
+        let id = identity.clone();
+        let handle = tokio::spawn(async move {
+            run_mesh_session(
+                &runner,
+                &url_runner,
+                &id,
+                &priv_b64,
+                &[],
+                MockTun::default(),
+                UdpMeshTransport::from_socket(sock),
+                None,
+                async move {
+                    let _ = stop_rx.await;
+                },
+            )
+            .await
+        });
+        wait_for(Duration::from_secs(5), || {
+            client.status() == ConnectionState::Connected
+        })
+        .await;
+
+        let mut b = ControlClient::connect(url).await.unwrap();
+        let b_key = ferrum_core::keys::KeyPair::generate().public_base64();
+        b.register(&b_key, "b", "127.0.0.1:51821", &[])
+            .await
+            .unwrap();
+        let peers = b.network_map(&b_key).await.unwrap();
+        let seen = peers
+            .iter()
+            .find(|p| p.public_key == identity.public_key)
+            .unwrap();
+        assert_eq!(seen.tls_cert_sha256, "", "stale pin must not be published");
+
+        let _ = stop_tx.send(());
+        let _ = handle.await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_mesh_session_connects_then_tracks_live_peers() {
         let url = start_coordinator().await;

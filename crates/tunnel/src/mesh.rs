@@ -94,15 +94,24 @@ impl MeshPeer {
 /// Push every peer's TLS pins to the transport, keyed by each address it may
 /// be dialed at (endpoint + ICE candidates). A no-op for non-TLS transports.
 fn apply_pins<M: MeshTransport>(transport: &M, peers: &[MeshPeer]) {
-    let pins: Vec<(SocketAddr, Vec<Fingerprint>)> = peers
-        .iter()
-        .filter(|p| !p.tls_pins.is_empty())
-        .flat_map(|p| {
-            std::iter::once(p.endpoint)
-                .chain(p.candidates.iter().copied())
-                .map(move |a| (a, p.tls_pins.clone()))
-        })
-        .collect();
+    // Several peers can share an address — most often an RFC 1918 host
+    // candidate like 192.168.1.10:51820 on two different LANs — so the pins
+    // for one address are the *union* over every peer listing it (WireGuard's
+    // crypto-demux still decides which peer actually answered). A plain
+    // overwrite would make one of those peers fail its own pin.
+    let mut by_addr: std::collections::HashMap<SocketAddr, Vec<Fingerprint>> =
+        std::collections::HashMap::new();
+    for p in peers.iter().filter(|p| !p.tls_pins.is_empty()) {
+        for addr in std::iter::once(p.endpoint).chain(p.candidates.iter().copied()) {
+            let pins = by_addr.entry(addr).or_default();
+            for pin in &p.tls_pins {
+                if !pins.contains(pin) {
+                    pins.push(*pin);
+                }
+            }
+        }
+    }
+    let pins: Vec<(SocketAddr, Vec<Fingerprint>)> = by_addr.into_iter().collect();
     transport.set_peer_pins(&pins);
 }
 
@@ -669,6 +678,26 @@ mod tests {
         let mut got = t.0.lock().unwrap().clone();
         got.sort();
         assert_eq!(got, vec![(a, vec![[1; 32]]), (a_cand, vec![[1; 32]])]);
+
+        // Review fix: two peers at different sites advertising the same LAN
+        // host candidate get the *union* of their pins at that address, so
+        // neither fails its own pin there.
+        let shared: SocketAddr = "192.168.1.10:51820".parse().unwrap();
+        let peers = vec![
+            MeshPeer::with_candidates(session(3), a, vec![], vec![shared])
+                .with_tls_pins(vec![[1; 32]]),
+            MeshPeer::with_candidates(session(4), b, vec![], vec![shared])
+                .with_tls_pins(vec![[2; 32]]),
+        ];
+        apply_pins(&t, &peers);
+        let got = t.0.lock().unwrap().clone();
+        let mut at_shared = got
+            .iter()
+            .find(|(addr, _)| *addr == shared)
+            .map(|(_, pins)| pins.clone())
+            .expect("shared candidate pinned");
+        at_shared.sort();
+        assert_eq!(at_shared, vec![[1; 32], [2; 32]]);
     }
 
     #[test]

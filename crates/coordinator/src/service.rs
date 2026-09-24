@@ -417,12 +417,15 @@ impl Coordinator for CoordinatorService {
                 reg.bind_identity(identity, &req.public_key)
                     .map_err(|e| Status::failed_precondition(e.to_string()))?;
             }
-            let ip = reg
-                .register(&req.public_key, &req.name, &req.endpoint, tags)
-                .map_err(|e| Status::invalid_argument(e.to_string()))?;
-            reg.set_tls_pin(&req.public_key, &tls_pin)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            ip
+            // One store write carries the device and its pin.
+            reg.register_with_pin(
+                &req.public_key,
+                &req.name,
+                &req.endpoint,
+                tags,
+                Some(&tls_pin),
+            )
+            .map_err(|e| Status::invalid_argument(e.to_string()))?
         };
         // Notify watchers that the network changed (ignored if none are connected).
         let _ = self.changes.send(());

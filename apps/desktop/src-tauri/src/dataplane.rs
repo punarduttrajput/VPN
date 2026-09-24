@@ -300,11 +300,8 @@ where
     // core emits the right `TrafficBlocked` signal and authenticates its RPCs.
     client.set_token(cfg.token.clone());
     client.set_kill_switch(cfg.kill_switch);
-    // SEC-004: over the QUIC mesh, peers dial this node as a TLS server, so
-    // publish the pin of the cert it presents (peers then pin it).
-    client.set_tls_fingerprint(matches!(mode, TransportMode::Quic).then(|| {
-        ferrum_transport::tls::fingerprint_hex(&tls_identity.fingerprint())
-    }));
+    // SEC-004: the QUIC mesh transport publishes its own TLS pin at every
+    // registration (`run_mesh_session`), so there's nothing to set here.
 
     // Pre-register (out of band) only to learn the assigned tunnel address — the
     // TUN needs it before the runner (which re-registers idempotently) takes over.

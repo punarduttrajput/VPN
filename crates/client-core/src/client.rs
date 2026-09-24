@@ -240,8 +240,9 @@ impl FerrumClient {
     /// Publish (or clear) this device's outer-transport TLS cert pin — the hex
     /// SHA-256 of the cert it presents to QUIC dialers (SEC-004;
     /// `TlsIdentity::fingerprint`). Sent with every registration, so the
-    /// coordinator can hand it to peers, which then pin it. Set it before
-    /// `connect`/`run_mesh_session` when using the QUIC mesh transport.
+    /// coordinator can hand it to peers, which then pin it. `run_mesh_session`
+    /// sets this itself from its transport (`MeshTransport::tls_fingerprint`),
+    /// so shells only need it for a bare `connect` without a data plane.
     pub fn set_tls_fingerprint(&self, pin: Option<String>) {
         self.inner
             .lock()

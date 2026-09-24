@@ -39,6 +39,9 @@ admin-api = ["oidc", "dep:axum", "dep:rust-embed"]
 
 [dependencies]
 ferrum-control-proto = { path = "../control-proto" }
+# Only for the shared TLS-pin parser (`ferrum_transport::fingerprint`, SEC-004);
+# the default feature set pulls in no QUIC/TLS stack.
+ferrum-transport = { path = "../transport" }
 tonic.workspace = true
 prost.workspace = true
 tokio.workspace = true

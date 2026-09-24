@@ -61,20 +61,16 @@ pub struct Device {
     pub tls_cert_sha256: String,
 }
 
-/// Normalize a TLS cert pin to 64 lowercase hex digits (accepting `:`
-/// separators and any case), or `""` for none; `None` if malformed.
+/// Normalize a TLS pin (SHA-256 of the device's TLS public key) to 64 lowercase
+/// hex digits, or `""` for none; `None` if malformed. Parsing is shared with
+/// the clients (`ferrum_transport::fingerprint`) so both accept exactly the
+/// same forms.
 pub fn normalize_tls_pin(s: &str) -> Option<String> {
-    let hex: String = s
-        .trim()
-        .chars()
-        .filter(|c| *c != ':')
-        .map(|c| c.to_ascii_lowercase())
-        .collect();
-    match hex.len() {
-        0 => Some(String::new()),
-        64 if hex.chars().all(|c| c.is_ascii_hexdigit()) => Some(hex),
-        _ => None,
+    use ferrum_transport::fingerprint::{fingerprint_hex, parse_fingerprint};
+    if s.trim().is_empty() {
+        return Some(String::new());
     }
+    parse_fingerprint(s).ok().map(|fp| fingerprint_hex(&fp))
 }
 
 /// Registry of devices and their assigned tunnel addresses.
@@ -217,13 +213,28 @@ impl Registry {
     }
 
     /// Register or re-register a device. Re-registering the same public key is
-    /// idempotent: the name/endpoint/tags are refreshed and the existing IP kept.
+    /// idempotent: the name/endpoint/tags are refreshed and the existing IP kept
+    /// (and any existing TLS pin left as is — see [`register_with_pin`](Self::register_with_pin)).
     pub fn register(
         &mut self,
         public_key: &str,
         name: &str,
         endpoint: &str,
         tags: &[String],
+    ) -> Result<Ipv4Addr, RegistryError> {
+        self.register_with_pin(public_key, name, endpoint, tags, None)
+    }
+
+    /// [`register`](Self::register), also setting the device's TLS pin
+    /// (SEC-004) in the same single store write when `pin` is `Some` (already
+    /// normalized — see [`normalize_tls_pin`]; `Some("")` clears it).
+    pub fn register_with_pin(
+        &mut self,
+        public_key: &str,
+        name: &str,
+        endpoint: &str,
+        tags: &[String],
+        pin: Option<&str>,
     ) -> Result<Ipv4Addr, RegistryError> {
         if public_key.trim().is_empty() {
             return Err(RegistryError::InvalidKey);
@@ -235,6 +246,9 @@ impl Registry {
             existing.name = name.to_string();
             existing.endpoint = endpoint.to_string();
             existing.tags = tags.to_vec();
+            if let Some(pin) = pin {
+                existing.tls_cert_sha256 = pin.to_string();
+            }
             existing.clone()
         } else {
             let ip = self.allocate()?;
@@ -247,8 +261,7 @@ impl Registry {
                 // Candidates are published separately (after STUN), via
                 // `set_candidates`; a fresh registration starts with none.
                 candidates: Vec::new(),
-                // Set by `set_tls_pin` from the same registration request.
-                tls_cert_sha256: String::new(),
+                tls_cert_sha256: pin.unwrap_or_default().to_string(),
             };
             self.by_key.insert(public_key.to_string(), device.clone());
             device
