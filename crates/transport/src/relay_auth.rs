@@ -195,16 +195,22 @@ struct Bucket {
 }
 
 /// Token-bucket rate limiter keyed by `K`, with a bounded table: once it holds
-/// more than `max_tracked` keys, buckets that have refilled to capacity (i.e.
-/// idle, and indistinguishable from a fresh one) are swept. A spoofed-source
-/// flood therefore can't grow memory without bound — each spoofed address's
-/// bucket refills within `capacity / refill_per_sec` and is swept.
+/// `max_tracked` keys, a new key makes room (see `make_room`: a rate-limited
+/// sweep of idle buckets, else one eviction). A spoofed-source flood therefore
+/// can't grow memory without bound, can't make each packet an O(n) scan, and
+/// can't lock new legitimate sources out.
 pub(crate) struct RateLimiter<K> {
     buckets: HashMap<K, Bucket>,
     capacity: f64,
     refill_per_sec: f64,
     max_tracked: usize,
+    /// When the full-table sweep last ran (it's O(n), so it's rate-limited too).
+    last_sweep: Option<Instant>,
 }
+
+/// Minimum spacing between full-table sweeps: a flood of never-seen sources
+/// must not turn every packet into an O(n) scan of the table.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
 impl<K: Eq + Hash + Copy> RateLimiter<K> {
     pub(crate) fn new(capacity: u32, refill_per_sec: f64, max_tracked: usize) -> Self {
@@ -213,6 +219,32 @@ impl<K: Eq + Hash + Copy> RateLimiter<K> {
             capacity: capacity as f64,
             refill_per_sec,
             max_tracked,
+            last_sweep: None,
+        }
+    }
+
+    /// Make room for one new key in a full table. Sweeps idle (refilled)
+    /// buckets at most once per [`SWEEP_INTERVAL`]; if the table is still full,
+    /// evicts one arbitrary bucket rather than refusing the newcomer — refusing
+    /// would let a spoofed-source flood that fills the table lock every *new*
+    /// legitimate source out. (An attacker who evicts a bucket this way resets
+    /// one random entry's limit per packet, far cheaper to tolerate than a
+    /// lockout; the cookie check keeps the expensive work return-routable.)
+    fn make_room(&mut self, now: Instant) {
+        let due = self
+            .last_sweep
+            .is_none_or(|t| now.saturating_duration_since(t) >= SWEEP_INTERVAL);
+        if due {
+            self.last_sweep = Some(now);
+            let (cap, rate) = (self.capacity, self.refill_per_sec);
+            self.buckets.retain(|_, b| {
+                (b.tokens + now.saturating_duration_since(b.at).as_secs_f64() * rate) < cap
+            });
+        }
+        if self.buckets.len() >= self.max_tracked {
+            if let Some(victim) = self.buckets.keys().next().copied() {
+                self.buckets.remove(&victim);
+            }
         }
     }
 
@@ -224,15 +256,7 @@ impl<K: Eq + Hash + Copy> RateLimiter<K> {
     /// Take one token for `key` if available.
     pub(crate) fn allow(&mut self, key: K, now: Instant) -> bool {
         if self.buckets.len() >= self.max_tracked && !self.buckets.contains_key(&key) {
-            let (cap, rate) = (self.capacity, self.refill_per_sec);
-            self.buckets.retain(|_, b| {
-                (b.tokens + now.saturating_duration_since(b.at).as_secs_f64() * rate) < cap
-            });
-            if self.buckets.len() >= self.max_tracked {
-                // Every tracked key is mid-burst: refuse new ones rather than
-                // evict a throttled one (which would reset its limit).
-                return false;
-            }
+            self.make_room(now);
         }
         let tokens = match self.buckets.get(&key) {
             Some(b) => self.refilled(*b, now),
@@ -357,11 +381,40 @@ mod tests {
         for k in 0..4u32 {
             assert!(rl.allow(k, t0));
         }
-        // Full of mid-burst keys: a new key is refused, not admitted by eviction.
-        assert!(!rl.allow(99, t0));
+        // Full of mid-burst keys: a newcomer is still admitted (never locked out
+        // by a table a flood filled) and the table stays at the bound.
+        assert!(rl.allow(99, t0));
         assert_eq!(rl.buckets.len(), 4);
-        // Once they've refilled they're swept and a new key fits.
-        assert!(rl.allow(99, t0 + Duration::from_secs(1)));
-        assert!(rl.buckets.len() <= 4);
+        assert!(rl.buckets.contains_key(&99));
+        // Once they've refilled, a sweep reclaims the idle buckets.
+        assert!(rl.allow(100, t0 + Duration::from_secs(2)));
+        assert!(
+            rl.buckets.len() <= 2,
+            "idle buckets swept: {}",
+            rl.buckets.len()
+        );
+    }
+
+    /// Review fix: a flood of never-seen keys into a full table sweeps at
+    /// most once per interval instead of scanning the table on every packet.
+    #[test]
+    fn full_table_sweeps_are_rate_limited() {
+        let mut rl = RateLimiter::new(2, 10.0, 4);
+        let t0 = Instant::now();
+        for k in 0..4u32 {
+            rl.allow(k, t0);
+        }
+        rl.allow(1000, t0); // first overflow: sweeps
+        let swept_at = rl.last_sweep;
+        for k in 1001..1100u32 {
+            rl.allow(k, t0 + Duration::from_millis(10));
+        }
+        assert_eq!(
+            rl.last_sweep, swept_at,
+            "no second sweep within the interval"
+        );
+        assert_eq!(rl.buckets.len(), 4);
+        rl.allow(5000, t0 + SWEEP_INTERVAL);
+        assert_ne!(rl.last_sweep, swept_at, "sweeps again after the interval");
     }
 }

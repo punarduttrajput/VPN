@@ -81,11 +81,14 @@ const _: () = assert!(CHALLENGE_LEN <= REGISTER_LEN);
 const IP_BURST: u32 = 32;
 const IP_REFILL_PER_SEC: f64 = 8.0;
 /// Per-key budget for committed mapping *changes* (first claim or roam): a
-/// burst of 4, then one per 5 s. Only the key holder can commit (the proof), so
-/// this bounds a flapping client's churn — including XDP map updates — without
-/// letting third parties exhaust a victim's budget.
-const KEY_BURST: u32 = 4;
-const KEY_REFILL_PER_SEC: f64 = 0.2;
+/// burst of 10, then one per second. Only the key holder can commit (the
+/// proof), so this bounds a flapping client's churn — including XDP map
+/// updates — without letting third parties exhaust a victim's budget. Roomy
+/// on purpose: a phone bouncing between Wi-Fi and cellular re-registers on
+/// every NAT rebind, and a throttled roam leaves its relayed traffic going to
+/// a dead address until the next keepalive.
+const KEY_BURST: u32 = 10;
+const KEY_REFILL_PER_SEC: f64 = 1.0;
 /// Bucket-table bound for each limiter (see `RateLimiter`).
 const MAX_TRACKED: usize = 65_536;
 /// Data-frame header: tag + key, before the opaque payload.
@@ -218,6 +221,11 @@ pub struct RelayMetrics {
     registers_rate_limited_total: AtomicU64,
     /// Responses rejected for a stale/foreign cookie or a bad possession proof.
     register_proofs_rejected_total: AtomicU64,
+    /// Malformed *control* frames (wrong-length register/response, unknown
+    /// tag) — e.g. a pre-SEC-003 client's 33-byte register during a rolling
+    /// upgrade. Kept out of `frames_dropped_total`, the forwarding SLI, so
+    /// they can't trip the relay-forwarding SLO alerts.
+    control_frames_invalid_total: AtomicU64,
 }
 
 impl RelayMetrics {
@@ -264,6 +272,11 @@ impl RelayMetrics {
 
     fn note_proof_rejected(&self) {
         self.register_proofs_rejected_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_control_invalid(&self) {
+        self.control_frames_invalid_total
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -351,6 +364,12 @@ impl RelayMetrics {
             "ferrum_relay_register_proofs_rejected_total",
             "Total challenge responses rejected (stale or foreign cookie, or bad key-possession proof).",
             self.register_proofs_rejected_total.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "ferrum_relay_control_frames_invalid_total",
+            "Total malformed control frames (wrong-length register/response, unknown tag), e.g. from pre-upgrade clients. Not a forwarding drop.",
+            self.control_frames_invalid_total.load(Ordering::Relaxed),
         );
         out
     }
@@ -685,9 +704,16 @@ impl RelayServer {
                         }
                     }
                 }
-                _ => {
+                // A short Data frame is a forwarding drop (it was meant to be
+                // forwarded); anything else malformed is a control-plane
+                // problem and stays out of the forwarding SLI.
+                Some(&TAG_DATA) => {
                     self.metrics.note_dropped();
-                    debug!(%from, len = n, "relay: malformed frame; dropping");
+                    debug!(%from, len = n, "relay: truncated data frame; dropping");
+                }
+                _ => {
+                    self.metrics.note_control_invalid();
+                    debug!(%from, len = n, "relay: malformed control frame; dropping");
                 }
             }
         }
@@ -709,8 +735,51 @@ pub struct RelayMeshTransport {
     /// This node's WireGuard private key — answers the relay's register
     /// challenges (SEC-003); never leaves the process.
     secret: StaticSecret,
+    /// Only answer challenges we could have solicited (see [`ChallengeGate`]).
+    gate: Arc<Mutex<ChallengeGate>>,
+    /// Reused receive buffer — one full frame, allocated once rather than per
+    /// datagram on the relayed data path.
+    recv_buf: tokio::sync::Mutex<Vec<u8>>,
     peers: Arc<Mutex<PeerMap>>,
     keepalive: tokio::task::JoinHandle<()>,
+}
+
+/// How long after sending a Register the client will answer a challenge.
+const ANSWER_WINDOW: Duration = Duration::from_secs(5);
+/// How many challenges one Register may draw an answer to (a retransmitted
+/// or duplicated challenge is fine; a flood is not).
+const MAX_ANSWERS_PER_REGISTER: u32 = 2;
+
+/// Client-side guard on answering register challenges. The relay only ever
+/// challenges in reply to one of our Register frames, so a challenge outside
+/// [`ANSWER_WINDOW`] of our last Register — or beyond
+/// [`MAX_ANSWERS_PER_REGISTER`] of them — is unsolicited: most likely spoofed
+/// from the relay's address. Answering those would cost an X25519 each and
+/// reflect a Response at the relay, draining our own per-IP register budget
+/// there so a genuine re-registration later gets rate-limited.
+#[derive(Default)]
+struct ChallengeGate {
+    last_register: Option<Instant>,
+    answered: u32,
+}
+
+impl ChallengeGate {
+    fn note_register(&mut self, now: Instant) {
+        self.last_register = Some(now);
+        self.answered = 0;
+    }
+
+    fn allow_answer(&mut self, now: Instant) -> bool {
+        let fresh = self
+            .last_register
+            .is_some_and(|t| now.saturating_duration_since(t) <= ANSWER_WINDOW);
+        if fresh && self.answered < MAX_ANSWERS_PER_REGISTER {
+            self.answered += 1;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// This node's view of its mesh peers, for translating between the mesh's
@@ -757,19 +826,30 @@ impl RelayMeshTransport {
             map.addr_of_key.insert(*key, *addr);
         }
 
-        // Announce ourselves (proving the key) so peers can reach us by key.
+        // Announce ourselves (proving the key) so peers can reach us by key. A
+        // challenge that arrives after this bounded wait is answered from
+        // `recv_from`, so open the answer window now.
+        let gate = Arc::new(Mutex::new(ChallengeGate::default()));
+        gate.lock()
+            .expect("relay challenge gate poisoned")
+            .note_register(Instant::now());
         if !register_via(&socket, relay, secret, CONNECT_HANDSHAKE).await? {
             debug!(%relay, "relay sent no register challenge yet; will answer it on receive");
         }
 
         // Keepalive: re-register periodically to refresh the NAT mapping.
         let ka_socket = Arc::clone(&socket);
+        let ka_gate = Arc::clone(&gate);
         let keepalive = tokio::spawn(async move {
             let frame = register_frame(&self_key);
             let mut tick = tokio::time::interval(KEEPALIVE);
             tick.tick().await; // consume the immediate first tick (already sent)
             loop {
                 tick.tick().await;
+                ka_gate
+                    .lock()
+                    .expect("relay challenge gate poisoned")
+                    .note_register(Instant::now());
                 if let Err(e) = ka_socket.send_to(&frame, relay).await {
                     warn!("relay keepalive failed: {e}");
                 }
@@ -780,6 +860,8 @@ impl RelayMeshTransport {
             socket,
             relay,
             secret: secret.clone(),
+            gate,
+            recv_buf: tokio::sync::Mutex::new(vec![0u8; FRAME_BUF]),
             peers: Arc::new(Mutex::new(map)),
             keepalive,
         })
@@ -830,15 +912,25 @@ impl MeshTransport for RelayMeshTransport {
     }
 
     async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr), TransportError> {
-        let mut frame = vec![0u8; FRAME_BUF];
+        let mut frame = self.recv_buf.lock().await;
         loop {
-            let (n, from) = self.socket.recv_from(&mut frame).await?;
+            let (n, from) = self.socket.recv_from(&mut frame[..]).await?;
             if from != self.relay {
                 continue; // only the relay should be talking to us
             }
             if frame.first() == Some(&TAG_CHALLENGE) {
                 // The relay wants proof before (re-)binding our mapping — on
-                // first connect, after a roam, or after it restarted.
+                // first connect, after a roam, or after it restarted. Only
+                // answer one we could have solicited (see `ChallengeGate`).
+                let solicited = self
+                    .gate
+                    .lock()
+                    .expect("relay challenge gate poisoned")
+                    .allow_answer(Instant::now());
+                if !solicited {
+                    debug!("relay: ignoring unsolicited register challenge");
+                    continue;
+                }
                 if let Some(resp) = answer_challenge(&self.secret, &frame[..n]) {
                     if let Err(e) = self.socket.send_to(&resp, self.relay).await {
                         warn!("relay challenge response failed: {e}");
@@ -925,6 +1017,16 @@ mod tests {
         );
     }
 
+    /// Current value of an (unlabelled) metric.
+    fn metric(metrics: &RelayMetrics, name: &str) -> u64 {
+        let text = metrics.render();
+        let prefix = format!("{name} ");
+        text.lines()
+            .find_map(|l| l.strip_prefix(&prefix))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("{name} missing:\n{text}"))
+    }
+
     /// Poll the metrics text until it contains `needle` (or ~1 s passes).
     async fn wait_for(metrics: &RelayMetrics, needle: &str) {
         for _ in 0..50 {
@@ -962,6 +1064,7 @@ mod tests {
         assert!(t.contains("ferrum_relay_register_challenges_total 0\n"));
         assert!(t.contains("ferrum_relay_registers_rate_limited_total 0\n"));
         assert!(t.contains("ferrum_relay_register_proofs_rejected_total 0\n"));
+        assert!(t.contains("ferrum_relay_control_frames_invalid_total 0\n"));
     }
 
     #[test]
@@ -1316,18 +1419,20 @@ mod tests {
         {
             challenges += 1;
         }
-        // The burst plus whatever refilled while the loop ran (well under 1 s).
+        // Bounds, not exact counts: loopback UDP can drop under a burst, and a
+        // slow runner lets a few tokens refill (8/s) while the loop runs.
         assert!(
-            (IP_BURST..IP_BURST + 16).contains(&challenges),
+            challenges <= IP_BURST + 16,
             "{challenges} challenges for {sent} registers"
         );
-        let t = metrics.render();
-        let limited = sent - challenges;
         assert!(
-            t.contains(&format!(
-                "ferrum_relay_registers_rate_limited_total {limited}\n"
-            )),
-            "{t}"
+            challenges >= IP_BURST / 2,
+            "burst never served: {challenges}"
+        );
+        let limited = metric(&metrics, "ferrum_relay_registers_rate_limited_total");
+        assert!(
+            limited >= u64::from(sent - IP_BURST - 16),
+            "only {limited} of {sent} registers rate-limited"
         );
     }
 
@@ -1337,19 +1442,95 @@ mod tests {
     async fn roams_are_rate_limited_per_key() {
         let (relay, metrics) = start_relay().await;
         let (s, _) = ident(9);
-        for _ in 0..KEY_BURST + 2 {
+        let attempts = KEY_BURST + 4;
+        for _ in 0..attempts {
             let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             register(&sock, relay, &s).await;
         }
-        wait_for(&metrics, "ferrum_relay_registers_rate_limited_total 2\n").await;
-        let t = metrics.render();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Bounds: the per-key bucket refills at 1/s while the handshakes run.
+        let accepted = metric(&metrics, "ferrum_relay_registers_total");
+        let limited = metric(&metrics, "ferrum_relay_registers_rate_limited_total");
         assert!(
-            t.contains(&format!("ferrum_relay_registers_total {KEY_BURST}\n")),
-            "{t}"
+            accepted >= u64::from(KEY_BURST) && accepted < u64::from(attempts),
+            "accepted {accepted} of {attempts}"
         );
+        assert!(limited >= 1, "no roam was rate-limited");
+    }
+
+    /// Review fix: pre-SEC-003 clients' 33-byte registers (and other malformed
+    /// control frames) are counted as control errors, not forwarding drops,
+    /// so a rolling upgrade can't trip the relay-forwarding SLO.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn malformed_control_frames_stay_out_of_the_forwarding_sli() {
+        let (relay, metrics) = start_relay().await;
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut old_register = vec![TAG_REGISTER];
+        old_register.extend_from_slice(&key(7));
+        sock.send_to(&old_register, relay).await.unwrap(); // 33 bytes
+        sock.send_to(&[0x7f, 1, 2, 3], relay).await.unwrap(); // unknown tag
+        sock.send_to(&[TAG_DATA, 1, 2], relay).await.unwrap(); // truncated data
+        wait_for(&metrics, "ferrum_relay_control_frames_invalid_total 2\n").await;
+        assert_eq!(
+            metric(&metrics, "ferrum_relay_control_frames_invalid_total"),
+            2
+        );
+        assert_eq!(metric(&metrics, "ferrum_relay_frames_dropped_total"), 1);
+    }
+
+    #[test]
+    fn challenge_gate_only_answers_soon_after_a_register() {
+        let t0 = Instant::now();
+        let mut gate = ChallengeGate::default();
+        assert!(!gate.allow_answer(t0), "no register sent yet");
+        gate.note_register(t0);
+        assert!(gate.allow_answer(t0));
+        assert!(gate.allow_answer(t0), "one duplicate allowed");
+        assert!(!gate.allow_answer(t0), "flood capped");
+        gate.note_register(t0 + Duration::from_secs(25));
         assert!(
-            t.contains("ferrum_relay_registers_rate_limited_total 2\n"),
-            "{t}"
+            !gate.allow_answer(t0 + Duration::from_secs(31)),
+            "window expired"
+        );
+    }
+
+    /// Review fix: challenges spoofed from the relay's address are answered at
+    /// most `MAX_ANSWERS_PER_REGISTER` times per Register — the client neither
+    /// burns an X25519 per packet nor reflects a Response flood at the relay.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_caps_answers_to_spoofed_challenges() {
+        // A stand-in "relay" we fully control (never answers on its own).
+        let fake = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let fake_addr = fake.local_addr().unwrap();
+        let (s, _) = ident(3);
+        let t = RelayMeshTransport::connect(fake_addr, &s, &[])
+            .await
+            .unwrap();
+        let mut buf = [0u8; 256];
+        let (_, client) = fake.recv_from(&mut buf).await.unwrap(); // its Register
+
+        let relay_pub = XPublicKey::from(&StaticSecret::random()).to_bytes();
+        for _ in 0..20 {
+            fake.send_to(&challenge_frame(&relay_pub, &[1; COOKIE_LEN]), client)
+                .await
+                .unwrap();
+        }
+        let drive = tokio::spawn(async move {
+            let mut b = [0u8; 256];
+            let _ = t.recv_from(&mut b).await;
+        });
+        let mut responses = 0u32;
+        while let Ok(Ok((n, _))) =
+            tokio::time::timeout(Duration::from_millis(400), fake.recv_from(&mut buf)).await
+        {
+            if n == RESPONSE_LEN && buf[0] == TAG_RESPONSE {
+                responses += 1;
+            }
+        }
+        drive.abort();
+        assert_eq!(
+            responses, MAX_ANSWERS_PER_REGISTER,
+            "answered {responses} of 20"
         );
     }
 
