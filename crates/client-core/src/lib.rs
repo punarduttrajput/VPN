@@ -14,6 +14,12 @@
 //! crate-wide `unsafe` ban is lifted only for that build (normal builds keep
 //! `#![forbid(unsafe_code)]`).
 #![cfg_attr(not(feature = "uniffi"), forbid(unsafe_code))]
+// The crate's single shared [`Error`] carries `tonic::Status` (176+ bytes), so
+// every `Result<_, Error>` trips `clippy::result_large_err` — for async fns too
+// since clippy 1.98. Boxing it would change the public, uniffi-exported error
+// type across every caller and binding for no runtime benefit on these
+// control-plane paths, so allow it crate-wide rather than per function.
+#![allow(clippy::result_large_err)]
 
 pub mod client;
 pub use client::{
