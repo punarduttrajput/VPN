@@ -1388,6 +1388,7 @@ dependencies = [
  "libc",
  "quinn",
  "rcgen",
+ "ring 0.17.14",
  "rustls",
  "thiserror 1.0.69",
  "tokio",
