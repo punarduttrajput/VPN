@@ -1,1 +1,8 @@
-// Layout/palette are global (src/styles.scss); nothing component-specific yet.
+// Layout/palette are global (src/styles.scss).
+
+// A failed policy load is an error, not an empty state: don't let it read as
+// the muted "nothing here" style.
+.load-error {
+  color: var(--err);
+  font-style: normal;
+}

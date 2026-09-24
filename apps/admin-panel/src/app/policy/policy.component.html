@@ -5,29 +5,46 @@
   allow-all if none was given).
 </p>
 
-<div class="toggle">
-  <input id="policy-allow-all" type="checkbox" [formControl]="allowAll" />
-  <label for="policy-allow-all">Allow all (full mesh — ignores rules below)</label>
-</div>
+@if (loaded()) {
+  <div class="toggle">
+    <input id="policy-allow-all" type="checkbox" [formControl]="allowAll" />
+    <label for="policy-allow-all">Allow all (full mesh — ignores rules below)</label>
+  </div>
 
-<ul class="rows">
-  @for (group of ruleGroups; track group; let i = $index) {
-    <li class="rule-row" [formGroup]="group">
-      <label>
-        src tags (comma-separated, or *)
-        <input formControlName="src" />
-      </label>
-      <label>
-        dst tags (comma-separated, or *)
-        <input formControlName="dst" />
-      </label>
-      <button class="link" (click)="removeRule(i)">Remove</button>
+  <ul class="rows">
+    @for (group of ruleGroups; track group; let i = $index) {
+      <li class="rule-row" [formGroup]="group">
+        <label>
+          src tags (comma-separated, or *)
+          <input formControlName="src" />
+        </label>
+        <label>
+          dst tags (comma-separated, or *)
+          <input formControlName="dst" />
+        </label>
+        <button class="link" (click)="removeRule(i)">Remove</button>
+      </li>
+    }
+  </ul>
+} @else if (loadError()) {
+  <!-- Never show an editable (empty) form for a policy we failed to load:
+       saving it would replace the live policy with deny-all. -->
+  <ul class="rows">
+    <li class="empty load-error" role="alert">
+      Couldn't load the current policy ({{ loadError() }}). Editing is disabled until
+      it loads, so a save can't overwrite the live policy.
     </li>
-  }
-</ul>
+  </ul>
+} @else {
+  <ul class="rows">
+    <li class="empty">Loading policy…</li>
+  </ul>
+}
 
 <div class="section-actions">
-  <button class="secondary" (click)="addRule()">+ Add rule</button>
-  <button class="secondary" [disabled]="loading()" (click)="refresh()">Refresh</button>
-  <button (click)="save()">Save policy</button>
+  <button class="secondary" [disabled]="!loaded()" (click)="addRule()">+ Add rule</button>
+  <button class="secondary" [disabled]="loading()" (click)="refresh(false)">
+    {{ loadError() ? 'Retry' : 'Refresh' }}
+  </button>
+  <button [disabled]="!canSave()" (click)="save()">Save policy</button>
 </div>

@@ -28,7 +28,12 @@ xdp = [
 tokio = { workspace = true, features = ["process"] }
 thiserror.workspace = true
 tracing.workspace = true
-quinn = { workspace = true, optional = true }
+# Relay register challenge (SEC-003): X25519 proof-of-possession + keyed-BLAKE2s
+# cookies, so a relay mapping can only be claimed by the key's holder.
+x25519-dalek.workspace = true
+blake2.workspace = true
+getrandom.workspace = true
+quinn ={ workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 rcgen = { workspace = true, optional = true }
 # SEC-004: SHA-256 cert pins + HKDF for the stable TLS identity. Already in the

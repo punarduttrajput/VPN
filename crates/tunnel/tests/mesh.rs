@@ -806,20 +806,14 @@ async fn relay_connects_two_nodes_by_public_key() {
     let handle_a: SocketAddr = "127.0.0.1:9001".parse().unwrap();
     let handle_b: SocketAddr = "127.0.0.1:9002".parse().unwrap();
 
-    let trans_a = RelayMeshTransport::connect(
-        relay_addr,
-        a.public.to_bytes(),
-        &[(handle_b, b.public.to_bytes())],
-    )
-    .await
-    .unwrap();
-    let trans_b = RelayMeshTransport::connect(
-        relay_addr,
-        b.public.to_bytes(),
-        &[(handle_a, a.public.to_bytes())],
-    )
-    .await
-    .unwrap();
+    let trans_a =
+        RelayMeshTransport::connect(relay_addr, &a.private, &[(handle_b, b.public.to_bytes())])
+            .await
+            .unwrap();
+    let trans_b =
+        RelayMeshTransport::connect(relay_addr, &b.private, &[(handle_a, a.public.to_bytes())])
+            .await
+            .unwrap();
 
     // A reaches B at handle_b; B reaches A at handle_a — both via the relay.
     let a_peers = vec![MeshPeer::new(
@@ -925,10 +919,10 @@ async fn relay_fallback_carries_traffic_when_direct_is_blocked() {
 
     // Relay transports connect with no peers; run_mesh_relayed aligns their tables
     // from the peer set (using each peer's blackhole endpoint as a stable handle).
-    let relay_a = RelayMeshTransport::connect(relay_addr, a.public.to_bytes(), &[])
+    let relay_a = RelayMeshTransport::connect(relay_addr, &a.private, &[])
         .await
         .unwrap();
-    let relay_b = RelayMeshTransport::connect(relay_addr, b.public.to_bytes(), &[])
+    let relay_b = RelayMeshTransport::connect(relay_addr, &b.private, &[])
         .await
         .unwrap();
 
@@ -1031,10 +1025,10 @@ async fn direct_path_is_used_when_available_despite_a_relay() {
         while dead_relay.recv_from(&mut buf).await.is_ok() {}
     });
 
-    let relay_a = RelayMeshTransport::connect(dead_relay_addr, a.public.to_bytes(), &[])
+    let relay_a = RelayMeshTransport::connect(dead_relay_addr, &a.private, &[])
         .await
         .unwrap();
-    let relay_b = RelayMeshTransport::connect(dead_relay_addr, b.public.to_bytes(), &[])
+    let relay_b = RelayMeshTransport::connect(dead_relay_addr, &b.private, &[])
         .await
         .unwrap();
 
