@@ -176,13 +176,31 @@ struct AdminUi;
 
 async fn static_asset(uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
-    // A hit is a real asset (index.html, a hashed JS/CSS chunk, favicon); a
-    // miss is one of the Angular router's client-side paths (/devices,
-    // /policy, or a hard refresh on either) — serve the app shell for those
-    // too and let its Router take over.
-    serve_embedded(path)
-        .or_else(|| serve_embedded("index.html"))
-        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
+    // An /api/* path that no route above matched is a missing endpoint, not a
+    // client-side route: answer 404 rather than a 200 app shell, so a typo'd or
+    // not-yet-deployed API call fails loudly instead of "succeeding" with HTML
+    // (PRD admin-panel-angular.md §10). Unauthenticated on purpose — it reveals
+    // nothing beyond "no such route". Case-insensitive, so `/API/...` can't
+    // slip past it (the routes above are case-sensitive and wouldn't match).
+    let first_segment = path.split('/').next().unwrap_or("");
+    if first_segment.eq_ignore_ascii_case("api") {
+        return (StatusCode::NOT_FOUND, "no such API route").into_response();
+    }
+    // A hit is a real asset (index.html, a hashed JS/CSS chunk, favicon).
+    if let Some(asset) = serve_embedded(path) {
+        return asset;
+    }
+    // A miss that names a file (`chunk-OLD.js` requested by a tab loaded
+    // before an upgrade) is a missing asset: 404, so the browser reports a
+    // failed load instead of trying to run index.html as a script. Only
+    // extensionless paths are the Angular router's client-side routes
+    // (/devices, /policy, or a hard refresh on either) — serve the app shell
+    // for those and let its Router take over.
+    let last_segment = path.rsplit('/').next().unwrap_or("");
+    if last_segment.contains('.') {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    serve_embedded("index.html").unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
 }
 
 fn serve_embedded(path: &str) -> Option<Response> {
@@ -403,5 +421,59 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// PRD admin-panel-angular.md §10: an unknown /api/* path must never fall
+    /// through to the SPA shell (it used to answer 200 + index.html), while the
+    /// Angular client-side routes still do.
+    #[tokio::test]
+    async fn unknown_api_paths_404_instead_of_serving_the_app() {
+        let signer = TestSigner::new("k1");
+        let (_registry, router) =
+            state_and_router(signer.verifier("https://idp.example", "ferrum-admin"));
+        let admin = admin_token(&signer, 3600);
+
+        for (uri, token) in [
+            ("/api/nonexistent", None),
+            ("/api/nonexistent", Some(admin.as_str())),
+            ("/api/devices/nope", Some(admin.as_str())),
+            ("/api", None),
+            // Wrong case can't slip past the guard either.
+            ("/API/devices", Some(admin.as_str())),
+            ("/Api/policy", None),
+            // A missing asset file isn't a client-side route.
+            ("/chunk-DOESNOTEXIST.js", None),
+            ("/assets/missing.css", None),
+        ] {
+            let mut req = Request::builder().uri(uri);
+            if let Some(t) = token {
+                req = req.header("authorization", format!("Bearer {t}"));
+            }
+            let resp = router
+                .clone()
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+            let ct = resp
+                .headers()
+                .get("content-type")
+                .map(|v| v.to_str().unwrap().to_string());
+            assert_ne!(
+                ct.as_deref(),
+                Some("text/html"),
+                "{uri} served the app shell"
+            );
+        }
+
+        // Client-side routes (a hard refresh on them) still get the app shell.
+        for uri in ["/devices", "/policy", "/dashboard"] {
+            let resp = router
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        }
     }
 }

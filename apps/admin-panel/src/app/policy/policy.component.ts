@@ -1,4 +1,5 @@
-import { Component, inject, signal } from '@angular/core';
+import { Component, computed, inject, signal } from '@angular/core';
+import { HttpErrorResponse } from '@angular/common/http';
 import { FormBuilder, FormControl, FormGroup, ReactiveFormsModule } from '@angular/forms';
 
 import { PolicyService } from '../core/policy.service';
@@ -19,6 +20,15 @@ export class PolicyComponent {
   private readonly fb = inject(FormBuilder);
 
   readonly loading = signal(false);
+  readonly saving = signal(false);
+  /**
+   * True only while the form holds the policy most recently fetched from the
+   * coordinator. Until then the form is empty (allow_all off, no rules), and
+   * saving it would silently replace the live policy with deny-all.
+   */
+  readonly loaded = signal(false);
+  readonly loadError = signal<string | null>(null);
+  readonly canSave = computed(() => this.loaded() && !this.loading() && !this.saving());
   readonly allowAll = this.fb.control(false);
   readonly rules = this.fb.array<RuleGroup>([]);
 
@@ -30,14 +40,37 @@ export class PolicyComponent {
     return this.rules.controls as RuleGroup[];
   }
 
-  refresh(): void {
+  /**
+   * Re-fetch the policy into the form. `afterSave` marks the re-fetch that
+   * follows a successful save, so a failure there doesn't read as the save
+   * having failed.
+   */
+  refresh(afterSave = false): void {
     this.loading.set(true);
     this.policyService.get().subscribe({
       next: (policy) => {
         this.render(policy);
+        this.loaded.set(true);
+        this.loadError.set(null);
         this.loading.set(false);
       },
-      error: () => this.loading.set(false),
+      error: (err) => {
+        // Whatever the form holds is no longer known to match the coordinator,
+        // so it must not be saveable (see `loaded`).
+        this.loaded.set(false);
+        this.loadError.set(errorText(err));
+        this.loading.set(false);
+        // 401/403: authInterceptor has already signed out, shown "sign in
+        // again", and redirected — don't overwrite that with a stale banner
+        // the operator would see after logging back in.
+        if (isAuthError(err)) return;
+        this.status.show(
+          afterSave
+            ? `Policy saved, but reloading it failed: ${errorText(err)}. Retry to keep editing.`
+            : `Failed to load the policy: ${errorText(err)}`,
+          'err',
+        );
+      },
     });
   }
 
@@ -50,6 +83,7 @@ export class PolicyComponent {
   }
 
   save(): void {
+    if (!this.canSave()) return;
     const policy: Policy = {
       allow_all: Boolean(this.allowAll.value),
       rules: this.ruleGroups.map((group) => ({
@@ -57,12 +91,17 @@ export class PolicyComponent {
         dst: splitTags(group.controls.dst.value ?? ''),
       })),
     };
+    this.saving.set(true);
     this.policyService.save(policy).subscribe({
       next: () => {
+        this.saving.set(false);
         this.status.show('Policy saved.', 'ok');
-        this.refresh();
+        this.refresh(true);
       },
-      error: (err) => this.status.show(`Save failed: ${errorText(err)}`, 'err'),
+      error: (err) => {
+        this.saving.set(false);
+        this.status.show(`Save failed: ${errorText(err)}`, 'err');
+      },
     });
   }
 
@@ -87,6 +126,10 @@ function splitTags(value: string): string[] {
     .split(',')
     .map((t) => t.trim())
     .filter((t) => t.length > 0);
+}
+
+function isAuthError(err: unknown): boolean {
+  return err instanceof HttpErrorResponse && (err.status === 401 || err.status === 403);
 }
 
 function errorText(err: unknown): string {
