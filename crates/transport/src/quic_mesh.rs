@@ -117,20 +117,6 @@ impl QuicMeshTransport {
         self.fingerprint
     }
 
-    /// Replace the expected cert pins, keyed by each address a peer may be dialed
-    /// at. Applies to connections dialed from now on; one already established to
-    /// an address keeps the pin it was verified against.
-    pub fn set_peer_pins(&self, pins: &[(SocketAddr, Vec<Fingerprint>)]) {
-        let mut map = self.pins.lock().expect("quic mesh pins poisoned");
-        map.clear();
-        map.extend(pins.iter().cloned());
-        // New pins are new information: retry previously refused peers now.
-        self.backoff
-            .lock()
-            .expect("quic mesh backoff poisoned")
-            .clear();
-    }
-
     /// Client config for dialing `dst`, pinned to its expected cert(s).
     fn client_config_for(&self, dst: SocketAddr) -> Result<ClientConfig, TransportError> {
         let pins = self
@@ -218,10 +204,32 @@ impl MeshTransport for QuicMeshTransport {
         buf[..n].copy_from_slice(&datagram[..n]);
         Ok((n, src))
     }
+
+    /// Replace the expected cert pins, keyed by each address a peer may be dialed
+    /// at. Applies to connections dialed from now on; one already established to
+    /// an address keeps the pin it was verified against.
+    fn set_peer_pins(&self, pins: &[(SocketAddr, Vec<Fingerprint>)]) {
+        let new: HashMap<SocketAddr, Vec<Fingerprint>> = pins.iter().cloned().collect();
+        let mut map = self.pins.lock().expect("quic mesh pins poisoned");
+        // A changed pin is new information: retry that address now. Unchanged
+        // ones keep their backoff — this runs on every network-map update, and
+        // resetting everything would re-dial refused peers every few seconds.
+        let mut backoff = self.backoff.lock().expect("quic mesh backoff poisoned");
+        for addr in map.keys().chain(new.keys()) {
+            if map.get(addr) != new.get(addr) {
+                backoff.note_success(*addr);
+            }
+        }
+        *map = new;
+    }
+
+    fn tls_fingerprint(&self) -> Option<Fingerprint> {
+        Some(self.fingerprint)
+    }
 }
 
 /// Per-destination exponential backoff for failed dials: 1 s, doubling to 30 s,
-/// reset on a successful dial (or new pins).
+/// reset on a successful dial (or when that destination's pins change).
 #[derive(Default)]
 pub(crate) struct DialBackoff {
     /// `dst -> (retry not before, current delay)`.
@@ -252,10 +260,6 @@ impl DialBackoff {
 
     pub(crate) fn note_success(&mut self, dst: SocketAddr) {
         self.failed.remove(&dst);
-    }
-
-    pub(crate) fn clear(&mut self) {
-        self.failed.clear();
     }
 }
 
@@ -370,6 +374,24 @@ mod tests {
             .expect("B did not receive after a correctly pinned dial")
             .unwrap();
         assert_eq!(&buf[..n], b"hello");
+    }
+
+    /// Review fix: re-applying the *same* pins (every network-map update does)
+    /// keeps a refused peer's backoff; changing its pin clears it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unchanged_pins_keep_their_backoff() {
+        let a = node(11).await;
+        assert_eq!(a.tls_fingerprint(), Some(a.fingerprint()));
+        let dst: SocketAddr = "192.0.2.7:9".parse().unwrap();
+        let pins = [(dst, vec![[7u8; 32]])];
+        a.set_peer_pins(&pins);
+        a.backoff.lock().unwrap().note_failure(dst, Instant::now());
+
+        a.set_peer_pins(&pins); // same pins: still backing off
+        assert!(a.backoff.lock().unwrap().is_waiting(dst, Instant::now()));
+
+        a.set_peer_pins(&[(dst, vec![[8u8; 32]])]); // new pin: retry now
+        assert!(!a.backoff.lock().unwrap().is_waiting(dst, Instant::now()));
     }
 
     #[test]

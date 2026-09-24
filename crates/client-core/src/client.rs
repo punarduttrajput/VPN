@@ -173,6 +173,10 @@ struct Inner {
     /// makes (via [`FerrumClient::set_token`]). `None` when the coordinator runs
     /// without auth.
     token: Option<String>,
+    /// This device's TLS cert pin, published on every registration (via
+    /// [`FerrumClient::set_tls_fingerprint`]; SEC-004). `None` without a TLS
+    /// transport.
+    tls_fingerprint: Option<String>,
 }
 
 /// The shared client core: connection state machine + control-plane sync.
@@ -222,14 +226,46 @@ impl FerrumClient {
         self.inner.lock().expect("client mutex poisoned").token = token;
     }
 
-    /// The currently configured bearer token, if any (crate-internal: the
-    /// data-plane runner reads it to authenticate its own control channels).
+    /// The currently configured bearer token, if any. (Channels read it via
+    /// [`control`](Self::control); this accessor exists for tests.)
+    #[cfg(test)]
     pub(crate) fn token(&self) -> Option<String> {
         self.inner
             .lock()
             .expect("client mutex poisoned")
             .token
             .clone()
+    }
+
+    /// Publish (or clear) this device's outer-transport TLS cert pin — the hex
+    /// SHA-256 of the cert it presents to QUIC dialers (SEC-004;
+    /// `TlsIdentity::fingerprint`). Sent with every registration, so the
+    /// coordinator can hand it to peers, which then pin it. `run_mesh_session`
+    /// sets this itself from its transport (`MeshTransport::tls_fingerprint`),
+    /// so shells only need it for a bare `connect` without a data plane.
+    pub fn set_tls_fingerprint(&self, pin: Option<String>) {
+        self.inner
+            .lock()
+            .expect("client mutex poisoned")
+            .tls_fingerprint = pin;
+    }
+
+    /// A control channel to `coordinator` carrying this client's bearer token
+    /// and TLS pin (crate-internal: every channel the facade and the data-plane
+    /// runner open goes through here).
+    pub(crate) async fn control(&self, coordinator: String) -> Result<ControlClient, Error> {
+        let (token, pin) = {
+            let inner = self.inner.lock().expect("client mutex poisoned");
+            (inner.token.clone(), inner.tls_fingerprint.clone())
+        };
+        let mut control = ControlClient::connect(coordinator).await?;
+        if let Some(token) = token {
+            control = control.with_token(token);
+        }
+        if let Some(pin) = pin {
+            control = control.with_tls_fingerprint(pin);
+        }
+        Ok(control)
     }
 
     /// The current connection state.
@@ -379,10 +415,7 @@ impl FerrumClient {
         coordinator: String,
         identity: &ClientIdentity,
     ) -> Result<(), Error> {
-        let mut control = ControlClient::connect(coordinator).await?;
-        if let Some(token) = self.token() {
-            control = control.with_token(token);
-        }
+        let mut control = self.control(coordinator).await?;
         let plan = control
             .plan(
                 &identity.public_key,
@@ -432,10 +465,7 @@ impl FerrumClient {
         old_public_key: &str,
         new_public_key: &str,
     ) -> Result<String, Error> {
-        let mut control = ControlClient::connect(coordinator.into()).await?;
-        if let Some(token) = self.token() {
-            control = control.with_token(token);
-        }
+        let mut control = self.control(coordinator.into()).await?;
         control.rotate_key(old_public_key, new_public_key).await
     }
 

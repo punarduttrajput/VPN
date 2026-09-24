@@ -17,7 +17,7 @@ use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
 use crate::metrics::Metrics;
-use crate::registry::{Registry, RegistryError};
+use crate::registry::{normalize_tls_pin, Registry, RegistryError};
 
 /// How often a relay should heartbeat, directed to it in every
 /// [`RelayHeartbeatResponse`] (PRD `phase-6-anycast-autoscaling.md` FR3).
@@ -127,6 +127,7 @@ fn current_map(
             endpoint: d.endpoint,
             allowed_ips: vec![format!("{}/32", d.tunnel_ip)],
             candidates: d.candidates,
+            tls_cert_sha256: d.tls_cert_sha256,
         })
         .collect();
     NetworkMapResponse {
@@ -403,6 +404,11 @@ impl Coordinator for CoordinatorService {
             Some(c) => &c.tags,
             None => &req.tags,
         };
+        // SEC-004: the device's TLS cert pin, distributed to peers that dial it
+        // over QUIC. Bound to this (authenticated, SEC-002) registration.
+        let tls_pin = normalize_tls_pin(&req.tls_cert_sha256).ok_or_else(|| {
+            Status::invalid_argument("tls_cert_sha256 must be 64 hex digits or empty")
+        })?;
         let ip = {
             let mut reg = self.registry.lock().expect("registry mutex poisoned");
             // SEC-002: an authenticated caller (OIDC token or mTLS client cert)
@@ -411,8 +417,15 @@ impl Coordinator for CoordinatorService {
                 reg.bind_identity(identity, &req.public_key)
                     .map_err(|e| Status::failed_precondition(e.to_string()))?;
             }
-            reg.register(&req.public_key, &req.name, &req.endpoint, tags)
-                .map_err(|e| Status::invalid_argument(e.to_string()))?
+            // One store write carries the device and its pin.
+            reg.register_with_pin(
+                &req.public_key,
+                &req.name,
+                &req.endpoint,
+                tags,
+                Some(&tls_pin),
+            )
+            .map_err(|e| Status::invalid_argument(e.to_string()))?
         };
         // Notify watchers that the network changed (ignored if none are connected).
         let _ = self.changes.send(());
@@ -568,6 +581,11 @@ impl Coordinator for CoordinatorService {
         let bound_identity = self.bound_identity(&request, &claims);
         self.metrics.inc_rotate_key();
         let req = request.into_inner();
+        // The device's TLS cert is derived from its WireGuard key, so a rotation
+        // carries the new pin (or clears it) — never keep the stale one.
+        let tls_pin = normalize_tls_pin(&req.new_tls_cert_sha256).ok_or_else(|| {
+            Status::invalid_argument("new_tls_cert_sha256 must be 64 hex digits or empty")
+        })?;
         let ip = {
             let mut reg = self.registry.lock().expect("registry mutex poisoned");
             // SEC-002: the authorized rotation path — an authenticated caller
@@ -577,14 +595,18 @@ impl Coordinator for CoordinatorService {
                 reg.rebind_identity(identity, &req.old_public_key, &req.new_public_key)
                     .map_err(|e| Status::failed_precondition(e.to_string()))?;
             }
-            reg.rotate_key(&req.old_public_key, &req.new_public_key)
+            let ip = reg
+                .rotate_key(&req.old_public_key, &req.new_public_key)
                 .map_err(|e| match e {
                     RegistryError::UnknownDevice => Status::not_found(e.to_string()),
                     RegistryError::InvalidKey | RegistryError::KeyInUse => {
                         Status::invalid_argument(e.to_string())
                     }
                     other => Status::internal(other.to_string()),
-                })?
+                })?;
+            reg.set_tls_pin(&req.new_public_key, &tls_pin)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            ip
         };
         // The device now answers under a new key; push a fresh map so peers
         // re-handshake to it (PRD Phase 3 FR3 graceful re-handshake).
@@ -634,6 +656,7 @@ mod tests {
                 name: "a".into(),
                 endpoint: "1.1.1.1:51820".into(),
                 tags: vec![],
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -646,6 +669,7 @@ mod tests {
                 name: "b".into(),
                 endpoint: "2.2.2.2:51820".into(),
                 tags: vec![],
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -679,6 +703,7 @@ mod tests {
             name: "a".into(),
             endpoint: "1.1.1.1:51820".into(),
             tags: vec![],
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -699,6 +724,7 @@ mod tests {
             name: "a".into(),
             endpoint: "1.1.1.1:51820".into(),
             tags: vec![],
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -728,6 +754,7 @@ mod tests {
                 name: pk.into(),
                 endpoint: ep.into(),
                 tags: vec![],
+                ..Default::default()
             }))
             .await
             .unwrap();
@@ -740,6 +767,7 @@ mod tests {
         svc.rotate_key(Request::new(RotateKeyRequest {
             old_public_key: "AAA".into(),
             new_public_key: "CCC".into(),
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -753,6 +781,112 @@ mod tests {
         assert!(text.contains("ferrum_rotate_key_total 1\n"), "{text}");
         assert!(text.contains("ferrum_devices_registered 2\n"), "{text}");
         assert!(text.contains("ferrum_unauthenticated_total 0\n"), "{text}");
+    }
+
+    /// SEC-004: a device's registered TLS cert pin reaches its peers' maps
+    /// (normalized), a malformed pin is rejected, a re-registration replaces the
+    /// pin, and a key rotation carries the new one (never the stale pin).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tls_pin_is_distributed_to_peers() {
+        let registry = Arc::new(Mutex::new(Registry::new(Ipv4Addr::new(10, 8, 0, 0), 24)));
+        let svc = CoordinatorService::new(registry);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(CoordinatorServer::new(svc))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let mut client = CoordinatorClient::connect(format!("http://{addr}"))
+            .await
+            .unwrap();
+        let register = |pk: &str, pin: &str| RegisterDeviceRequest {
+            public_key: pk.into(),
+            name: pk.into(),
+            endpoint: "1.1.1.1:51820".into(),
+            tls_cert_sha256: pin.into(),
+            ..Default::default()
+        };
+        let pin_of = |map: NetworkMapResponse, pk: &str| {
+            map.peers
+                .into_iter()
+                .find(|p| p.public_key == pk)
+                .map(|p| p.tls_cert_sha256)
+                .expect("peer in map")
+        };
+
+        // openssl-style (uppercase, colon-separated) is accepted and normalized.
+        let openssl = vec!["AB"; 32].join(":");
+        client
+            .register_device(register("A", &openssl))
+            .await
+            .unwrap();
+        client.register_device(register("B", "")).await.unwrap();
+        let map = client
+            .get_network_map(NetworkMapRequest {
+                public_key: "B".into(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(pin_of(map, "A"), "ab".repeat(32));
+
+        // Malformed pins are refused outright.
+        let err = client
+            .register_device(register("C", "not-a-pin"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        // Re-registering replaces the pin.
+        client
+            .register_device(register("A", &"cd".repeat(32)))
+            .await
+            .unwrap();
+        let map = client
+            .get_network_map(NetworkMapRequest {
+                public_key: "B".into(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(pin_of(map, "A"), "cd".repeat(32));
+
+        // Rotation carries the new key's pin — or clears it — never the old one.
+        client
+            .rotate_key(RotateKeyRequest {
+                old_public_key: "A".into(),
+                new_public_key: "A2".into(),
+                new_tls_cert_sha256: "ef".repeat(32),
+            })
+            .await
+            .unwrap();
+        let map = client
+            .get_network_map(NetworkMapRequest {
+                public_key: "B".into(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(pin_of(map, "A2"), "ef".repeat(32));
+        client
+            .rotate_key(RotateKeyRequest {
+                old_public_key: "A2".into(),
+                new_public_key: "A3".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let map = client
+            .get_network_map(NetworkMapRequest {
+                public_key: "B".into(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(pin_of(map, "A3"), "");
     }
 
     /// End-to-end over gRPC: a device rotates its key and a peer's network map
@@ -780,6 +914,7 @@ mod tests {
                 name: "a".into(),
                 endpoint: "1.1.1.1:51820".into(),
                 tags: vec![],
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -789,6 +924,7 @@ mod tests {
                 name: "b".into(),
                 endpoint: "2.2.2.2:51820".into(),
                 tags: vec![],
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -798,6 +934,7 @@ mod tests {
             .rotate_key(RotateKeyRequest {
                 old_public_key: "OLD".into(),
                 new_public_key: "NEW".into(),
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -821,6 +958,7 @@ mod tests {
             .rotate_key(RotateKeyRequest {
                 old_public_key: "GHOST".into(),
                 new_public_key: "X".into(),
+                ..Default::default()
             })
             .await
             .unwrap_err();
@@ -841,6 +979,7 @@ mod tests {
             name: "a".into(),
             endpoint: "1.1.1.1:51820".into(),
             tags: vec![],
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -923,6 +1062,7 @@ mod tests {
             name: "a".into(),
             endpoint: "1.1.1.1:51820".into(),
             tags: vec![],
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -961,6 +1101,7 @@ mod tests {
             name: "a".into(),
             endpoint: "1.1.1.1:51820".into(),
             tags: vec![],
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -1049,6 +1190,7 @@ mod tests {
                 name: "a".into(),
                 endpoint: "1.1.1.1:51820".into(),
                 tags: vec!["admin".into()],
+                ..Default::default()
             })
             .await;
         assert_eq!(no_token.unwrap_err().code(), tonic::Code::Unauthenticated);
@@ -1068,6 +1210,7 @@ mod tests {
             name: "a".into(),
             endpoint: "1.1.1.1:51820".into(),
             tags: vec!["admin".into()],
+            ..Default::default()
         });
         req.metadata_mut()
             .insert("authorization", format!("Bearer {token}").parse().unwrap());
@@ -1134,6 +1277,7 @@ mod tests {
                     name: "a".into(),
                     endpoint: "1.1.1.1:51820".into(),
                     tags: vec![],
+                    ..Default::default()
                 },
                 &token,
             ))
@@ -1148,6 +1292,7 @@ mod tests {
                     name: "a".into(),
                     endpoint: "2.2.2.2:51820".into(),
                     tags: vec![],
+                    ..Default::default()
                 },
                 &token,
             ))
@@ -1162,6 +1307,7 @@ mod tests {
                     name: "a".into(),
                     endpoint: "1.1.1.1:51820".into(),
                     tags: vec![],
+                    ..Default::default()
                 },
                 &token,
             ))
@@ -1179,6 +1325,7 @@ mod tests {
                 RotateKeyRequest {
                     old_public_key: "AAA".into(),
                     new_public_key: "CCC".into(),
+                    ..Default::default()
                 },
                 &token,
             ))
@@ -1194,6 +1341,7 @@ mod tests {
                     name: "a".into(),
                     endpoint: "1.1.1.1:51820".into(),
                     tags: vec![],
+                    ..Default::default()
                 },
                 &token,
             ))
@@ -1208,6 +1356,7 @@ mod tests {
                     name: "a".into(),
                     endpoint: "1.1.1.1:51820".into(),
                     tags: vec![],
+                    ..Default::default()
                 },
                 &token,
             ))

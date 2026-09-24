@@ -105,9 +105,17 @@ What a pin protects, and what it doesn't:
   (so existing setups keep working) but logs an "outer transport
   UNAUTHENTICATED" warning every time it connects.
 
-The coordinator-managed QUIC mesh (`up-mesh`) dials each peer with the peer's
-pin once the coordinator distributes pins (the second SEC-004 PR). Until then,
-mesh peers are dialed with the warning.
+In the coordinator-managed QUIC mesh (`up-mesh`, desktop) pinning is
+automatic. Each node publishes its public-key pin when it registers, the
+coordinator hands it to peers in the network map, and every dial to a peer is
+pinned to it, with no configuration. A peer that registered without a pin (for
+example an older client) is still dialed, with the warning.
+
+Those pins are only as trustworthy as the connection to the coordinator that
+delivers them. If that connection is plain `http://`, someone on the path
+between a device and the coordinator could swap in their own pin (or, for that
+matter, their own WireGuard key). Protect the control channel with mTLS
+(`--tls-cert/--tls-key/--tls-ca`) or run it only over a network you trust.
 
 **Padding (obfuscation, FR5):** add `padding = true` (optionally `pad_to = 1280`)
 to `[transport]` to normalize datagram sizes against fingerprinting. Both peers

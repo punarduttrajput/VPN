@@ -244,6 +244,21 @@ fn tls_identity(config: &Config) -> Result<ferrum_transport::TlsIdentity> {
     ferrum_transport::TlsIdentity::from_wireguard_key(&key).context("deriving TLS identity")
 }
 
+/// The TLS pin this node publishes to the coordinator for the mesh (SEC-004):
+/// only when it runs the QUIC mesh transport, where peers dial it as a TLS
+/// server. MASQUE nodes dial a proxy and UDP has no TLS, so they publish none.
+fn mesh_tls_pin(config: &Config) -> Result<Option<String>> {
+    #[cfg(any(feature = "quic", feature = "masque"))]
+    if config.transport.mode == TransportMode::Quic {
+        let id = tls_identity(config)?;
+        return Ok(Some(ferrum_transport::tls::fingerprint_hex(
+            &id.fingerprint(),
+        )));
+    }
+    let _ = config; // without a QUIC build there is never a pin to publish
+    Ok(None)
+}
+
 /// `transport.cert_pins`, decoded (already format-checked by config validation).
 #[cfg(any(feature = "quic", feature = "masque"))]
 fn cert_pins(config: &Config) -> Result<Vec<ferrum_transport::Fingerprint>> {
@@ -762,6 +777,12 @@ async fn up_mesh(
     if let Some(token) = &token {
         control = control.with_token(token.clone());
     }
+    // SEC-004: over the QUIC mesh, peers dial this node as a TLS server; publish
+    // the pin of the cert it presents so the coordinator can hand it to them.
+    let tls_pin = mesh_tls_pin(&config)?;
+    if let Some(pin) = &tls_pin {
+        control = control.with_tls_fingerprint(pin.clone());
+    }
     let address = control
         .register(&public_key, name, endpoint, tags)
         .await
@@ -827,6 +848,8 @@ async fn up_mesh(
     // `transport.relay` override else whatever the coordinator advertises.
     let client = FerrumClient::new();
     client.set_token(token);
+    // (The session publishes its transport's own TLS pin at each registration
+    // — `run_mesh_session` — so it can't drift from the key in use.)
     let identity = ClientIdentity {
         public_key: public_key.clone(),
         name: name.to_string(),

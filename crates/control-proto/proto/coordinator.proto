@@ -41,6 +41,13 @@ message RegisterDeviceRequest {
   string name = 2;            // human-friendly device label
   string endpoint = 3;        // reachable UDP endpoint "ip:port" (may be empty)
   repeated string tags = 4;   // device tags for ACL/policy matching
+  // The TLS pin of this device (SEC-004): SHA-256 (64 lowercase hex) of the
+  // SubjectPublicKeyInfo — the *public key*, not the whole certificate — that
+  // it presents when peers dial it over QUIC, or empty when it isn't
+  // reachable over a TLS transport. Distributed to permitted peers in the
+  // network map so they can pin it. Replaced on every registration. (The
+  // field name predates the switch to key pins; the wire name is kept.)
+  string tls_cert_sha256 = 5;
 }
 
 message RegisterDeviceResponse {
@@ -56,6 +63,9 @@ message PeerInfo {
   string endpoint = 2;            // "ip:port"
   repeated string allowed_ips = 3; // CIDRs routed to this peer
   repeated string candidates = 4;  // ICE candidates (host + reflexive "ip:port")
+  // The peer's registered TLS pin (public-key hash; see RegisterDeviceRequest),
+  // or empty. A dialer over QUIC accepts only a certificate with this key.
+  string tls_cert_sha256 = 5;
 }
 
 message NetworkMapResponse {
@@ -92,6 +102,9 @@ message RelayHeartbeatResponse {
 message RotateKeyRequest {
   string old_public_key = 1; // the device's current public key
   string new_public_key = 2; // the freshly generated public key to switch to
+  // The TLS pin that goes with the new key (a device's TLS key is derived
+  // from its WireGuard key, so it changes too), or empty to clear the pin.
+  string new_tls_cert_sha256 = 3;
 }
 
 message RotateKeyResponse {

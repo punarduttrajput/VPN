@@ -685,38 +685,37 @@ async fn quic_mesh_routes_packets_to_the_right_peer() {
     let qb = quic_node(&b).await;
     let qc = quic_node(&c).await;
     let (addr_a, addr_b, addr_c) = (qa.local_addr(), qb.local_addr(), qc.local_addr());
-    // Everyone pins everyone (what the coordinator-distributed pins will do).
-    let pins = [
-        (addr_a, vec![qa.fingerprint()]),
-        (addr_b, vec![qb.fingerprint()]),
-        (addr_c, vec![qc.fingerprint()]),
-    ];
-    for q in [&qa, &qb, &qc] {
-        q.set_peer_pins(&pins);
-    }
+    // Each peer carries its expected TLS pin (as `build_mesh_peers` does from the
+    // coordinator's map); `run_mesh` hands them to the transport (SEC-004), so
+    // every dial below is pinned.
+    let (pin_a, pin_b, pin_c) = (qa.fingerprint(), qb.fingerprint(), qc.fingerprint());
 
     let a_peers = vec![
         MeshPeer::new(
             Session::from_bytes(a.private.to_bytes(), b.public.to_bytes(), 1).unwrap(),
             addr_b,
             vec![cidr("10.8.0.2/32")],
-        ),
+        )
+        .with_tls_pins(vec![pin_b]),
         MeshPeer::new(
             Session::from_bytes(a.private.to_bytes(), c.public.to_bytes(), 2).unwrap(),
             addr_c,
             vec![cidr("10.8.0.3/32")],
-        ),
+        )
+        .with_tls_pins(vec![pin_c]),
     ];
     let b_peers = vec![MeshPeer::new(
         Session::from_bytes(b.private.to_bytes(), a.public.to_bytes(), 1).unwrap(),
         addr_a,
         vec![cidr("10.8.0.1/32")],
-    )];
+    )
+    .with_tls_pins(vec![pin_a])];
     let c_peers = vec![MeshPeer::new(
         Session::from_bytes(c.private.to_bytes(), a.public.to_bytes(), 1).unwrap(),
         addr_a,
         vec![cidr("10.8.0.1/32")],
-    )];
+    )
+    .with_tls_pins(vec![pin_a])];
 
     let tun_a = MockTun::default();
     let tun_b = MockTun::default();

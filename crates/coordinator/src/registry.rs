@@ -56,6 +56,21 @@ pub struct Device {
     /// `ip:port` strings), distributed to permitted peers for NAT traversal
     /// (PRD Phase 4). Empty until the device calls `set_candidates`.
     pub candidates: Vec<String>,
+    /// SHA-256 pin (64 lowercase hex) of the TLS cert this device presents to
+    /// QUIC dialers (SEC-004), or empty. Distributed to permitted peers.
+    pub tls_cert_sha256: String,
+}
+
+/// Normalize a TLS pin (SHA-256 of the device's TLS public key) to 64 lowercase
+/// hex digits, or `""` for none; `None` if malformed. Parsing is shared with
+/// the clients (`ferrum_transport::fingerprint`) so both accept exactly the
+/// same forms.
+pub fn normalize_tls_pin(s: &str) -> Option<String> {
+    use ferrum_transport::fingerprint::{fingerprint_hex, parse_fingerprint};
+    if s.trim().is_empty() {
+        return Some(String::new());
+    }
+    parse_fingerprint(s).ok().map(|fp| fingerprint_hex(&fp))
 }
 
 /// Registry of devices and their assigned tunnel addresses.
@@ -198,13 +213,28 @@ impl Registry {
     }
 
     /// Register or re-register a device. Re-registering the same public key is
-    /// idempotent: the name/endpoint/tags are refreshed and the existing IP kept.
+    /// idempotent: the name/endpoint/tags are refreshed and the existing IP kept
+    /// (and any existing TLS pin left as is — see [`register_with_pin`](Self::register_with_pin)).
     pub fn register(
         &mut self,
         public_key: &str,
         name: &str,
         endpoint: &str,
         tags: &[String],
+    ) -> Result<Ipv4Addr, RegistryError> {
+        self.register_with_pin(public_key, name, endpoint, tags, None)
+    }
+
+    /// [`register`](Self::register), also setting the device's TLS pin
+    /// (SEC-004) in the same single store write when `pin` is `Some` (already
+    /// normalized — see [`normalize_tls_pin`]; `Some("")` clears it).
+    pub fn register_with_pin(
+        &mut self,
+        public_key: &str,
+        name: &str,
+        endpoint: &str,
+        tags: &[String],
+        pin: Option<&str>,
     ) -> Result<Ipv4Addr, RegistryError> {
         if public_key.trim().is_empty() {
             return Err(RegistryError::InvalidKey);
@@ -216,6 +246,9 @@ impl Registry {
             existing.name = name.to_string();
             existing.endpoint = endpoint.to_string();
             existing.tags = tags.to_vec();
+            if let Some(pin) = pin {
+                existing.tls_cert_sha256 = pin.to_string();
+            }
             existing.clone()
         } else {
             let ip = self.allocate()?;
@@ -228,6 +261,7 @@ impl Registry {
                 // Candidates are published separately (after STUN), via
                 // `set_candidates`; a fresh registration starts with none.
                 candidates: Vec::new(),
+                tls_cert_sha256: pin.unwrap_or_default().to_string(),
             };
             self.by_key.insert(public_key.to_string(), device.clone());
             device
@@ -255,6 +289,26 @@ impl Registry {
                 .get_mut(public_key)
                 .ok_or(RegistryError::UnknownDevice)?;
             device.candidates = candidates.to_vec();
+            device.clone()
+        };
+        self.store
+            .upsert(&device)
+            .map_err(|e| RegistryError::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Record the TLS cert pin a registered device presents (SEC-004); `pin`
+    /// must already be normalized ([`normalize_tls_pin`]) — empty clears it.
+    pub fn set_tls_pin(&mut self, public_key: &str, pin: &str) -> Result<(), RegistryError> {
+        let device = {
+            let device = self
+                .by_key
+                .get_mut(public_key)
+                .ok_or(RegistryError::UnknownDevice)?;
+            if device.tls_cert_sha256 == pin {
+                return Ok(()); // unchanged: skip the write
+            }
+            device.tls_cert_sha256 = pin.to_string();
             device.clone()
         };
         self.store

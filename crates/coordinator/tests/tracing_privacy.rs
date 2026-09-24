@@ -83,6 +83,7 @@ fn rpc_tracing_spans_emit_without_leaking_keys() {
                 name: "node".into(),
                 endpoint: "1.1.1.1:51820".into(),
                 tags: vec![],
+                ..Default::default()
             }))
             .await
             .unwrap();
