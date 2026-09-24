@@ -47,8 +47,11 @@ without needing root — the OS device path cleanly reports "unsupported" instea
 1. Start the coordinator:
    ```sh
    cargo run -p ferrum-coordinator -- --listen 0.0.0.0:50051 \
-       --metrics-listen 0.0.0.0:9095
+       --metrics-listen 0.0.0.0:9095 --insecure-no-auth
    ```
+   The coordinator refuses to start without authentication unless you pass
+   `--insecure-no-auth` (it then logs a warning every 5 minutes) — fine for a
+   local demo; use the `--oidc-*` flags for anything real.
    (Add `--policy policy.example.toml` to show ACL enforcement — see `policy.example.toml`
    at repo root for the rule format; omit it for allow-all/full-mesh.)
 

@@ -363,7 +363,9 @@ CFG
     red "FAIL: coordinator binary not found at $COORD_BIN"; FAIL=$((FAIL+1))
   else
     # Coordinator listens in ns A, reachable from both namespaces over the veth.
-    ip netns exec "$NS1" "$COORD_BIN" --listen "0.0.0.0:$COORD_PORT" \
+    # --insecure-no-auth: the coordinator fails closed without OIDC (SEC-001);
+    # this is a throwaway netns test bed, so run it open.
+    ip netns exec "$NS1" "$COORD_BIN" --listen "0.0.0.0:$COORD_PORT" --insecure-no-auth \
       >"$WORK/coord.log" 2>&1 & PIDS+=($!)
     sleep 1
 

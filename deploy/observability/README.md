@@ -33,7 +33,8 @@ Run the coordinator and/or relay with their metrics (and optionally OTLP) endpoi
 cargo run -p ferrum-coordinator --features otlp -- \
   --listen 0.0.0.0:50051 \
   --metrics-listen 0.0.0.0:9095 \
-  --otlp-endpoint http://localhost:4317
+  --otlp-endpoint http://localhost:4317 \
+  --insecure-no-auth   # local only; use the --oidc-* flags in a real deployment
 
 # Relay: metrics on :9096, traces to Jaeger
 cargo run -p ferrum-cli --features otlp --bin ferrum -- relay \
