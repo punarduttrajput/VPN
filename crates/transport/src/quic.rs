@@ -6,8 +6,8 @@
 //! WireGuard handshake; the QUIC layer is authenticated separately by **pinning**
 //! the server's self-signed cert (SEC-004, see [`crate::tls`]): the server
 //! presents a stable [`TlsIdentity`] derived from its WireGuard key, and the
-//! client accepts only a cert whose SHA-256 it was told to expect — warning loudly
-//! when it has no pin.
+//! client accepts only a cert whose public key's SHA-256 it was told to expect —
+//! warning when it has no pin.
 //!
 //! Connection migration (FR4): a QUIC connection is keyed by connection IDs, not
 //! by the 4-tuple, so it survives the client's local address changing (Wi-Fi →
@@ -15,8 +15,8 @@
 //! socket; the next packet the client sends validates the new path and the server
 //! follows it — the tunnel keeps running without a re-handshake.
 //!
-//! Deferred to later Phase 2 increments: MASQUE/HTTP3 framing and padding/timing
-//! obfuscation.
+//! See also [`crate::masque`] (MASQUE / HTTP-3 CONNECT-UDP) and the padding and
+//! timing-jitter decorators ([`crate::pad`], [`crate::jitter`]).
 
 use std::net::SocketAddr;
 use std::sync::Arc;

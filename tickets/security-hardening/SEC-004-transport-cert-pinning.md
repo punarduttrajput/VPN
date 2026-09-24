@@ -54,14 +54,21 @@ relationships and only one of them fits a single "network map" fingerprint:
 
 **Part 1** (`crates/transport/src/tls.rs`):
 - `PinnedVerifier` replaces `SkipServerVerification`. It accepts a server cert
-  only if its SHA-256 (the DER, i.e. the `openssl x509 -fingerprint -sha256`
-  value) is one of the pins. Several pins are allowed, so a current and a next
-  cert can overlap during a rotation (SEC-007).
-- With no pins, it connects and logs the warning on every handshake.
-- Pinning needs a **stable cert**, but every start used to generate a throwaway
+  only if the SHA-256 of its **public key** (SubjectPublicKeyInfo, HPKP-style)
+  is one of the pins. The ticket suggested hashing the whole cert DER; the key
+  is used instead because it stays stable when the cert is re-issued or a
+  dependency changes how certs are encoded. Several pins are allowed, so a
+  current and a next key can overlap during a rotation (SEC-007).
+- With no pins, it connects and logs the warning (once per destination).
+- Pinning needs a **stable key**, but every start used to generate a throwaway
   one. `TlsIdentity::from_wireguard_key` fixes that: it derives an Ed25519 key
-  from the WireGuard private key (HKDF-SHA256, one-way). With rcgen's
-  deterministic defaults, the result is a byte-identical cert on every start.
+  from the WireGuard private key (HKDF-SHA256, one-way). The derived key
+  material is zeroized.
+- A dial that fails its pin (or can't connect) is a dropped datagram with a
+  backed-off retry, never a mesh-fatal error, so one bad peer can't take the
+  others down.
 - `ferrum tls-fingerprint --config` prints a node's pin.
 - `QuicMeshTransport::set_peer_pins` pins each mesh dial per destination; part 2
   feeds it.
+- Follow-up (not in scope): every endpoint uses the fixed SNI `ferrum`, which a
+  censor could match on.

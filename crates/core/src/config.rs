@@ -102,11 +102,12 @@ pub struct TransportConfig {
     /// off. Both peers configure this independently.
     #[serde(default)]
     pub jitter_ms: Option<u16>,
-    /// Expected SHA-256 fingerprint(s) of the QUIC server's / MASQUE proxy's
-    /// TLS certificate (SEC-004): the peer (point-to-point QUIC, client role)
-    /// or the proxy (MASQUE). Hex, `:`-separated or not — the `openssl x509
-    /// -fingerprint -sha256` form works. A list so a current and a next cert can
-    /// overlap across a rotation. Empty (the default) still connects, but logs
+    /// Expected pin(s) of the QUIC server's / MASQUE proxy's TLS certificate
+    /// (SEC-004): the SHA-256 of its public key (SubjectPublicKeyInfo) — the
+    /// peer (point-to-point QUIC, client role) or the proxy (MASQUE). Hex,
+    /// `:`-separated or not. For a third-party proxy: `openssl x509 -in cert.pem
+    /// -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256`.
+    /// A list so a current and a next key can overlap across a rotation. Empty (the default) still connects, but logs
     /// that the outer transport is unauthenticated. Get a Ferrum node's own
     /// value with `ferrum tls-fingerprint --config <its config>`.
     #[serde(default)]

@@ -96,7 +96,7 @@ enum Command {
         #[arg(long)]
         xdp_program: Option<String>,
     },
-    /// Print the SHA-256 fingerprint of the QUIC/MASQUE TLS certificate this
+    /// Print the pin (SHA-256 of the public key) of the QUIC/MASQUE TLS certificate this
     /// node presents (derived from the config's `private_key`, so it's stable
     /// across restarts). Peers pin it via `[transport] cert_pins` (SEC-004).
     #[cfg(any(feature = "quic", feature = "masque"))]

@@ -82,12 +82,13 @@ See [config.quic.example.toml](config.quic.example.toml). Omitting `[transport]`
 keeps plain UDP (Phase 1 behavior).
 
 **Certificate pinning (SEC-004):** QUIC and MASQUE run inside TLS, and the
-client checks the server's certificate against `cert_pins` in `[transport]`
-(SHA-256 fingerprints). A Ferrum node's certificate is derived from its
-WireGuard private key, so it stays the same across restarts: print it on the
-server with `ferrum tls-fingerprint --config <server config>` and put it in the
-client's `cert_pins`. For a third-party MASQUE proxy, use the output of
-`openssl x509 -fingerprint -sha256`.
+client checks the server's certificate against `cert_pins` in `[transport]`.
+A pin is the SHA-256 of the certificate's **public key**, so it survives the
+certificate being re-issued. A Ferrum node's key is derived from its WireGuard
+private key, so its pin stays the same across restarts: print it on the server
+with `ferrum tls-fingerprint --config <server config>` and put it in the
+client's `cert_pins`. For a third-party MASQUE proxy, compute it with
+`openssl x509 -in cert.pem -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256`.
 
 What a pin protects, and what it doesn't:
 

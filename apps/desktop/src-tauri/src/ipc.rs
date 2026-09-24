@@ -68,7 +68,7 @@ pub struct ConnectConfig {
     /// TLS / HTTP-3 `:authority` for QUIC/MASQUE (defaults to `ferrum` when unset).
     #[serde(default)]
     pub server_name: Option<String>,
-    /// Expected SHA-256 fingerprint(s) of the MASQUE proxy's TLS certificate
+    /// Expected pin(s) — SHA-256 of the public key — of the MASQUE proxy's TLS certificate
     /// (SEC-004; hex, `:`-separated or not). Empty connects with an "outer
     /// transport unauthenticated" warning. No GUI field yet.
     #[serde(default)]

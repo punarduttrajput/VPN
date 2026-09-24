@@ -33,11 +33,13 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{ClientConfig, Connection, Endpoint, ServerConfig};
 use tokio::sync::{mpsc, Mutex};
+use tracing::{debug, warn};
 
 use crate::tls::{self, Fingerprint, TlsIdentity, SERVER_NAME};
 use crate::{MeshTransport, TransportError};
@@ -66,6 +68,8 @@ pub struct QuicMeshTransport {
     pins: std::sync::Mutex<HashMap<SocketAddr, Vec<Fingerprint>>>,
     /// Connections we dialed, keyed by the peer's advertised address (used to send).
     dialed: Mutex<HashMap<SocketAddr, Connection>>,
+    /// Destinations whose last dial failed, and when to try again.
+    backoff: std::sync::Mutex<DialBackoff>,
     /// Inbound datagrams from every connection (dialed + accepted).
     inbound_tx: mpsc::UnboundedSender<Tagged>,
     inbound_rx: Mutex<mpsc::UnboundedReceiver<Tagged>>,
@@ -96,6 +100,7 @@ impl QuicMeshTransport {
             fingerprint: identity.fingerprint(),
             pins: std::sync::Mutex::new(HashMap::new()),
             dialed: Mutex::new(HashMap::new()),
+            backoff: std::sync::Mutex::new(DialBackoff::default()),
             inbound_tx,
             inbound_rx: Mutex::new(inbound_rx),
             accept_task,
@@ -119,6 +124,11 @@ impl QuicMeshTransport {
         let mut map = self.pins.lock().expect("quic mesh pins poisoned");
         map.clear();
         map.extend(pins.iter().cloned());
+        // New pins are new information: retry previously refused peers now.
+        self.backoff
+            .lock()
+            .expect("quic mesh backoff poisoned")
+            .clear();
     }
 
     /// Client config for dialing `dst`, pinned to its expected cert(s).
@@ -158,10 +168,44 @@ impl QuicMeshTransport {
 }
 
 impl MeshTransport for QuicMeshTransport {
+    /// Send to one peer. Like a UDP datagram, a send that can't be delivered
+    /// — the peer is unreachable, refused our pin, or its connection died — is
+    /// **dropped and logged, not an error**: the mesh loop treats a send error
+    /// as fatal to the whole session, and one bad peer (or an on-path attacker
+    /// presenting the wrong cert for it) must not take every other peer down.
+    /// Failed dials back off (see [`DialBackoff`]) so a refused peer doesn't
+    /// stall the loop with a handshake per packet.
     async fn send_to(&self, dst: SocketAddr, datagram: &[u8]) -> Result<(), TransportError> {
-        let conn = self.connection_to(dst).await?;
-        conn.send_datagram(Bytes::copy_from_slice(datagram))
-            .map_err(|e| conn_err(format!("send_datagram {dst}: {e}")))
+        if self
+            .backoff
+            .lock()
+            .expect("quic mesh backoff poisoned")
+            .is_waiting(dst, Instant::now())
+        {
+            return Ok(());
+        }
+        let conn = match self.connection_to(dst).await {
+            Ok(conn) => conn,
+            Err(e) => {
+                let retry_in = self
+                    .backoff
+                    .lock()
+                    .expect("quic mesh backoff poisoned")
+                    .note_failure(dst, Instant::now());
+                warn!("QUIC mesh: can't reach {dst} ({e}); dropping, retrying in {retry_in:?}");
+                return Ok(());
+            }
+        };
+        self.backoff
+            .lock()
+            .expect("quic mesh backoff poisoned")
+            .note_success(dst);
+        if let Err(e) = conn.send_datagram(Bytes::copy_from_slice(datagram)) {
+            // A dead connection: forget it so the next send re-dials.
+            debug!("QUIC mesh: send to {dst} failed ({e}); re-dialing on the next send");
+            self.dialed.lock().await.remove(&dst);
+        }
+        Ok(())
     }
 
     async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr), TransportError> {
@@ -173,6 +217,45 @@ impl MeshTransport for QuicMeshTransport {
         let n = datagram.len().min(buf.len());
         buf[..n].copy_from_slice(&datagram[..n]);
         Ok((n, src))
+    }
+}
+
+/// Per-destination exponential backoff for failed dials: 1 s, doubling to 30 s,
+/// reset on a successful dial (or new pins).
+#[derive(Default)]
+pub(crate) struct DialBackoff {
+    /// `dst -> (retry not before, current delay)`.
+    failed: HashMap<SocketAddr, (Instant, Duration)>,
+}
+
+const DIAL_BACKOFF_MIN: Duration = Duration::from_secs(1);
+const DIAL_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+impl DialBackoff {
+    /// Whether `dst` is still waiting out a previous failure.
+    pub(crate) fn is_waiting(&self, dst: SocketAddr, now: Instant) -> bool {
+        self.failed
+            .get(&dst)
+            .is_some_and(|(retry_at, _)| now < *retry_at)
+    }
+
+    /// Record a failed dial; returns how long until the next attempt.
+    pub(crate) fn note_failure(&mut self, dst: SocketAddr, now: Instant) -> Duration {
+        let delay = self
+            .failed
+            .get(&dst)
+            .map(|(_, d)| (*d * 2).min(DIAL_BACKOFF_MAX))
+            .unwrap_or(DIAL_BACKOFF_MIN);
+        self.failed.insert(dst, (now + delay, delay));
+        delay
+    }
+
+    pub(crate) fn note_success(&mut self, dst: SocketAddr) {
+        self.failed.remove(&dst);
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.failed.clear();
     }
 }
 
@@ -260,18 +343,51 @@ mod tests {
         let impostor = TlsIdentity::from_wireguard_key(&[5; 32]).unwrap();
 
         a.set_peer_pins(&[(addr_b, vec![impostor.fingerprint()])]);
-        let err = a.send_to(addr_b, b"x").await.unwrap_err();
-        assert!(err.to_string().contains("handshake"), "{err}");
+        // Refused, but as a dropped datagram — not an error that would take
+        // the whole mesh session down (review fix).
+        a.send_to(addr_b, b"x").await.unwrap();
+        let mut buf = [0u8; 16];
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), b.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "nothing may reach a peer that failed its pin"
+        );
+        // While backing off, a send doesn't even re-dial.
+        let t0 = std::time::Instant::now();
+        a.send_to(addr_b, b"y").await.unwrap();
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(100),
+            "re-dialed during backoff"
+        );
 
-        // With the right pin, the same dial succeeds and B receives.
+        // With the right pin (which also clears the backoff), the same dial
+        // succeeds and B receives.
         a.set_peer_pins(&[(addr_b, vec![b.fingerprint()])]);
         a.send_to(addr_b, b"hello").await.unwrap();
-        let mut buf = [0u8; 16];
         let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(5), b.recv_from(&mut buf))
             .await
             .expect("B did not receive after a correctly pinned dial")
             .unwrap();
         assert_eq!(&buf[..n], b"hello");
+    }
+
+    #[test]
+    fn dial_backoff_doubles_caps_and_resets() {
+        let dst: SocketAddr = "192.0.2.1:1".parse().unwrap();
+        let t0 = Instant::now();
+        let mut b = DialBackoff::default();
+        assert!(!b.is_waiting(dst, t0));
+        assert_eq!(b.note_failure(dst, t0), DIAL_BACKOFF_MIN);
+        assert!(b.is_waiting(dst, t0));
+        assert!(!b.is_waiting(dst, t0 + DIAL_BACKOFF_MIN));
+        assert_eq!(b.note_failure(dst, t0), DIAL_BACKOFF_MIN * 2);
+        for _ in 0..10 {
+            b.note_failure(dst, t0);
+        }
+        assert_eq!(b.note_failure(dst, t0), DIAL_BACKOFF_MAX);
+        b.note_success(dst);
+        assert!(!b.is_waiting(dst, t0));
     }
 
     /// No pin for a peer: still dialed (with the unauthenticated warning).

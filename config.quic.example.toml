@@ -25,7 +25,8 @@ server_name = "ferrum"    # TLS SNI presented/expected (peer identity is via Wir
 # server's private_key). Several entries are allowed, for a cert rotation.
 # Without a pin the client still connects but logs that the outer transport is
 # unauthenticated. For MASQUE, pin the proxy's cert the same way
-# (`openssl x509 -fingerprint -sha256` output works as-is).
+# (the pin is the SHA-256 of its public key:
+#   openssl x509 -in cert.pem -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256).
 # cert_pins = ["<64 hex digits>"]
 # Optional DERP-style relay fallback for `ferrum up-mesh` (Phase 4 NAT traversal).
 # Independent of `mode`: when set, the mesh runs the direct transport AND a

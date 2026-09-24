@@ -9,7 +9,7 @@ authors.workspace = true
 default = []
 # QUIC transport (Phase 2 FR2). Off by default so the core data plane builds
 # without the rustls/quinn stack; enable for the obfuscation-capable transport.
-quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:bytes", "dep:ring"]
+quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:bytes", "dep:ring", "dep:zeroize"]
 # MASQUE / HTTP3 (Phase 2 FR3) — builds on the QUIC stack.
 masque = ["quic", "dep:h3", "dep:h3-quinn", "dep:h3-datagram", "dep:http"]
 # The relay's eBPF/XDP fast path (PRD `phase-6-ebpf-xdp-relay.md`). Off by
@@ -34,6 +34,8 @@ rcgen = { workspace = true, optional = true }
 # SEC-004: SHA-256 cert pins + HKDF for the stable TLS identity. Already in the
 # tree as rustls/rcgen's crypto backend (the same pin the coordinator uses).
 ring = { version = "0.17", optional = true }
+# Wipes the derived TLS private key from memory (already in the tree).
+zeroize = { version = "1", optional = true }
 bytes ={ workspace = true, optional = true }
 h3 = { workspace = true, optional = true }
 h3-quinn = { workspace = true, optional = true }
