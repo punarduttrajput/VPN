@@ -108,8 +108,9 @@ docker compose -f deploy/observability/docker-compose.yml up -d
 Grafana at **http://localhost:3000** (anonymous read-only; `admin`/`admin` to
 edit) with a pre-provisioned **"Ferrum — Control Plane Overview"** dashboard.
 Point the coordinator at it with `--metrics-listen 0.0.0.0:9095
---otlp-endpoint http://localhost:4317` (the `otlp` feature flag is only needed
-for trace export — metrics work on a default build). Jaeger traces at
+--otlp-endpoint http://localhost:4317` (plus `--insecure-no-auth` for a local
+demo, or the `--oidc-*` flags — see **Auth** below; the `otlp` feature flag is
+only needed for trace export — metrics work on a default build). Jaeger traces at
 **http://localhost:16686**. All metrics/traces are aggregate-only — no
 per-user IPs, keys, or traffic content ever leave the process (a privacy
 guarantee that's actually enforced by an automated test, `tracing_privacy.rs`).
@@ -137,11 +138,14 @@ Other RPCs to demo the same way: `GetNetworkMap`, `WatchNetworkMap` (streams —
 good for showing live push when a second device registers), `PublishCandidates`,
 `RotateKey`.
 
-**Auth**: open by default (tags are self-declared). Add `--oidc-issuer
-<url> --oidc-audience <aud> --oidc-jwks <path>` when starting the coordinator
-to require a bearer JWT on every RPC (tags then come from the verified claim,
-not the request) — good for a security-conscious client to see. `--tls-cert/
---tls-key/--tls-ca` similarly turns on mutual TLS on the gRPC channel.
+**Auth**: required by default (SEC-001) — the coordinator won't start unless
+you either configure OIDC (`--oidc-issuer <url> --oidc-audience <aud>
+--oidc-jwks <path>`: every RPC then needs a bearer JWT, and tags come from the
+verified claim, not the request — good for a security-conscious client to see)
+or explicitly opt out with `--insecure-no-auth` (tags are then self-declared,
+and a warning is logged every 5 minutes). `--tls-cert/--tls-key/--tls-ca` adds
+mutual TLS on the gRPC channel on top of either — it doesn't satisfy the auth
+requirement on its own.
 
 ---
 
