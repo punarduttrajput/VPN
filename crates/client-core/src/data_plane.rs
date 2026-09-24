@@ -81,26 +81,18 @@ pub fn build_mesh_peers(private_key_b64: &str, peers: &[PeerSpec]) -> Result<Vec
         .collect()
 }
 
-/// Our own 32-byte WireGuard public key, derived from the base64 private key —
-/// the relay underlay's routing identity for this node.
-// `Error` carries `tonic::Status` (large); boxing only this sync helper would be
-// inconsistent with the rest of the crate, so allow the lint.
-#[allow(clippy::result_large_err)]
-fn self_public_key(private_key_b64: &str) -> Result<[u8; 32], Error> {
-    let pub_b64 = ferrum_core::keys::public_base64_from_private(private_key_b64)
-        .map_err(|e| Error::DataPlane(e.to_string()))?;
-    ferrum_core::keys::decode_key(&pub_b64).map_err(|e| Error::DataPlane(e.to_string()))
-}
-
-/// Connect a public-key-keyed relay underlay at `addr` for this node. The relay's
-/// peer table is aligned from the network map by the mesh runner, so we connect
-/// with no peers here.
+/// Connect a public-key-keyed relay underlay at `addr` for this node, whose
+/// routing identity is the public half of `private_key_b64`. The relay's peer
+/// table is aligned from the network map by the mesh runner, so we connect with
+/// no peers here.
 async fn connect_relay(addr: &str, private_key_b64: &str) -> Result<RelayMeshTransport, Error> {
     let relay_addr: SocketAddr = addr
         .parse()
         .map_err(|e| Error::DataPlane(format!("relay '{addr}': {e}")))?;
-    let self_key = self_public_key(private_key_b64)?;
-    RelayMeshTransport::connect(relay_addr, self_key, &[])
+    // The relay challenges each registration for proof of this key (SEC-003).
+    let secret = ferrum_core::keys::private_from_base64(private_key_b64)
+        .map_err(|e| Error::DataPlane(e.to_string()))?;
+    RelayMeshTransport::connect(relay_addr, &secret, &[])
         .await
         .map_err(|e| Error::DataPlane(e.to_string()))
 }

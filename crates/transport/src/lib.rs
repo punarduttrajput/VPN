@@ -29,6 +29,7 @@ pub use udp::{UdpMeshTransport, UdpTransport};
 pub mod stun;
 
 pub mod relay;
+mod relay_auth;
 pub use relay::{RelayMeshTransport, RelayMetrics, RelayServer, RelayXdpHook};
 
 // The relay's eBPF/XDP fast path (PRD `phase-6-ebpf-xdp-relay.md`) — Linux
