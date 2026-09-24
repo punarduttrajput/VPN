@@ -19,15 +19,18 @@ Phase 2 anti-censorship value proposition.
 
 ## Acceptance criteria
 
-- [ ] Replace `SkipServerVerification` with a pinning verifier that checks the
-      server cert against a coordinator-advertised fingerprint.
+- [x] Replace `SkipServerVerification` with a pinning verifier that checks the
+      server cert against a coordinator-advertised fingerprint. *(Verifier +
+      config pins: part 1. Coordinator-advertised per-peer pins: part 2.)*
 - [ ] The fingerprint is advertised in the network map alongside
-      `relay`/`dns_servers`.
-- [ ] With no pinning material available, the client connects but emits a
+      `relay`/`dns_servers`. *(Part 2 — per peer, since each mesh node is a
+      QUIC server; see Resolution.)*
+- [x] With no pinning material available, the client connects but emits a
       documented, visible "outer transport unauthenticated" warning — never a
       silent accept.
-- [ ] Residual on-path threat model documented in user-facing terms.
-- [ ] Test: a client rejects a server whose cert doesn't match the advertised
+- [x] Residual on-path threat model documented in user-facing terms
+      (README "Certificate pinning").
+- [x] Test: a client rejects a server whose cert doesn't match the advertised
       fingerprint; the no-pin warning path is covered.
 
 ## Implementation notes
@@ -37,3 +40,28 @@ Phase 2 anti-censorship value proposition.
 - Coordinates with SEC-007 (rotation): advertise current + next fingerprint so
   a cert roll doesn't break pinning.
 - Keep the self-signed cert generation; only the *verification* changes.
+
+## Resolution
+
+Split into two PRs, because the code has three separate QUIC trust
+relationships and only one of them fits a single "network map" fingerprint:
+
+| Path | Who is the TLS server | Pin source |
+|---|---|---|
+| Point-to-point `ferrum up`, `mode = "quic"` | the peer with `role = "server"` | `[transport] cert_pins` (part 1) |
+| MASQUE (`up` and `up-mesh`) | the MASQUE proxy (third-party; no in-tree binary) | `[transport] cert_pins` / desktop `ConnectConfig.cert_pins` (part 1) |
+| QUIC mesh (`up-mesh`, desktop) | **every** peer | published by each device at register, advertised **per peer** in the network map (part 2) |
+
+**Part 1** (`crates/transport/src/tls.rs`):
+- `PinnedVerifier` replaces `SkipServerVerification`. It accepts a server cert
+  only if its SHA-256 (the DER, i.e. the `openssl x509 -fingerprint -sha256`
+  value) is one of the pins. Several pins are allowed, so a current and a next
+  cert can overlap during a rotation (SEC-007).
+- With no pins, it connects and logs the warning on every handshake.
+- Pinning needs a **stable cert**, but every start used to generate a throwaway
+  one. `TlsIdentity::from_wireguard_key` fixes that: it derives an Ed25519 key
+  from the WireGuard private key (HKDF-SHA256, one-way). With rcgen's
+  deterministic defaults, the result is a byte-identical cert on every start.
+- `ferrum tls-fingerprint --config` prints a node's pin.
+- `QuicMeshTransport::set_peer_pins` pins each mesh dial per destination; part 2
+  feeds it.

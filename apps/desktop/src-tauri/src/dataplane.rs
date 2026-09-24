@@ -254,6 +254,16 @@ where
         ),
         TransportMode::Udp | TransportMode::Quic => None,
     };
+    // Outer-transport authentication (SEC-004): the MASQUE proxy's cert pins,
+    // and this node's stable QUIC identity (derived from its WireGuard key).
+    let cert_pins = ferrum_transport::tls::parse_fingerprints(&cfg.cert_pins)
+        .map_err(|e| format!("invalid certificate pin: {e}"))?;
+    let tls_identity = ferrum_core::keys::decode_key(&cfg.private_key)
+        .map_err(|e| format!("invalid private key: {e}"))
+        .and_then(|k| {
+            ferrum_transport::TlsIdentity::from_wireguard_key(&k)
+                .map_err(|e| format!("deriving TLS identity: {e}"))
+        })?;
 
     // NAT-traversal settings (Phase 4), validated up front for a clean error.
     let relay: Option<String> = match cfg
@@ -378,10 +388,13 @@ where
             .await
         }
         TransportMode::Quic => {
-            let make_transport = move || async move {
-                QuicMeshTransport::bind(bind_addr)
-                    .await
-                    .map_err(|e| ferrum_client_core::Error::DataPlane(e.to_string()))
+            let make_transport = move || {
+                let id = tls_identity.clone();
+                async move {
+                    QuicMeshTransport::bind(bind_addr, &id)
+                        .await
+                        .map_err(|e| ferrum_client_core::Error::DataPlane(e.to_string()))
+                }
             };
             supervise_session(
                 client,
@@ -400,8 +413,11 @@ where
             let proxy = masque_proxy.expect("masque proxy resolved above");
             let make_transport = move || {
                 let authority = server_name.clone();
+                let pins = cert_pins.clone();
                 async move {
-                    Ok::<_, ferrum_client_core::Error>(MasqueMeshTransport::new(proxy, authority))
+                    Ok::<_, ferrum_client_core::Error>(MasqueMeshTransport::new(
+                        proxy, authority, pins,
+                    ))
                 }
             };
             supervise_session(
@@ -489,6 +505,7 @@ mod tests {
             transport_mode: "udp".into(),
             masque_proxy: None,
             server_name: None,
+            cert_pins: Vec::new(),
             stun_server: None,
             relay: None,
             token: None,

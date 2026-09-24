@@ -136,9 +136,13 @@ on the new environment before assuming it's still blocked.
   server* — verifies RS256/ES256 against a JWKS offline via `ring`, derives device
   tags from a verified claim (so ACL tags become an auth boundary). No external IdP
   needed to test.
-- **TLS in QUIC/MASQUE** uses a self-signed cert with a permissive verifier on
-  purpose: peer identity is the inner WireGuard handshake, not TLS (the TLS layer
-  is for encryption/camouflage). See `crates/transport/src/quic.rs`.
+- **TLS in QUIC/MASQUE** uses self-signed certs **pinned by SHA-256** (SEC-004,
+  `crates/transport/src/tls.rs`), not a CA. Peer identity is still the inner
+  WireGuard handshake; the pin authenticates the outer camouflage layer. A node's
+  cert is derived deterministically from its WireGuard private key
+  (`TlsIdentity::from_wireguard_key`), so its pin is stable across restarts. With
+  no pin configured, connections still succeed but log an "outer transport
+  UNAUTHENTICATED" warning. Never reintroduce an accept-anything verifier.
 
 ## Completion snapshot (see STATUS.md for detail)
 

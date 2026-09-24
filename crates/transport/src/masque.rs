@@ -35,7 +35,7 @@ use quinn::{ClientConfig, Endpoint, ServerConfig};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
 
-use crate::quic::{install_provider, SkipServerVerification};
+use crate::tls::{self, Fingerprint, TlsIdentity};
 use crate::{MeshTransport, Transport, TransportError};
 
 const CHANNEL_CAP: usize = 1024;
@@ -63,30 +63,19 @@ fn strip_ctx(datagram: Bytes) -> Option<Bytes> {
     Some(datagram.slice(1..))
 }
 
-/// ALPN-`h3` rustls client config that accepts any server cert (peer identity is
-/// established by the inner WireGuard handshake, not TLS).
-fn h3_client_crypto() -> Result<QuicClientConfig, TransportError> {
-    install_provider();
-    let mut crypto = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SkipServerVerification::new()))
-        .with_no_client_auth();
-    crypto.alpn_protocols = vec![b"h3".to_vec()];
+/// ALPN-`h3` rustls client config pinning the proxy's cert to `pins` (SEC-004;
+/// an empty list connects with the "outer transport unauthenticated" warning).
+fn h3_client_crypto(
+    pins: Vec<Fingerprint>,
+    proxy: SocketAddr,
+) -> Result<QuicClientConfig, TransportError> {
+    let crypto = tls::client_crypto(pins, format!("MASQUE proxy {proxy}"), &[b"h3"]);
     QuicClientConfig::try_from(crypto).map_err(setup)
 }
 
-/// ALPN-`h3` rustls server config with a self-signed cert.
-fn h3_server_crypto() -> Result<QuicServerConfig, TransportError> {
-    install_provider();
-    let cert = rcgen::generate_simple_self_signed(vec!["ferrum".to_string()]).map_err(setup)?;
-    let cert_der = rustls::pki_types::CertificateDer::from(cert.cert);
-    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
-    let mut crypto = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der], key.into())
-        .map_err(setup)?;
-    crypto.alpn_protocols = vec![b"h3".to_vec()];
-    QuicServerConfig::try_from(crypto).map_err(setup)
+/// ALPN-`h3` rustls server config presenting `identity`.
+fn h3_server_crypto(identity: &TlsIdentity) -> Result<QuicServerConfig, TransportError> {
+    QuicServerConfig::try_from(identity.server_crypto(&[b"h3"])?).map_err(setup)
 }
 
 /// Client side of a MASQUE CONNECT-UDP tunnel.
@@ -97,15 +86,19 @@ pub struct MasqueTransport {
 }
 
 impl MasqueTransport {
-    /// Open a CONNECT-UDP session to a MASQUE `proxy` that will relay to `target`.
+    /// Open a CONNECT-UDP session to a MASQUE `proxy` that will relay to `target`,
+    /// accepting only a proxy cert whose SHA-256 is in `pins` (empty: connect
+    /// with a warning).
     pub async fn connect(
         local: SocketAddr,
         proxy: SocketAddr,
         authority: &str,
         target: SocketAddr,
+        pins: Vec<Fingerprint>,
     ) -> Result<Self, TransportError> {
         let mut endpoint = Endpoint::client(local).map_err(TransportError::Io)?;
-        endpoint.set_default_client_config(ClientConfig::new(Arc::new(h3_client_crypto()?)));
+        endpoint
+            .set_default_client_config(ClientConfig::new(Arc::new(h3_client_crypto(pins, proxy)?)));
 
         let conn = endpoint
             .connect(proxy, authority)
@@ -229,14 +222,32 @@ fn parse_connect_udp_target(path: &str) -> Option<SocketAddr> {
 /// per QUIC connection — which is what a mesh node needs (one session per peer).
 pub struct MasqueProxy {
     endpoint: Endpoint,
+    fingerprint: Fingerprint,
 }
 
 impl MasqueProxy {
-    /// Bind a MASQUE proxy (HTTP/3, ALPN `h3`) on `local`.
+    /// Bind a MASQUE proxy (HTTP/3, ALPN `h3`) on `local` with a fresh random
+    /// cert — clients can only pin it for this run (see [`fingerprint`](Self::fingerprint)).
     pub fn bind(local: SocketAddr) -> Result<Self, TransportError> {
-        let server_config = ServerConfig::with_crypto(Arc::new(h3_server_crypto()?));
+        Self::bind_with_identity(local, &TlsIdentity::ephemeral()?)
+    }
+
+    /// Bind a MASQUE proxy presenting `identity` (a stable one is pinnable).
+    pub fn bind_with_identity(
+        local: SocketAddr,
+        identity: &TlsIdentity,
+    ) -> Result<Self, TransportError> {
+        let server_config = ServerConfig::with_crypto(Arc::new(h3_server_crypto(identity)?));
         let endpoint = Endpoint::server(server_config, local).map_err(TransportError::Io)?;
-        Ok(Self { endpoint })
+        Ok(Self {
+            endpoint,
+            fingerprint: identity.fingerprint(),
+        })
+    }
+
+    /// The SHA-256 pin of the cert this proxy presents.
+    pub fn fingerprint(&self) -> Fingerprint {
+        self.fingerprint
     }
 
     /// The proxy's bound address.
@@ -363,6 +374,8 @@ async fn relay_connection(
 pub struct MasqueMeshTransport {
     proxy: SocketAddr,
     authority: String,
+    /// The proxy's expected cert pins (SEC-004); empty warns per session.
+    pins: Vec<Fingerprint>,
     sessions: Mutex<HashMap<SocketAddr, Arc<MasqueTransport>>>,
     inbound_tx: mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>,
     inbound_rx: Mutex<mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>>,
@@ -370,12 +383,14 @@ pub struct MasqueMeshTransport {
 
 impl MasqueMeshTransport {
     /// Create a mesh transport that tunnels every peer through `proxy`,
-    /// presenting `authority` as the HTTP/3 `:authority` (also the TLS name).
-    pub fn new(proxy: SocketAddr, authority: impl Into<String>) -> Self {
+    /// presenting `authority` as the HTTP/3 `:authority` (also the TLS name) and
+    /// pinning the proxy's cert to `pins` (empty: every session warns).
+    pub fn new(proxy: SocketAddr, authority: impl Into<String>, pins: Vec<Fingerprint>) -> Self {
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
         Self {
             proxy,
             authority: authority.into(),
+            pins,
             sessions: Mutex::new(HashMap::new()),
             inbound_tx,
             inbound_rx: Mutex::new(inbound_rx),
@@ -389,8 +404,10 @@ impl MasqueMeshTransport {
             return Ok(s.clone());
         }
         let local: SocketAddr = (Ipv4Addr::UNSPECIFIED, 0).into();
-        let session =
-            Arc::new(MasqueTransport::connect(local, self.proxy, &self.authority, dst).await?);
+        let session = Arc::new(
+            MasqueTransport::connect(local, self.proxy, &self.authority, dst, self.pins.clone())
+                .await?,
+        );
 
         // Pump this session's inbound datagrams into the shared channel, tagged
         // with the peer's target address.
@@ -449,14 +466,20 @@ mod tests {
 
         let proxy = MasqueProxy::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
+        let pin = proxy.fingerprint();
         tokio::spawn(async move {
             let _ = proxy.serve_one(target).await;
         });
 
-        let client =
-            MasqueTransport::connect("127.0.0.1:0".parse().unwrap(), proxy_addr, "ferrum", target)
-                .await
-                .unwrap();
+        let client = MasqueTransport::connect(
+            "127.0.0.1:0".parse().unwrap(),
+            proxy_addr,
+            "ferrum",
+            target,
+            vec![pin],
+        )
+        .await
+        .unwrap();
 
         client.send(b"masque-hello").await.unwrap();
         let mut out = [0u8; 64];
@@ -527,15 +550,17 @@ mod tests {
 
         let proxy = MasqueProxy::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
+        let pin = proxy.fingerprint();
         tokio::spawn(async move {
             let _ = proxy.serve().await;
         });
 
         // Two clients through the *same* proxy, each targeting a different peer.
-        let c1 = MasqueTransport::connect("127.0.0.1:0".parse().unwrap(), proxy_addr, "ferrum", t1)
+        let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let c1 = MasqueTransport::connect(local, proxy_addr, "ferrum", t1, vec![pin])
             .await
             .unwrap();
-        let c2 = MasqueTransport::connect("127.0.0.1:0".parse().unwrap(), proxy_addr, "ferrum", t2)
+        let c2 = MasqueTransport::connect(local, proxy_addr, "ferrum", t2, vec![pin])
             .await
             .unwrap();
 
@@ -581,11 +606,12 @@ mod tests {
 
         let proxy = MasqueProxy::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
+        let pin = proxy.fingerprint();
         tokio::spawn(async move {
             let _ = proxy.serve().await;
         });
 
-        let mesh = MasqueMeshTransport::new(proxy_addr, "ferrum");
+        let mesh = MasqueMeshTransport::new(proxy_addr, "ferrum", vec![pin]);
         mesh.send_to(p1, b"hi-1").await.unwrap();
         mesh.send_to(p2, b"hi-2").await.unwrap();
 
@@ -608,5 +634,34 @@ mod tests {
             got.get(&p2).map(|v| v.as_slice()),
             Some(b"\x02hi-2".as_ref())
         );
+    }
+
+    /// SEC-004 AC: a client pinned to the real proxy refuses an impostor proxy
+    /// (e.g. an on-path box presenting its own cert).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn masque_client_rejects_an_impostor_proxy() {
+        let expected = TlsIdentity::from_wireguard_key(&[9; 32]).unwrap();
+        let impostor = MasqueProxy::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let impostor_addr = impostor.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = impostor.serve().await;
+        });
+        let res = MasqueTransport::connect(
+            "127.0.0.1:0".parse().unwrap(),
+            impostor_addr,
+            "ferrum",
+            "127.0.0.1:9".parse().unwrap(),
+            vec![expected.fingerprint()],
+        )
+        .await;
+        assert!(res.is_err(), "impostor proxy must be refused");
+    }
+
+    /// A proxy bound with a stable identity presents exactly that pin.
+    #[tokio::test]
+    async fn stable_proxy_identity_is_pinnable() {
+        let id = TlsIdentity::from_wireguard_key(&[10; 32]).unwrap();
+        let proxy = MasqueProxy::bind_with_identity("127.0.0.1:0".parse().unwrap(), &id).unwrap();
+        assert_eq!(proxy.fingerprint(), id.fingerprint());
     }
 }

@@ -96,6 +96,15 @@ enum Command {
         #[arg(long)]
         xdp_program: Option<String>,
     },
+    /// Print the SHA-256 fingerprint of the QUIC/MASQUE TLS certificate this
+    /// node presents (derived from the config's `private_key`, so it's stable
+    /// across restarts). Peers pin it via `[transport] cert_pins` (SEC-004).
+    #[cfg(any(feature = "quic", feature = "masque"))]
+    TlsFingerprint {
+        /// Path to the TOML config file (only `private_key` is used).
+        #[arg(short, long)]
+        config: String,
+    },
     /// Bring up the tunnel from a config file and run until Ctrl-C.
     Up {
         /// Path to the TOML config file.
@@ -187,6 +196,8 @@ fn main() -> Result<()> {
                 xdp_iface.as_deref(),
                 xdp_program.as_deref(),
             )),
+        #[cfg(any(feature = "quic", feature = "masque"))]
+        Command::TlsFingerprint { config } => tls_fingerprint(&config),
         Command::Up { config, iface, mtu } => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?
@@ -223,6 +234,35 @@ fn keygen() {
     let kp = KeyPair::generate();
     println!("private_key = \"{}\"", kp.private_base64());
     println!("public_key  = \"{}\"", kp.public_base64());
+}
+
+/// This node's stable QUIC/MASQUE TLS identity, derived from its WireGuard key
+/// (SEC-004) — so the cert, and the pin peers configure for it, survive restarts.
+#[cfg(any(feature = "quic", feature = "masque"))]
+fn tls_identity(config: &Config) -> Result<ferrum_transport::TlsIdentity> {
+    let key = ferrum_core::keys::decode_key(&config.private_key).context("decoding private_key")?;
+    ferrum_transport::TlsIdentity::from_wireguard_key(&key).context("deriving TLS identity")
+}
+
+/// `transport.cert_pins`, decoded (already format-checked by config validation).
+#[cfg(any(feature = "quic", feature = "masque"))]
+fn cert_pins(config: &Config) -> Result<Vec<ferrum_transport::Fingerprint>> {
+    ferrum_transport::tls::parse_fingerprints(&config.transport.cert_pins)
+        .context("parsing transport.cert_pins")
+}
+
+/// SEC-004: print the SHA-256 pin of the QUIC/MASQUE certificate this config's
+/// node presents — the value its peers put in `transport.cert_pins`.
+#[cfg(any(feature = "quic", feature = "masque"))]
+fn tls_fingerprint(config_path: &str) -> Result<()> {
+    let config = Config::load(config_path)
+        .with_context(|| format!("loading config from '{config_path}'"))?;
+    let id = tls_identity(&config)?;
+    println!(
+        "{}",
+        ferrum_transport::tls::fingerprint_hex(&id.fingerprint())
+    );
+    Ok(())
 }
 
 /// Phase 4 M3: run the public-key-keyed relay until interrupted. The relay only
@@ -594,7 +634,12 @@ async fn up(config_path: &str, iface: &str, mtu: u16) -> Result<()> {
                 match config.transport.role {
                     Some(TransportRole::Server) => {
                         info!("transport: quic (server), listening on {bind_addr}");
-                        let ep = QuicTransport::server_endpoint(bind_addr)
+                        let id = tls_identity(&config)?;
+                        info!(
+                            cert_sha256 = %ferrum_transport::tls::fingerprint_hex(&id.fingerprint()),
+                            "QUIC server certificate — pin this in the client's transport.cert_pins"
+                        );
+                        let ep = QuicTransport::server_endpoint(bind_addr, &id)
                             .context("creating quic server endpoint")?;
                         let transport = QuicTransport::accept(ep)
                             .await
@@ -603,9 +648,14 @@ async fn up(config_path: &str, iface: &str, mtu: u16) -> Result<()> {
                     }
                     Some(TransportRole::Client) => {
                         info!("transport: quic (client), connecting to {peer}");
-                        let transport = QuicTransport::connect(bind_addr, peer, &server_name)
-                            .await
-                            .context("connecting quic transport")?;
+                        let transport = QuicTransport::connect(
+                            bind_addr,
+                            peer,
+                            &server_name,
+                            cert_pins(&config)?,
+                        )
+                        .await
+                        .context("connecting quic transport")?;
                         drive(session, dev, transport, pad_to, jitter_ms, shutdown).await?;
                     }
                     None => anyhow::bail!("transport.role (client|server) required for quic"),
@@ -641,9 +691,11 @@ async fn up(config_path: &str, iface: &str, mtu: u16) -> Result<()> {
                     .unwrap_or("ferrum")
                     .to_string();
                 info!("transport: masque, proxy={proxy_addr}");
-                let transport = MasqueTransport::connect(bind_addr, proxy_addr, &authority, peer)
-                    .await
-                    .context("connecting to masque proxy")?;
+                let pins = cert_pins(&config)?;
+                let transport =
+                    MasqueTransport::connect(bind_addr, proxy_addr, &authority, peer, pins)
+                        .await
+                        .context("connecting to masque proxy")?;
                 drive(session, dev, transport, pad_to, jitter_ms, shutdown).await?;
             }
             #[cfg(not(feature = "masque"))]
@@ -862,11 +914,18 @@ async fn up_mesh(
         TransportMode::Quic => {
             #[cfg(feature = "quic")]
             {
-                info!("mesh transport: quic");
-                let make_transport = move || async move {
-                    ferrum_transport::QuicMeshTransport::bind(bind_addr)
-                        .await
-                        .map_err(|e| ferrum_client_core::Error::DataPlane(e.to_string()))
+                let id = tls_identity(&config)?;
+                info!(
+                    cert_sha256 = %ferrum_transport::tls::fingerprint_hex(&id.fingerprint()),
+                    "mesh transport: quic"
+                );
+                let make_transport = move || {
+                    let id = id.clone();
+                    async move {
+                        ferrum_transport::QuicMeshTransport::bind(bind_addr, &id)
+                            .await
+                            .map_err(|e| ferrum_client_core::Error::DataPlane(e.to_string()))
+                    }
                 };
                 run_mesh_session_supervised(
                     &client,
@@ -911,11 +970,13 @@ async fn up_mesh(
                     .unwrap_or("ferrum")
                     .to_string();
                 info!(proxy = %proxy_addr, "mesh transport: masque");
+                let pins = cert_pins(&config)?;
                 let make_transport = move || {
                     let authority = authority.clone();
+                    let pins = pins.clone();
                     async move {
                         Ok::<_, ferrum_client_core::Error>(
-                            ferrum_transport::MasqueMeshTransport::new(proxy_addr, authority),
+                            ferrum_transport::MasqueMeshTransport::new(proxy_addr, authority, pins),
                         )
                     }
                 };
