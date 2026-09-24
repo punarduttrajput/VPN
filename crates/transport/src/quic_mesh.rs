@@ -112,15 +112,6 @@ impl QuicMeshTransport {
         self.fingerprint
     }
 
-    /// Replace the expected cert pins, keyed by each address a peer may be dialed
-    /// at. Applies to connections dialed from now on; one already established to
-    /// an address keeps the pin it was verified against.
-    pub fn set_peer_pins(&self, pins: &[(SocketAddr, Vec<Fingerprint>)]) {
-        let mut map = self.pins.lock().expect("quic mesh pins poisoned");
-        map.clear();
-        map.extend(pins.iter().cloned());
-    }
-
     /// Client config for dialing `dst`, pinned to its expected cert(s).
     fn client_config_for(&self, dst: SocketAddr) -> Result<ClientConfig, TransportError> {
         let pins = self
@@ -173,6 +164,15 @@ impl MeshTransport for QuicMeshTransport {
         let n = datagram.len().min(buf.len());
         buf[..n].copy_from_slice(&datagram[..n]);
         Ok((n, src))
+    }
+
+    /// Replace the expected cert pins, keyed by each address a peer may be dialed
+    /// at. Applies to connections dialed from now on; one already established to
+    /// an address keeps the pin it was verified against.
+    fn set_peer_pins(&self, pins: &[(SocketAddr, Vec<Fingerprint>)]) {
+        let mut map = self.pins.lock().expect("quic mesh pins poisoned");
+        map.clear();
+        map.extend(pins.iter().cloned());
     }
 }
 

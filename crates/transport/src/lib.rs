@@ -41,10 +41,13 @@ pub mod relay_xdp;
 #[cfg(all(target_os = "linux", feature = "xdp"))]
 pub use relay_xdp::{RelayXdpError, RelayXdpLoader};
 
+pub mod fingerprint;
+pub use fingerprint::Fingerprint;
+
 #[cfg(feature = "quic")]
 pub mod tls;
 #[cfg(feature = "quic")]
-pub use tls::{Fingerprint, TlsIdentity};
+pub use tls::TlsIdentity;
 
 #[cfg(feature = "quic")]
 pub mod quic;
@@ -146,4 +149,12 @@ pub trait MeshTransport: Send + Sync {
         &self,
         buf: &mut [u8],
     ) -> impl std::future::Future<Output = Result<(usize, SocketAddr), TransportError>> + Send;
+
+    /// Tell the transport which TLS certificate pins to expect when it dials
+    /// each peer address (SEC-004), replacing any previous set. The mesh runner
+    /// calls this whenever the peer set changes. Only transports whose peers are
+    /// TLS servers (`QuicMeshTransport`) act on it; the default ignores it.
+    fn set_peer_pins(&self, pins: &[(SocketAddr, Vec<Fingerprint>)]) {
+        let _ = pins;
+    }
 }

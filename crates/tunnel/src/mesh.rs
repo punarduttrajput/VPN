@@ -24,7 +24,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use ferrum_core::config::Cidr;
-use ferrum_transport::{MeshTransport, RelayMeshTransport};
+use ferrum_transport::{Fingerprint, MeshTransport, RelayMeshTransport};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -48,6 +48,10 @@ pub struct MeshPeer {
     /// candidate (plus `endpoint`) until one answers; roaming then locks
     /// `endpoint` onto whichever path worked. Empty means "only use `endpoint`".
     pub candidates: Vec<SocketAddr>,
+    /// Expected outer-transport TLS cert pins for this peer (SEC-004), applied
+    /// to its endpoint and every candidate. Only a TLS-carrying transport (the
+    /// QUIC mesh) uses them; empty means "unpinned" (it warns).
+    pub tls_pins: Vec<Fingerprint>,
 }
 
 impl MeshPeer {
@@ -58,7 +62,14 @@ impl MeshPeer {
             endpoint,
             allowed_ips,
             candidates: Vec::new(),
+            tls_pins: Vec::new(),
         }
+    }
+
+    /// Expect these TLS cert pins when dialing this peer (SEC-004).
+    pub fn with_tls_pins(mut self, pins: Vec<Fingerprint>) -> Self {
+        self.tls_pins = pins;
+        self
     }
 
     /// A peer with extra ICE `candidates` to probe (Phase 4 connectivity checks).
@@ -75,8 +86,24 @@ impl MeshPeer {
             endpoint,
             allowed_ips,
             candidates,
+            tls_pins: Vec::new(),
         }
     }
+}
+
+/// Push every peer's TLS pins to the transport, keyed by each address it may
+/// be dialed at (endpoint + ICE candidates). A no-op for non-TLS transports.
+fn apply_pins<M: MeshTransport>(transport: &M, peers: &[MeshPeer]) {
+    let pins: Vec<(SocketAddr, Vec<Fingerprint>)> = peers
+        .iter()
+        .filter(|p| !p.tls_pins.is_empty())
+        .flat_map(|p| {
+            std::iter::once(p.endpoint)
+                .chain(p.candidates.iter().copied())
+                .map(move |a| (a, p.tls_pins.clone()))
+        })
+        .collect();
+    transport.set_peer_pins(&pins);
 }
 
 /// Destination IP of an outbound IP packet (v4 or v6), if parseable.
@@ -391,6 +418,7 @@ where
     // Stable relay handles, parallel to `peers`; align the relay's key table.
     let mut handles = relay_handles(&peers);
     align_relay(relay.as_ref(), &peers, &handles);
+    apply_pins(&transport, &peers);
 
     // Kick off a handshake to every peer we start with.
     handshake_all(
@@ -433,6 +461,7 @@ where
                         paths = vec![PathMachine::new(); peers.len()];
                         handles = relay_handles(&peers);
                         align_relay(relay.as_ref(), &peers, &handles);
+                        apply_pins(&transport, &peers);
                         handshake_all(
                             &transport,
                             relay.as_ref(),
@@ -593,6 +622,53 @@ mod tests {
         assert_eq!(peer_for_dest(&peers, "10.8.0.2".parse().unwrap()), Some(0));
         assert_eq!(peer_for_dest(&peers, "10.8.0.3".parse().unwrap()), Some(1));
         assert_eq!(peer_for_dest(&peers, "10.8.0.9".parse().unwrap()), None);
+    }
+
+    /// SEC-004: each pinned peer's pin is applied to its endpoint *and* every
+    /// ICE candidate (any of which the QUIC mesh may dial); unpinned peers add
+    /// nothing.
+    #[test]
+    fn apply_pins_covers_endpoint_and_candidates() {
+        #[derive(Default)]
+        struct Recorder(std::sync::Mutex<Vec<(SocketAddr, Vec<Fingerprint>)>>);
+        impl MeshTransport for Recorder {
+            async fn send_to(
+                &self,
+                _: SocketAddr,
+                _: &[u8],
+            ) -> std::result::Result<(), ferrum_transport::TransportError> {
+                Ok(())
+            }
+            async fn recv_from(
+                &self,
+                _: &mut [u8],
+            ) -> std::result::Result<(usize, SocketAddr), ferrum_transport::TransportError>
+            {
+                std::future::pending().await
+            }
+            fn set_peer_pins(&self, pins: &[(SocketAddr, Vec<Fingerprint>)]) {
+                *self.0.lock().unwrap() = pins.to_vec();
+            }
+        }
+
+        let me = ferrum_core::keys::KeyPair::generate();
+        let session = |i| {
+            let k = ferrum_core::keys::KeyPair::generate();
+            Session::from_bytes(me.private.to_bytes(), k.public.to_bytes(), i).unwrap()
+        };
+        let a: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let a_cand: SocketAddr = "192.168.1.5:1".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        let peers = vec![
+            MeshPeer::with_candidates(session(1), a, vec![], vec![a_cand])
+                .with_tls_pins(vec![[1; 32]]),
+            MeshPeer::new(session(2), b, vec![]), // unpinned
+        ];
+        let t = Recorder::default();
+        apply_pins(&t, &peers);
+        let mut got = t.0.lock().unwrap().clone();
+        got.sort();
+        assert_eq!(got, vec![(a, vec![[1; 32]]), (a_cand, vec![[1; 32]])]);
     }
 
     #[test]

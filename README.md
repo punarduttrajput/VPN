@@ -104,9 +104,11 @@ What a pin protects, and what it doesn't:
   (so existing setups keep working) but logs an "outer transport
   UNAUTHENTICATED" warning every time it connects.
 
-The coordinator-managed QUIC mesh (`up-mesh`) dials each peer with the peer's
-pin once the coordinator distributes pins (the second SEC-004 PR). Until then,
-mesh peers are dialed with the warning.
+In the coordinator-managed QUIC mesh (`up-mesh`, desktop) pinning is
+automatic. Each node publishes its certificate's fingerprint when it registers,
+the coordinator hands it to peers in the network map, and every dial to a peer
+is pinned to it, with no configuration. A peer that registered without a pin
+(for example an older client) is still dialed, with the warning.
 
 **Padding (obfuscation, FR5):** add `padding = true` (optionally `pad_to = 1280`)
 to `[transport]` to normalize datagram sizes against fingerprinting. Both peers

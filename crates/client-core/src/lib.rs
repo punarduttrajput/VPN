@@ -45,6 +45,7 @@ fn peer_spec_from_info(p: PeerInfo) -> PeerSpec {
         endpoint: p.endpoint,
         allowed_ips: p.allowed_ips,
         candidates: p.candidates,
+        tls_cert_sha256: p.tls_cert_sha256,
     }
 }
 
@@ -80,6 +81,9 @@ pub struct PeerSpec {
     /// Peer's published ICE candidates (host + STUN reflexive `ip:port`), for
     /// NAT traversal (PRD Phase 4). Empty until the peer publishes them.
     pub candidates: Vec<String>,
+    /// SHA-256 pin (hex) of the TLS cert the peer presents to QUIC dialers
+    /// (SEC-004), or empty if it registered none.
+    pub tls_cert_sha256: String,
 }
 
 /// The tunnel configuration derived from the control plane for this device.
@@ -96,19 +100,33 @@ pub struct ControlClient {
     inner: CoordinatorClient<Channel>,
     /// Optional OIDC bearer token attached to every RPC (`authorization` header).
     token: Option<String>,
+    /// This device's TLS cert pin (SEC-004), published on every registration.
+    tls_cert_sha256: String,
 }
 
 impl ControlClient {
     /// Connect to the coordinator at `endpoint` (e.g. `http://10.0.0.1:50051`).
     pub async fn connect(endpoint: impl Into<String>) -> Result<Self, Error> {
         let inner = CoordinatorClient::connect(endpoint.into()).await?;
-        Ok(Self { inner, token: None })
+        Ok(Self {
+            inner,
+            token: None,
+            tls_cert_sha256: String::new(),
+        })
     }
 
     /// Attach an OIDC bearer token sent as `authorization: Bearer <token>` on
     /// every request (required when the coordinator runs with OIDC auth on).
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
         self.token = Some(token.into());
+        self
+    }
+
+    /// Publish `pin` (hex SHA-256 of the TLS cert this device presents to QUIC
+    /// dialers — SEC-004) with every [`register`](Self::register), so the
+    /// coordinator can hand it to peers. Unset means "no TLS transport".
+    pub fn with_tls_fingerprint(mut self, pin: impl Into<String>) -> Self {
+        self.tls_cert_sha256 = pin.into();
         self
     }
 
@@ -152,6 +170,7 @@ impl ControlClient {
         Ok(Self {
             inner: CoordinatorClient::new(channel),
             token: None,
+            tls_cert_sha256: String::new(),
         })
     }
 
@@ -168,6 +187,7 @@ impl ControlClient {
             name: name.to_string(),
             endpoint: endpoint.to_string(),
             tags: tags.to_vec(),
+            tls_cert_sha256: self.tls_cert_sha256.clone(),
         });
         let resp = self.inner.register_device(req).await?.into_inner();
         Ok(resp.assigned_cidr)
@@ -237,6 +257,10 @@ impl ControlClient {
         let req = self.request(RotateKeyRequest {
             old_public_key: old_public_key.to_string(),
             new_public_key: new_public_key.to_string(),
+            // The TLS cert is derived from the WireGuard key, so the old pin is
+            // now wrong; clear it (peers dial unpinned, with a warning) until the
+            // device re-registers under the new key with its new pin (SEC-004).
+            new_tls_cert_sha256: String::new(),
         });
         let resp = self.inner.rotate_key(req).await?.into_inner();
         Ok(resp.assigned_cidr)

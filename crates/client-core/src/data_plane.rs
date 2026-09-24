@@ -22,13 +22,14 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use ferrum_core::config::Cidr;
+use ferrum_transport::fingerprint::parse_fingerprint;
 use ferrum_transport::{MeshTransport, RelayMeshTransport};
 use ferrum_tunnel::device::TunDevice;
 use ferrum_tunnel::session::Session;
 use ferrum_tunnel::{run_mesh, run_mesh_relayed, MeshPeer};
 
 use crate::client::FerrumClient;
-use crate::{ClientIdentity, ControlClient, Error, PeerSpec, ReconnectPolicy};
+use crate::{ClientIdentity, Error, PeerSpec, ReconnectPolicy};
 
 /// Turn the coordinator's peer list into mesh sessions keyed by our private key.
 ///
@@ -71,12 +72,23 @@ pub fn build_mesh_peers(private_key_b64: &str, peers: &[PeerSpec]) -> Result<Vec
             // Local session indices must be distinct per peer; +1 keeps them non-zero.
             let session = Session::from_bytes(priv_bytes, pub_bytes, (i as u32) + 1)
                 .map_err(|e| Error::DataPlane(format!("session for '{}': {e}", p.public_key)))?;
-            Ok(MeshPeer::with_candidates(
-                session,
-                endpoint,
-                allowed_ips,
-                candidates,
-            ))
+            // The peer's registered TLS cert pin (SEC-004), for a QUIC dial. A
+            // malformed pin is dropped (that peer is dialed unpinned, with the
+            // transport's warning) rather than failing the whole mesh.
+            let tls_pins = match p.tls_cert_sha256.as_str() {
+                "" => Vec::new(),
+                pin => match parse_fingerprint(pin) {
+                    Ok(fp) => vec![fp],
+                    Err(e) => {
+                        warn!(peer = %p.public_key, "ignoring peer's TLS pin: {e}");
+                        Vec::new()
+                    }
+                },
+            };
+            Ok(
+                MeshPeer::with_candidates(session, endpoint, allowed_ips, candidates)
+                    .with_tls_pins(tls_pins),
+            )
         })
         .collect()
 }
@@ -155,10 +167,7 @@ where
     // A second channel carries live map updates into both the mesh and the facade.
     // It authenticates with the same bearer token as the facade's own channel, so
     // an OIDC-protected coordinator accepts the watch/publish/relay-lookup RPCs.
-    let mut control = ControlClient::connect(coordinator.to_string()).await?;
-    if let Some(token) = client.token() {
-        control = control.with_token(token);
-    }
+    let mut control = client.control(coordinator.to_string()).await?;
 
     // Publish our gathered candidates (gather-then-signal, after registration) so
     // peers learn the alternative paths to probe. Best-effort: a failure here
@@ -447,6 +456,7 @@ where
 mod tests {
     use super::*;
     use crate::client::ConnectionState;
+    use crate::ControlClient;
     use ferrum_control_proto::coordinator::coordinator_server::CoordinatorServer;
     use ferrum_coordinator::{CoordinatorService, Registry};
     use ferrum_transport::UdpMeshTransport;
@@ -482,6 +492,7 @@ mod tests {
             endpoint: "not-an-addr".into(),
             allowed_ips: vec!["10.8.0.3/32".into()],
             candidates: vec![],
+            tls_cert_sha256: String::new(),
         }];
         let result = build_mesh_peers(&me.private_base64(), &specs);
         assert!(matches!(result, Err(Error::DataPlane(_))));
@@ -498,16 +509,65 @@ mod tests {
                 endpoint: "127.0.0.1:51820".into(),
                 allowed_ips: vec!["10.8.0.3/32".into()],
                 candidates: vec![],
+                tls_cert_sha256: String::new(),
             },
             PeerSpec {
                 public_key: p2.public_base64(),
                 endpoint: "127.0.0.1:51821".into(),
                 allowed_ips: vec!["10.8.0.4/32".into()],
                 candidates: vec![],
+                tls_cert_sha256: String::new(),
             },
         ];
         let peers = build_mesh_peers(&me.private_base64(), &specs).unwrap();
         assert_eq!(peers.len(), 2);
+    }
+
+    /// SEC-004: a peer's coordinator-advertised TLS pin becomes its mesh pin; a
+    /// malformed one is dropped (dialed unpinned) rather than failing the mesh.
+    #[test]
+    fn build_mesh_peers_carries_tls_pins() {
+        let me = ferrum_core::keys::KeyPair::generate();
+        let spec = |pin: &str| PeerSpec {
+            public_key: ferrum_core::keys::KeyPair::generate().public_base64(),
+            endpoint: "127.0.0.1:51820".into(),
+            allowed_ips: vec!["10.8.0.3/32".into()],
+            candidates: vec![],
+            tls_cert_sha256: pin.into(),
+        };
+        let specs = [spec(&"ab".repeat(32)), spec("garbage"), spec("")];
+        let peers = build_mesh_peers(&me.private_base64(), &specs).unwrap();
+        assert_eq!(peers[0].tls_pins, vec![[0xab; 32]]);
+        assert!(peers[1].tls_pins.is_empty(), "malformed pin dropped");
+        assert!(peers[2].tls_pins.is_empty());
+    }
+
+    /// SEC-004: a pin set on the facade is published at registration and
+    /// reaches another device's peer view.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tls_fingerprint_is_published_to_peers() {
+        let url = start_coordinator().await;
+        let a = crate::FerrumClient::new();
+        a.set_tls_fingerprint(Some("12".repeat(32)));
+        let a_id = crate::ClientIdentity {
+            public_key: ferrum_core::keys::KeyPair::generate().public_base64(),
+            name: "a".into(),
+            endpoint: "127.0.0.1:51820".into(),
+            tags: vec![],
+        };
+        a.connect(url.clone(), &a_id).await.unwrap();
+
+        let mut b = ControlClient::connect(url).await.unwrap();
+        let b_key = ferrum_core::keys::KeyPair::generate().public_base64();
+        b.register(&b_key, "b", "127.0.0.1:51821", &[])
+            .await
+            .unwrap();
+        let peers = b.network_map(&b_key).await.unwrap();
+        let seen = peers
+            .iter()
+            .find(|p| p.public_key == a_id.public_key)
+            .unwrap();
+        assert_eq!(seen.tls_cert_sha256, "12".repeat(32));
     }
 
     /// The runner registers (driving the facade to `Connected`), reflects a peer

@@ -31,7 +31,8 @@ impl SqliteStore {
                  endpoint   TEXT NOT NULL,
                  tunnel_ip  TEXT NOT NULL,
                  tags       TEXT NOT NULL,
-                 candidates TEXT NOT NULL DEFAULT '[]'
+                 candidates TEXT NOT NULL DEFAULT '[]',
+                 tls_cert_sha256 TEXT NOT NULL DEFAULT ''
              );
              CREATE TABLE IF NOT EXISTS identity_bindings (
                  identity   TEXT PRIMARY KEY,
@@ -39,15 +40,17 @@ impl SqliteStore {
              );",
         )
         .map_err(backend)?;
-        // Migrate databases created before the candidates column existed. A
-        // duplicate-column error just means the schema is already current.
-        if let Err(e) = conn.execute(
+        // Migrate databases created before the candidates / TLS-pin (SEC-004)
+        // columns existed. A duplicate-column error just means the schema is
+        // already current.
+        for migration in [
             "ALTER TABLE devices ADD COLUMN candidates TEXT NOT NULL DEFAULT '[]'",
-            [],
-        ) {
-            let msg = e.to_string();
-            if !msg.contains("duplicate column name") {
-                return Err(backend(e));
+            "ALTER TABLE devices ADD COLUMN tls_cert_sha256 TEXT NOT NULL DEFAULT ''",
+        ] {
+            if let Err(e) = conn.execute(migration, []) {
+                if !e.to_string().contains("duplicate column name") {
+                    return Err(backend(e));
+                }
             }
         }
         Ok(Self {
@@ -66,7 +69,10 @@ impl Store for SqliteStore {
     fn load_all(&self) -> Result<Vec<Device>, StoreError> {
         let conn = self.conn.lock().expect("sqlite mutex poisoned");
         let mut stmt = conn
-            .prepare("SELECT public_key, name, endpoint, tunnel_ip, tags, candidates FROM devices")
+            .prepare(
+                "SELECT public_key, name, endpoint, tunnel_ip, tags, candidates, tls_cert_sha256 \
+                 FROM devices",
+            )
             .map_err(backend)?;
         let rows = stmt
             .query_map([], |row| {
@@ -77,13 +83,14 @@ impl Store for SqliteStore {
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
                 ))
             })
             .map_err(backend)?;
 
         let mut devices = Vec::new();
         for row in rows {
-            let (public_key, name, endpoint, ip_str, tags_json, candidates_json) =
+            let (public_key, name, endpoint, ip_str, tags_json, candidates_json, tls_cert_sha256) =
                 row.map_err(backend)?;
             let tunnel_ip: Ipv4Addr = ip_str
                 .parse()
@@ -98,6 +105,7 @@ impl Store for SqliteStore {
                 tunnel_ip,
                 tags,
                 candidates,
+                tls_cert_sha256,
             });
         }
         Ok(devices)
@@ -108,17 +116,20 @@ impl Store for SqliteStore {
         let candidates = serde_json::to_string(&device.candidates).map_err(backend)?;
         let conn = self.conn.lock().expect("sqlite mutex poisoned");
         conn.execute(
-            "INSERT INTO devices (public_key, name, endpoint, tunnel_ip, tags, candidates)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO devices
+                 (public_key, name, endpoint, tunnel_ip, tags, candidates, tls_cert_sha256)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(public_key) DO UPDATE SET
-                 name = ?2, endpoint = ?3, tunnel_ip = ?4, tags = ?5, candidates = ?6",
+                 name = ?2, endpoint = ?3, tunnel_ip = ?4, tags = ?5, candidates = ?6,
+                 tls_cert_sha256 = ?7",
             params![
                 device.public_key,
                 device.name,
                 device.endpoint,
                 device.tunnel_ip.to_string(),
                 tags,
-                candidates
+                candidates,
+                device.tls_cert_sha256
             ],
         )
         .map_err(backend)?;
@@ -173,6 +184,7 @@ mod tests {
             tunnel_ip: Ipv4Addr::from(ip),
             tags: tags.iter().map(|t| t.to_string()).collect(),
             candidates: Vec::new(),
+            tls_cert_sha256: String::new(),
         }
     }
 
@@ -207,6 +219,17 @@ mod tests {
         let loaded = store.load_all().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].candidates, d.candidates);
+    }
+
+    /// SEC-004: a device's TLS cert pin survives a coordinator restart.
+    #[test]
+    fn tls_pin_roundtrips_through_the_store() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut d = device("AAA", [10, 8, 0, 2], &[]);
+        d.tls_cert_sha256 = "ab".repeat(32);
+        store.upsert(&d).unwrap();
+        let loaded = store.load_all().unwrap();
+        assert_eq!(loaded[0].tls_cert_sha256, d.tls_cert_sha256);
     }
 
     #[test]

@@ -33,10 +33,8 @@ use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime
 use rustls::{CertificateError, DigitallySignedStruct, SignatureScheme};
 use tracing::warn;
 
+pub use crate::fingerprint::{fingerprint_hex, parse_fingerprint, parse_fingerprints, Fingerprint};
 use crate::TransportError;
-
-/// SHA-256 of a certificate's DER — what a pin is.
-pub type Fingerprint = [u8; 32];
 
 /// TLS name every Ferrum QUIC/MASQUE endpoint presents and dials. Identity is
 /// the pinned cert (and, underneath, WireGuard), never the name.
@@ -62,31 +60,6 @@ pub fn fingerprint_of(der: &[u8]) -> Fingerprint {
     let mut out = [0u8; 32];
     out.copy_from_slice(d.as_ref());
     out
-}
-
-/// Lowercase hex, no separators — the canonical form Ferrum prints and stores.
-pub fn fingerprint_hex(fp: &Fingerprint) -> String {
-    fp.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Parse a SHA-256 pin: 64 hex digits, optionally `:`-separated, any case.
-pub fn parse_fingerprint(s: &str) -> Result<Fingerprint, TransportError> {
-    let hex: String = s.trim().chars().filter(|c| *c != ':').collect();
-    if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(setup(format!(
-            "certificate pin '{s}' is not a SHA-256 fingerprint (64 hex digits)"
-        )));
-    }
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).expect("validated hex");
-    }
-    Ok(out)
-}
-
-/// Parse a list of pins (e.g. a config field), failing on the first bad one.
-pub fn parse_fingerprints(list: &[String]) -> Result<Vec<Fingerprint>, TransportError> {
-    list.iter().map(|s| parse_fingerprint(s)).collect()
 }
 
 /// A node's outer-transport TLS certificate and key.
@@ -322,27 +295,6 @@ mod tests {
         let a = TlsIdentity::ephemeral().unwrap();
         let b = TlsIdentity::ephemeral().unwrap();
         assert_ne!(a.fingerprint(), b.fingerprint());
-    }
-
-    #[test]
-    fn fingerprint_parses_openssl_and_plain_forms() {
-        let fp = TlsIdentity::from_wireguard_key(&[1; 32])
-            .unwrap()
-            .fingerprint();
-        let plain = fingerprint_hex(&fp);
-        assert_eq!(plain.len(), 64);
-        assert_eq!(parse_fingerprint(&plain).unwrap(), fp);
-        // `openssl x509 -fingerprint -sha256` style: uppercase, colon-separated.
-        let openssl: Vec<String> = fp.iter().map(|b| format!("{b:02X}")).collect();
-        assert_eq!(parse_fingerprint(&openssl.join(":")).unwrap(), fp);
-    }
-
-    #[test]
-    fn malformed_fingerprints_are_rejected() {
-        assert!(parse_fingerprint("").is_err());
-        assert!(parse_fingerprint("abcd").is_err());
-        assert!(parse_fingerprint(&"zz".repeat(32)).is_err());
-        assert!(parse_fingerprint(&"ab".repeat(33)).is_err());
     }
 
     #[test]

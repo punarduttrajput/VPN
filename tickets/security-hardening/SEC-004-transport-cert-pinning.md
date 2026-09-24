@@ -22,9 +22,9 @@ Phase 2 anti-censorship value proposition.
 - [x] Replace `SkipServerVerification` with a pinning verifier that checks the
       server cert against a coordinator-advertised fingerprint. *(Verifier +
       config pins: part 1. Coordinator-advertised per-peer pins: part 2.)*
-- [ ] The fingerprint is advertised in the network map alongside
-      `relay`/`dns_servers`. *(Part 2 — per peer, since each mesh node is a
-      QUIC server; see Resolution.)*
+- [x] The fingerprint is advertised in the network map alongside
+      `relay`/`dns_servers`. *(Part 2 — as a per-peer `PeerInfo` field, since
+      each mesh node is a QUIC server; see Resolution.)*
 - [x] With no pinning material available, the client connects but emits a
       documented, visible "outer transport unauthenticated" warning — never a
       silent accept.
@@ -65,3 +65,25 @@ relationships and only one of them fits a single "network map" fingerprint:
 - `ferrum tls-fingerprint --config` prints a node's pin.
 - `QuicMeshTransport::set_peer_pins` pins each mesh dial per destination; part 2
   feeds it.
+
+**Part 2** (distributing the pins):
+- **Proto.** `RegisterDeviceRequest.tls_cert_sha256` (the device's own pin),
+  `PeerInfo.tls_cert_sha256` (handed to permitted peers) and
+  `RotateKeyRequest.new_tls_cert_sha256` (the cert is derived from the
+  WireGuard key, so a rotation carries the new pin or clears it, never the
+  stale one).
+- **Coordinator.** Validates the pin (64 hex digits, `:`-separated or not, any
+  case), normalizes it and stores it on the device, persisted under `sqlite`
+  with a column migration. The pin rides the same authenticated registration
+  as the key (SEC-002), so nobody can publish a pin for a key they don't own.
+- **Client.**
+  - `FerrumClient::set_tls_fingerprint`, mirroring `set_token`, attaches the pin
+    to every registration, and `PeerSpec` carries the peer's pin.
+  - `build_mesh_peers` turns it into `MeshPeer::with_tls_pins`. A malformed pin
+    is dropped, so that peer is dialed unpinned with the warning.
+  - `run_mesh` pushes every peer's pins to the transport, keyed by its
+    endpoint and every ICE candidate, through a new
+    `MeshTransport::set_peer_pins` hook (default no-op; QUIC mesh acts on it).
+- **Who publishes.** The CLI (`up-mesh`) and the desktop publish their derived
+  pin only in QUIC mesh mode. UDP has no TLS, and a MASQUE node dials a proxy
+  rather than being dialed.

@@ -56,6 +56,25 @@ pub struct Device {
     /// `ip:port` strings), distributed to permitted peers for NAT traversal
     /// (PRD Phase 4). Empty until the device calls `set_candidates`.
     pub candidates: Vec<String>,
+    /// SHA-256 pin (64 lowercase hex) of the TLS cert this device presents to
+    /// QUIC dialers (SEC-004), or empty. Distributed to permitted peers.
+    pub tls_cert_sha256: String,
+}
+
+/// Normalize a TLS cert pin to 64 lowercase hex digits (accepting `:`
+/// separators and any case), or `""` for none; `None` if malformed.
+pub fn normalize_tls_pin(s: &str) -> Option<String> {
+    let hex: String = s
+        .trim()
+        .chars()
+        .filter(|c| *c != ':')
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    match hex.len() {
+        0 => Some(String::new()),
+        64 if hex.chars().all(|c| c.is_ascii_hexdigit()) => Some(hex),
+        _ => None,
+    }
 }
 
 /// Registry of devices and their assigned tunnel addresses.
@@ -228,6 +247,8 @@ impl Registry {
                 // Candidates are published separately (after STUN), via
                 // `set_candidates`; a fresh registration starts with none.
                 candidates: Vec::new(),
+                // Set by `set_tls_pin` from the same registration request.
+                tls_cert_sha256: String::new(),
             };
             self.by_key.insert(public_key.to_string(), device.clone());
             device
@@ -255,6 +276,26 @@ impl Registry {
                 .get_mut(public_key)
                 .ok_or(RegistryError::UnknownDevice)?;
             device.candidates = candidates.to_vec();
+            device.clone()
+        };
+        self.store
+            .upsert(&device)
+            .map_err(|e| RegistryError::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Record the TLS cert pin a registered device presents (SEC-004); `pin`
+    /// must already be normalized ([`normalize_tls_pin`]) — empty clears it.
+    pub fn set_tls_pin(&mut self, public_key: &str, pin: &str) -> Result<(), RegistryError> {
+        let device = {
+            let device = self
+                .by_key
+                .get_mut(public_key)
+                .ok_or(RegistryError::UnknownDevice)?;
+            if device.tls_cert_sha256 == pin {
+                return Ok(()); // unchanged: skip the write
+            }
+            device.tls_cert_sha256 = pin.to_string();
             device.clone()
         };
         self.store
