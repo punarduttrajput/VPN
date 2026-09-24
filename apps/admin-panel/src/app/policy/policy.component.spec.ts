@@ -122,6 +122,26 @@ describe('PolicyComponent', () => {
     });
   });
 
+  it('leaves the banner to authInterceptor on a 401/403', () => {
+    const status = TestBed.inject(StatusService);
+    status.show('token rejected — sign in again', 'err'); // what the interceptor shows
+    policyService.get.and.returnValue(throwError(() => new HttpErrorResponse({ status: 401 })));
+    component.refresh();
+    expect(status.message()?.text).toBe('token rejected — sign in again');
+    expect(component.canSave()).toBeFalse();
+  });
+
+  it('says the save succeeded when only the follow-up reload fails', () => {
+    policyService.get.and.returnValue(
+      throwError(() => new HttpErrorResponse({ status: 503, error: 'coordinator busy' })),
+    );
+    component.save();
+    const msg = TestBed.inject(StatusService).message();
+    expect(policyService.save).toHaveBeenCalled();
+    expect(msg?.kind).toBe('err');
+    expect(msg?.text).toContain('Policy saved, but reloading it failed: coordinator busy');
+  });
+
   it('blocks Save until the first load completes', async () => {
     const pending = new Subject<Policy>();
     policyService.get.and.returnValue(pending);

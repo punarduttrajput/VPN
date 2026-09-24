@@ -43,7 +43,7 @@
 
 <div class="section-actions">
   <button class="secondary" [disabled]="!loaded()" (click)="addRule()">+ Add rule</button>
-  <button class="secondary" [disabled]="loading()" (click)="refresh()">
+  <button class="secondary" [disabled]="loading()" (click)="refresh(false)">
     {{ loadError() ? 'Retry' : 'Refresh' }}
   </button>
   <button [disabled]="!canSave()" (click)="save()">Save policy</button>

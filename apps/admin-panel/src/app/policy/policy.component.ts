@@ -1,4 +1,5 @@
 import { Component, computed, inject, signal } from '@angular/core';
+import { HttpErrorResponse } from '@angular/common/http';
 import { FormBuilder, FormControl, FormGroup, ReactiveFormsModule } from '@angular/forms';
 
 import { PolicyService } from '../core/policy.service';
@@ -39,7 +40,12 @@ export class PolicyComponent {
     return this.rules.controls as RuleGroup[];
   }
 
-  refresh(): void {
+  /**
+   * Re-fetch the policy into the form. `afterSave` marks the re-fetch that
+   * follows a successful save, so a failure there doesn't read as the save
+   * having failed.
+   */
+  refresh(afterSave = false): void {
     this.loading.set(true);
     this.policyService.get().subscribe({
       next: (policy) => {
@@ -54,7 +60,16 @@ export class PolicyComponent {
         this.loaded.set(false);
         this.loadError.set(errorText(err));
         this.loading.set(false);
-        this.status.show(`Failed to load the policy: ${errorText(err)}`, 'err');
+        // 401/403: authInterceptor has already signed out, shown "sign in
+        // again", and redirected — don't overwrite that with a stale banner
+        // the operator would see after logging back in.
+        if (isAuthError(err)) return;
+        this.status.show(
+          afterSave
+            ? `Policy saved, but reloading it failed: ${errorText(err)}. Retry to keep editing.`
+            : `Failed to load the policy: ${errorText(err)}`,
+          'err',
+        );
       },
     });
   }
@@ -81,7 +96,7 @@ export class PolicyComponent {
       next: () => {
         this.saving.set(false);
         this.status.show('Policy saved.', 'ok');
-        this.refresh();
+        this.refresh(true);
       },
       error: (err) => {
         this.saving.set(false);
@@ -111,6 +126,10 @@ function splitTags(value: string): string[] {
     .split(',')
     .map((t) => t.trim())
     .filter((t) => t.length > 0);
+}
+
+function isAuthError(err: unknown): boolean {
+  return err instanceof HttpErrorResponse && (err.status === 401 || err.status === 403);
 }
 
 function errorText(err: unknown): string {
