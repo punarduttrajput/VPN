@@ -29,6 +29,10 @@ authors = ["punar Rajput <punar@ferrum.dev>"]
 # Pinned to match boringtun 0.6.0's exact dependency (=2.0.0-rc.3) so the
 # StaticSecret/PublicKey types unify across crates.
 x25519-dalek = { version = "=2.0.0-rc.3", features = ["getrandom", "static_secrets"] }
+# Keyed BLAKE2s for the relay's register cookies/proofs (SEC-003) — the same
+# primitive WireGuard's own cookie MACs use; already in the tree via boringtun.
+blake2 = "0.10"
+getrandom = "0.2"
 base64 = "0.22"
 # wireguard data plane
 boringtun = "0.6"

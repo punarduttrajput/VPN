@@ -5,8 +5,9 @@
 //! as two processes against a `ferrum relay` reachable over a real
 //! (veth/netns or physical) interface — see `relay-ebpf/README.md` "Verify".
 //!
-//! Two fixed roles, `a` and `b`, with well-known 32-byte test keys, so the
-//! two processes need no key exchange:
+//! Two fixed roles, `a` and `b`, with well-known test private keys (the relay
+//! challenges every registration for proof of the key — SEC-003), so the two
+//! processes need no key exchange:
 //!
 //! ```sh
 //! relay_traffic <relay_addr> b recv 1000 [timeout_secs]     # start first
@@ -21,11 +22,17 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use ferrum_transport::relay::{PublicKey, RelayMeshTransport};
+use ferrum_transport::relay::{register_via, PublicKey, RelayMeshTransport};
 use ferrum_transport::MeshTransport;
+use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
 
-const KEY_A: PublicKey = [0xAA; 32];
-const KEY_B: PublicKey = [0xBB; 32];
+/// Well-known test private keys for the two roles.
+const SECRET_A: [u8; 32] = [0xAA; 32];
+const SECRET_B: [u8; 32] = [0xBB; 32];
+
+fn public_of(secret: [u8; 32]) -> PublicKey {
+    XPublicKey::from(&StaticSecret::from(secret)).to_bytes()
+}
 
 /// Opaque per-peer endpoint handles (never routed to — the relay addresses
 /// peers by key; these only key the transport's internal peer map).
@@ -51,18 +58,19 @@ async fn main() {
         usage();
     }
     let relay: SocketAddr = args[1].parse().expect("bad relay addr");
-    let (self_key, peer_handle, peer_key) = match args[2].as_str() {
-        "a" => (KEY_A, HANDLE_B, KEY_B),
-        "b" => (KEY_B, HANDLE_A, KEY_A),
+    let (self_secret, peer_handle, peer_secret) = match args[2].as_str() {
+        "a" => (SECRET_A, HANDLE_B, SECRET_B),
+        "b" => (SECRET_B, HANDLE_A, SECRET_A),
         _ => usage(),
     };
+    let secret = StaticSecret::from(self_secret);
     let peer: SocketAddr = peer_handle.parse().unwrap();
 
-    let transport = RelayMeshTransport::connect(relay, self_key, &[(peer, peer_key)])
+    // `connect` completes the relay's register challenge before returning, so
+    // even a send-only role is registered before its first frame.
+    let transport = RelayMeshTransport::connect(relay, &secret, &[(peer, public_of(peer_secret))])
         .await
         .expect("connecting to relay");
-    // Give the relay a beat to process our register frame before any send.
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
     match args[3].as_str() {
         "recv" => {
@@ -101,7 +109,7 @@ async fn main() {
             drop(transport); // its socket would steal nothing (distinct port), but be tidy
             let expected: u64 = arg_or(&args, 4, 10);
             let timeout = Duration::from_secs(arg_or(&args, 5, 20));
-            rawdump(relay, self_key, expected, timeout).await;
+            rawdump(relay, &secret, expected, timeout).await;
         }
         _ => usage(),
     }
@@ -109,14 +117,17 @@ async fn main() {
 
 /// Register `self_key` from a plain socket, then print every datagram that
 /// arrives (truncated hex) until `expected` datagrams or `timeout`.
-async fn rawdump(relay: SocketAddr, self_key: [u8; 32], expected: u64, timeout: Duration) {
+async fn rawdump(relay: SocketAddr, secret: &StaticSecret, expected: u64, timeout: Duration) {
     let sock = tokio::net::UdpSocket::bind("0.0.0.0:0")
         .await
         .expect("bind");
-    let mut reg = vec![0x01u8];
-    reg.extend_from_slice(&self_key);
-    sock.send_to(&reg, relay).await.expect("register");
-    eprintln!("rawdump: registered from {}", sock.local_addr().unwrap());
+    let answered = register_via(&sock, relay, secret, Duration::from_secs(3))
+        .await
+        .expect("register");
+    eprintln!(
+        "rawdump: registered from {} (challenge answered: {answered})",
+        sock.local_addr().unwrap()
+    );
     let mut buf = vec![0u8; 65_600];
     let deadline = Instant::now() + timeout;
     let mut n = 0u64;
