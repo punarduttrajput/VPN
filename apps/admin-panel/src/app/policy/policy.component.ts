@@ -1,4 +1,4 @@
-import { Component, inject, signal } from '@angular/core';
+import { Component, computed, inject, signal } from '@angular/core';
 import { FormBuilder, FormControl, FormGroup, ReactiveFormsModule } from '@angular/forms';
 
 import { PolicyService } from '../core/policy.service';
@@ -19,6 +19,15 @@ export class PolicyComponent {
   private readonly fb = inject(FormBuilder);
 
   readonly loading = signal(false);
+  readonly saving = signal(false);
+  /**
+   * True only while the form holds the policy most recently fetched from the
+   * coordinator. Until then the form is empty (allow_all off, no rules), and
+   * saving it would silently replace the live policy with deny-all.
+   */
+  readonly loaded = signal(false);
+  readonly loadError = signal<string | null>(null);
+  readonly canSave = computed(() => this.loaded() && !this.loading() && !this.saving());
   readonly allowAll = this.fb.control(false);
   readonly rules = this.fb.array<RuleGroup>([]);
 
@@ -35,9 +44,18 @@ export class PolicyComponent {
     this.policyService.get().subscribe({
       next: (policy) => {
         this.render(policy);
+        this.loaded.set(true);
+        this.loadError.set(null);
         this.loading.set(false);
       },
-      error: () => this.loading.set(false),
+      error: (err) => {
+        // Whatever the form holds is no longer known to match the coordinator,
+        // so it must not be saveable (see `loaded`).
+        this.loaded.set(false);
+        this.loadError.set(errorText(err));
+        this.loading.set(false);
+        this.status.show(`Failed to load the policy: ${errorText(err)}`, 'err');
+      },
     });
   }
 
@@ -50,6 +68,7 @@ export class PolicyComponent {
   }
 
   save(): void {
+    if (!this.canSave()) return;
     const policy: Policy = {
       allow_all: Boolean(this.allowAll.value),
       rules: this.ruleGroups.map((group) => ({
@@ -57,12 +76,17 @@ export class PolicyComponent {
         dst: splitTags(group.controls.dst.value ?? ''),
       })),
     };
+    this.saving.set(true);
     this.policyService.save(policy).subscribe({
       next: () => {
+        this.saving.set(false);
         this.status.show('Policy saved.', 'ok');
         this.refresh();
       },
-      error: (err) => this.status.show(`Save failed: ${errorText(err)}`, 'err'),
+      error: (err) => {
+        this.saving.set(false);
+        this.status.show(`Save failed: ${errorText(err)}`, 'err');
+      },
     });
   }
 
