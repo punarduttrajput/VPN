@@ -377,6 +377,8 @@ pub struct MasqueMeshTransport {
     /// The proxy's expected cert pins (SEC-004); empty warns per session.
     pins: Vec<Fingerprint>,
     sessions: Mutex<HashMap<SocketAddr, Arc<MasqueTransport>>>,
+    /// Targets whose session setup last failed (e.g. the proxy failed its pin).
+    backoff: std::sync::Mutex<crate::quic_mesh::DialBackoff>,
     inbound_tx: mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>,
     inbound_rx: Mutex<mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>>,
 }
@@ -392,6 +394,7 @@ impl MasqueMeshTransport {
             authority: authority.into(),
             pins,
             sessions: Mutex::new(HashMap::new()),
+            backoff: std::sync::Mutex::new(Default::default()),
             inbound_tx,
             inbound_rx: Mutex::new(inbound_rx),
         }
@@ -429,9 +432,43 @@ impl MasqueMeshTransport {
 }
 
 impl MeshTransport for MasqueMeshTransport {
+    /// Send to one peer through the proxy. As with the QUIC mesh, a session that
+    /// can't be set up (proxy unreachable, or it failed its pin) or has died is
+    /// a dropped datagram, not a session-fatal error, with backed-off retries.
     async fn send_to(&self, dst: SocketAddr, datagram: &[u8]) -> Result<(), TransportError> {
-        let session = self.session_for(dst).await?;
-        session.send(datagram).await
+        let now = std::time::Instant::now();
+        if self
+            .backoff
+            .lock()
+            .expect("masque backoff poisoned")
+            .is_waiting(dst, now)
+        {
+            return Ok(());
+        }
+        let session = match self.session_for(dst).await {
+            Ok(s) => s,
+            Err(e) => {
+                let retry_in = self
+                    .backoff
+                    .lock()
+                    .expect("masque backoff poisoned")
+                    .note_failure(dst, now);
+                tracing::warn!(
+                    "MASQUE mesh: no session to {dst} via {} ({e}); dropping, retrying in {retry_in:?}",
+                    self.proxy
+                );
+                return Ok(());
+            }
+        };
+        self.backoff
+            .lock()
+            .expect("masque backoff poisoned")
+            .note_success(dst);
+        if let Err(e) = session.send(datagram).await {
+            tracing::debug!("MASQUE mesh: send to {dst} failed ({e}); reopening on the next send");
+            self.sessions.lock().await.remove(&dst);
+        }
+        Ok(())
     }
 
     async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr), TransportError> {

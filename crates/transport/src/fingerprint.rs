@@ -6,7 +6,7 @@
 
 use crate::TransportError;
 
-/// SHA-256 of a certificate's DER — what a pin is.
+/// SHA-256 of a certificate's SubjectPublicKeyInfo DER — what a pin is.
 pub type Fingerprint = [u8; 32];
 
 /// Lowercase hex, no separators — the canonical form Ferrum prints and stores.
@@ -15,7 +15,7 @@ pub fn fingerprint_hex(fp: &Fingerprint) -> String {
 }
 
 /// Parse a SHA-256 pin: 64 hex digits, optionally `:`-separated, any case (so
-/// `openssl x509 -fingerprint -sha256` output works as-is).
+/// `openssl dgst -sha256`-style and colon-separated output both work).
 pub fn parse_fingerprint(s: &str) -> Result<Fingerprint, TransportError> {
     let hex: String = s.trim().chars().filter(|c| *c != ':').collect();
     if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
