@@ -18,6 +18,16 @@ allowed_ips = ["10.8.0.2/32"]
 mode = "quic"
 role = "client"        # the other peer uses role = "server"
 server_name = "ferrum"    # TLS SNI presented/expected (peer identity is via WireGuard)
+# Pin the QUIC server's certificate (SEC-004) so an on-path box can't intercept
+# the outer QUIC layer. On the SERVER peer run:
+#   ferrum tls-fingerprint --config <server-config.toml>
+# and paste the output here (it's stable across restarts — derived from the
+# server's private_key). Several entries are allowed, for a cert rotation.
+# Without a pin the client still connects but logs that the outer transport is
+# unauthenticated. For MASQUE, pin the proxy's cert the same way
+# (the pin is the SHA-256 of its public key:
+#   openssl x509 -in cert.pem -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256).
+# cert_pins = ["<64 hex digits>"]
 # Optional DERP-style relay fallback for `ferrum up-mesh` (Phase 4 NAT traversal).
 # Independent of `mode`: when set, the mesh runs the direct transport AND a
 # public-key-keyed relay at once, preferring direct and falling back per peer.

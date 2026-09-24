@@ -2,10 +2,12 @@
 //!
 //! Carries WireGuard packets as QUIC datagrams. QUIC is encrypted, multiplexed,
 //! and ubiquitous (HTTP/3), so the traffic blends with ordinary web QUIC and
-//! gains roaming-friendly properties. Peer authenticity is already guaranteed by
-//! the inner WireGuard handshake, so the QUIC layer uses a self-signed cert with
-//! a permissive verifier — the TLS layer here is for transport encryption and
-//! camouflage, not peer identity.
+//! gains roaming-friendly properties. Peer authenticity is guaranteed by the inner
+//! WireGuard handshake; the QUIC layer is authenticated separately by **pinning**
+//! the server's self-signed cert (SEC-004, see [`crate::tls`]): the server
+//! presents a stable [`TlsIdentity`] derived from its WireGuard key, and the
+//! client accepts only a cert whose public key's SHA-256 it was told to expect —
+//! warning when it has no pin.
 //!
 //! Connection migration (FR4): a QUIC connection is keyed by connection IDs, not
 //! by the 4-tuple, so it survives the client's local address changing (Wi-Fi →
@@ -13,8 +15,8 @@
 //! socket; the next packet the client sends validates the new path and the server
 //! follows it — the tunnel keeps running without a re-handshake.
 //!
-//! Deferred to later Phase 2 increments: MASQUE/HTTP3 framing and padding/timing
-//! obfuscation.
+//! See also [`crate::masque`] (MASQUE / HTTP-3 CONNECT-UDP) and the padding and
+//! timing-jitter decorators ([`crate::pad`], [`crate::jitter`]).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -23,6 +25,7 @@ use bytes::Bytes;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{ClientConfig, Connection, Endpoint, ServerConfig};
 
+use crate::tls::{self, Fingerprint, TlsIdentity};
 use crate::{Transport, TransportError};
 
 fn setup(msg: impl std::fmt::Display) -> TransportError {
@@ -46,20 +49,16 @@ pub struct QuicTransport {
 }
 
 impl QuicTransport {
-    /// Create a bound, configured server endpoint (call [`accept`] to take a peer).
+    /// Create a bound, configured server endpoint presenting `identity` (call
+    /// [`accept`] to take a peer). Pass [`TlsIdentity::from_wireguard_key`] so the
+    /// client can pin it.
     ///
     /// [`accept`]: QuicTransport::accept
-    pub fn server_endpoint(local: SocketAddr) -> Result<Endpoint, TransportError> {
-        install_provider();
-        let cert = rcgen::generate_simple_self_signed(vec!["ferrum".to_string()])
-            .map_err(|e| setup(format!("self-signed cert: {e}")))?;
-        let cert_der = rustls::pki_types::CertificateDer::from(cert.cert);
-        let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
-
-        let crypto = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert_der], key_der.into())
-            .map_err(|e| setup(format!("server tls: {e}")))?;
+    pub fn server_endpoint(
+        local: SocketAddr,
+        identity: &TlsIdentity,
+    ) -> Result<Endpoint, TransportError> {
+        let crypto = identity.server_crypto(&[])?;
         let quic_crypto =
             QuicServerConfig::try_from(crypto).map_err(|e| setup(format!("quic server: {e}")))?;
         let server_config = ServerConfig::with_crypto(Arc::new(quic_crypto));
@@ -122,19 +121,18 @@ impl QuicTransport {
         Ok(())
     }
 
-    /// Connect to a QUIC server at `server` from local address `local`.
+    /// Connect to a QUIC server at `server` from local address `local`,
+    /// accepting only a server cert whose SHA-256 is in `pins`. An empty `pins`
+    /// connects anyway but logs an "outer transport unauthenticated" warning.
     pub async fn connect(
         local: SocketAddr,
         server: SocketAddr,
         server_name: &str,
+        pins: Vec<Fingerprint>,
     ) -> Result<Self, TransportError> {
-        install_provider();
         let mut endpoint = Endpoint::client(local).map_err(TransportError::Io)?;
 
-        let crypto = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(SkipServerVerification::new()))
-            .with_no_client_auth();
+        let crypto = tls::client_crypto(pins, format!("QUIC server {server}"), &[]);
         let quic_crypto =
             QuicClientConfig::try_from(crypto).map_err(|e| setup(format!("quic client: {e}")))?;
         endpoint.set_default_client_config(ClientConfig::new(Arc::new(quic_crypto)));
@@ -171,71 +169,23 @@ impl Transport for QuicTransport {
     }
 }
 
-/// A rustls verifier that accepts any server certificate. Safe here because the
-/// inner WireGuard handshake — not TLS — authenticates the peer (see module docs).
-#[derive(Debug)]
-pub(crate) struct SkipServerVerification(Arc<rustls::crypto::CryptoProvider>);
-
-impl SkipServerVerification {
-    pub(crate) fn new() -> Self {
-        Self(Arc::new(rustls::crypto::ring::default_provider()))
-    }
-}
-
-impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A server endpoint on loopback with a stable identity; returns its address
+    /// and pin.
+    fn pinned_server(key: u8) -> (Endpoint, SocketAddr, Fingerprint) {
+        let id = TlsIdentity::from_wireguard_key(&[key; 32]).unwrap();
+        let ep = QuicTransport::server_endpoint("127.0.0.1:0".parse().unwrap(), &id).unwrap();
+        let addr = ep.local_addr().unwrap();
+        (ep, addr, id.fingerprint())
+    }
+
     /// A WireGuard-sized packet survives a QUIC datagram round trip (FR2).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn quic_datagram_roundtrip() {
-        let endpoint = QuicTransport::server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
-        let server_addr = endpoint.local_addr().unwrap();
+        let (endpoint, server_addr, pin) = pinned_server(1);
 
         // Server: accept, echo one datagram, then stay alive until the client
         // closes so the (unreliable) echoed datagram is actually flushed.
@@ -247,9 +197,14 @@ mod tests {
             t.connection.closed().await;
         });
 
-        let client = QuicTransport::connect("127.0.0.1:0".parse().unwrap(), server_addr, "ferrum")
-            .await
-            .unwrap();
+        let client = QuicTransport::connect(
+            "127.0.0.1:0".parse().unwrap(),
+            server_addr,
+            "ferrum",
+            vec![pin],
+        )
+        .await
+        .unwrap();
 
         // Size the payload to the negotiated datagram limit (a realistic
         // WireGuard-sized packet that fits QUIC's conservative initial MTU).
@@ -273,8 +228,7 @@ mod tests {
     async fn quic_connection_survives_client_migration() {
         use std::time::Duration;
 
-        let endpoint = QuicTransport::server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
-        let server_addr = endpoint.local_addr().unwrap();
+        let (endpoint, server_addr, pin) = pinned_server(2);
 
         // Server: echo every datagram until the client closes, reporting the
         // remote address it saw on the last datagram.
@@ -292,9 +246,14 @@ mod tests {
             t.connection.closed().await;
         });
 
-        let client = QuicTransport::connect("127.0.0.1:0".parse().unwrap(), server_addr, "ferrum")
-            .await
-            .unwrap();
+        let client = QuicTransport::connect(
+            "127.0.0.1:0".parse().unwrap(),
+            server_addr,
+            "ferrum",
+            vec![pin],
+        )
+        .await
+        .unwrap();
         let before = client.local_addr_of_endpoint();
 
         // Pre-migration exchange.
@@ -328,5 +287,68 @@ mod tests {
 
         drop(client);
         let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+    }
+
+    /// SEC-004 AC: a client refuses a server whose cert doesn't match its pin —
+    /// the case of an on-path interceptor presenting its own cert.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_rejects_a_server_that_does_not_match_the_pin() {
+        let (endpoint, server_addr, _real_pin) = pinned_server(3);
+        tokio::spawn(async move {
+            let _ = QuicTransport::accept(endpoint).await;
+        });
+        let wrong = TlsIdentity::from_wireguard_key(&[4; 32])
+            .unwrap()
+            .fingerprint();
+        let res = QuicTransport::connect(
+            "127.0.0.1:0".parse().unwrap(),
+            server_addr,
+            "ferrum",
+            vec![wrong],
+        )
+        .await;
+        let err = res.err().expect("mismatched pin must fail the handshake");
+        assert!(err.to_string().contains("handshake"), "{err}");
+    }
+
+    /// Several pins (current + next across a rotation): any match is accepted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn any_configured_pin_matches() {
+        let (endpoint, server_addr, pin) = pinned_server(5);
+        tokio::spawn(async move {
+            let _ = QuicTransport::accept(endpoint).await;
+        });
+        let other = TlsIdentity::from_wireguard_key(&[6; 32])
+            .unwrap()
+            .fingerprint();
+        QuicTransport::connect(
+            "127.0.0.1:0".parse().unwrap(),
+            server_addr,
+            "ferrum",
+            vec![other, pin],
+        )
+        .await
+        .expect("a matching pin in the set must be accepted");
+    }
+
+    /// SEC-004 AC (no-pin path): with nothing to pin, the client still connects
+    /// (the warning is logged by `tls::PinnedVerifier`), preserving the
+    /// pre-pinning behavior rather than breaking unconfigured deployments.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unpinned_client_still_connects() {
+        let id = TlsIdentity::ephemeral().unwrap();
+        let endpoint = QuicTransport::server_endpoint("127.0.0.1:0".parse().unwrap(), &id).unwrap();
+        let server_addr = endpoint.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = QuicTransport::accept(endpoint).await;
+        });
+        QuicTransport::connect(
+            "127.0.0.1:0".parse().unwrap(),
+            server_addr,
+            "ferrum",
+            vec![],
+        )
+        .await
+        .expect("unpinned connect should succeed (with a warning)");
     }
 }

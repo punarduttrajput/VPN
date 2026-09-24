@@ -68,6 +68,11 @@ pub struct ConnectConfig {
     /// TLS / HTTP-3 `:authority` for QUIC/MASQUE (defaults to `ferrum` when unset).
     #[serde(default)]
     pub server_name: Option<String>,
+    /// Expected pin(s) — SHA-256 of the public key — of the MASQUE proxy's TLS certificate
+    /// (SEC-004; hex, `:`-separated or not). Empty connects with an "outer
+    /// transport unauthenticated" warning. No GUI field yet.
+    #[serde(default)]
+    pub cert_pins: Vec<String>,
     /// STUN server `ip:port`; when set, the service gathers + publishes candidates.
     #[serde(default)]
     pub stun_server: Option<String>,
@@ -202,6 +207,7 @@ mod tests {
             transport_mode: "udp".into(),
             masque_proxy: None,
             server_name: None,
+            cert_pins: Vec::new(),
             stun_server: Some("198.51.100.1:3478".into()),
             relay: None,
             token: None,

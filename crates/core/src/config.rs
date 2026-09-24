@@ -102,6 +102,23 @@ pub struct TransportConfig {
     /// off. Both peers configure this independently.
     #[serde(default)]
     pub jitter_ms: Option<u16>,
+    /// Expected pin(s) of the QUIC server's / MASQUE proxy's TLS certificate
+    /// (SEC-004): the SHA-256 of its public key (SubjectPublicKeyInfo) — the
+    /// peer (point-to-point QUIC, client role) or the proxy (MASQUE). Hex,
+    /// `:`-separated or not. For a third-party proxy: `openssl x509 -in cert.pem
+    /// -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256`.
+    /// A list so a current and a next key can overlap across a rotation. Empty (the default) still connects, but logs
+    /// that the outer transport is unauthenticated. Get a Ferrum node's own
+    /// value with `ferrum tls-fingerprint --config <its config>`.
+    #[serde(default)]
+    pub cert_pins: Vec<String>,
+}
+
+/// Whether `s` looks like a SHA-256 fingerprint: 64 hex digits, optionally
+/// `:`-separated (the transport crate does the actual decoding).
+fn is_sha256_fingerprint(s: &str) -> bool {
+    let hex: Vec<char> = s.trim().chars().filter(|c| *c != ':').collect();
+    hex.len() == 64 && hex.iter().all(|c| c.is_ascii_hexdigit())
 }
 
 /// The `[dns]` config block (PRD `leak-protection.md`, FR2): resolvers to use
@@ -297,6 +314,14 @@ impl Config {
             relay
                 .parse::<SocketAddr>()
                 .map_err(|e| Error::ConfigInvalid(format!("transport.relay '{relay}': {e}")))?;
+        }
+
+        for pin in &self.transport.cert_pins {
+            if !is_sha256_fingerprint(pin) {
+                return Err(Error::ConfigInvalid(format!(
+                    "transport.cert_pins '{pin}' is not a SHA-256 fingerprint (64 hex digits)"
+                )));
+            }
         }
 
         // DNS servers are bare IPs (DNS uses its standard ports), not ip:port.
@@ -508,6 +533,33 @@ mod tests {
         );
         let cfg: Config = toml::from_str(&toml_str).unwrap();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn cert_pins_default_empty_and_parse() {
+        let cfg: Config = toml::from_str(&valid_toml()).unwrap();
+        assert!(cfg.transport.cert_pins.is_empty());
+
+        let plain = "ab".repeat(32);
+        let openssl = vec!["AB"; 32].join(":");
+        let toml_str = format!(
+            "{}\n[transport]\nmode = \"masque\"\nmasque_proxy = \"203.0.113.1:443\"\ncert_pins = [\"{plain}\", \"{openssl}\"]\n",
+            valid_toml()
+        );
+        let cfg: Config = toml::from_str(&toml_str).unwrap();
+        assert_eq!(cfg.transport.cert_pins.len(), 2);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_malformed_cert_pin() {
+        let toml_str = format!(
+            "{}\n[transport]\nmode = \"udp\"\ncert_pins = [\"not-a-fingerprint\"]\n",
+            valid_toml()
+        );
+        let cfg: Config = toml::from_str(&toml_str).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("cert_pins"), "{err}");
     }
 
     #[test]

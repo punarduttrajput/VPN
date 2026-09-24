@@ -290,6 +290,7 @@ fn build_config(
         transport_mode: transport.mode,
         masque_proxy: transport.masque_proxy,
         server_name: transport.server_name,
+        cert_pins: Vec::new(), // no GUI field yet (SEC-004): unpinned, with a warning
         stun_server: transport.stun_server,
         relay: transport.relay,
         token: identity.token,

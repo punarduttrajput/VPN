@@ -490,6 +490,7 @@ async fn masque_mesh_node_reaches_udp_peer() {
     // MASQUE proxy M tunnels through.
     let proxy = MasqueProxy::bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let proxy_addr = proxy.local_addr().unwrap();
+    let proxy_pin = proxy.fingerprint();
     tokio::spawn(async move {
         let _ = proxy.serve().await;
     });
@@ -532,7 +533,7 @@ async fn masque_mesh_node_reaches_udp_peer() {
     let jm = tokio::spawn(async move {
         run_mesh(
             tun_m,
-            MasqueMeshTransport::new(proxy_addr, "ferrum"),
+            MasqueMeshTransport::new(proxy_addr, "ferrum", vec![proxy_pin]),
             m_peers,
             um_rx,
             async {
@@ -664,7 +665,7 @@ async fn mesh_applies_peers_from_a_live_update() {
 #[cfg(feature = "quic")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn quic_mesh_routes_packets_to_the_right_peer() {
-    use ferrum_transport::QuicMeshTransport;
+    use ferrum_transport::{QuicMeshTransport, TlsIdentity};
 
     let (a, b, c) = (
         KeyPair::generate(),
@@ -673,16 +674,26 @@ async fn quic_mesh_routes_packets_to_the_right_peer() {
     );
 
     // Build the QUIC endpoints first so we know each node's advertised address.
-    let qa = QuicMeshTransport::bind("127.0.0.1:0".parse().unwrap())
-        .await
-        .unwrap();
-    let qb = QuicMeshTransport::bind("127.0.0.1:0".parse().unwrap())
-        .await
-        .unwrap();
-    let qc = QuicMeshTransport::bind("127.0.0.1:0".parse().unwrap())
-        .await
-        .unwrap();
+    // Each presents the stable TLS identity derived from its WireGuard key.
+    async fn quic_node(kp: &KeyPair) -> QuicMeshTransport {
+        let id = TlsIdentity::from_wireguard_key(&kp.private.to_bytes()).unwrap();
+        QuicMeshTransport::bind("127.0.0.1:0".parse().unwrap(), &id)
+            .await
+            .unwrap()
+    }
+    let qa = quic_node(&a).await;
+    let qb = quic_node(&b).await;
+    let qc = quic_node(&c).await;
     let (addr_a, addr_b, addr_c) = (qa.local_addr(), qb.local_addr(), qc.local_addr());
+    // Everyone pins everyone (what the coordinator-distributed pins will do).
+    let pins = [
+        (addr_a, vec![qa.fingerprint()]),
+        (addr_b, vec![qb.fingerprint()]),
+        (addr_c, vec![qc.fingerprint()]),
+    ];
+    for q in [&qa, &qb, &qc] {
+        q.set_peer_pins(&pins);
+    }
 
     let a_peers = vec![
         MeshPeer::new(

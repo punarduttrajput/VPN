@@ -21,22 +21,28 @@
 //! `send_to` always uses the connection *we* dialed to that peer, while inbound
 //! arrives over the connection the peer dialed to us. This keeps send/receive
 //! unambiguous without connection-dedup races.
+//!
+//! ## Outer-layer authentication (SEC-004)
+//!
+//! Every node presents its stable [`TlsIdentity`] (derived from its WireGuard
+//! key), and each dial pins the destination peer's cert fingerprint, supplied via
+//! [`set_peer_pins`](QuicMeshTransport::set_peer_pins) — keyed by every address
+//! the peer may be dialed at (endpoint and ICE candidates). A peer with no pin is
+//! still dialed, with a loud "outer transport unauthenticated" warning.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{ClientConfig, Connection, Endpoint, ServerConfig};
 use tokio::sync::{mpsc, Mutex};
+use tracing::{debug, warn};
 
-use crate::quic::{install_provider, SkipServerVerification};
+use crate::tls::{self, Fingerprint, TlsIdentity, SERVER_NAME};
 use crate::{MeshTransport, TransportError};
-
-/// TLS server name presented/accepted (peer identity is the inner WireGuard
-/// handshake, not TLS — see [`crate::quic`]).
-const SERVER_NAME: &str = "ferrum";
 
 /// Max bytes read for a peer's hello (an `ip:port` string is far smaller).
 const HELLO_MAX: usize = 64;
@@ -56,8 +62,14 @@ type Tagged = (SocketAddr, Bytes);
 pub struct QuicMeshTransport {
     endpoint: Endpoint,
     local_addr: SocketAddr,
+    /// This node's presented cert pin (what peers must be told to expect).
+    fingerprint: Fingerprint,
+    /// Expected cert pins per dialable peer address (SEC-004).
+    pins: std::sync::Mutex<HashMap<SocketAddr, Vec<Fingerprint>>>,
     /// Connections we dialed, keyed by the peer's advertised address (used to send).
     dialed: Mutex<HashMap<SocketAddr, Connection>>,
+    /// Destinations whose last dial failed, and when to try again.
+    backoff: std::sync::Mutex<DialBackoff>,
     /// Inbound datagrams from every connection (dialed + accepted).
     inbound_tx: mpsc::UnboundedSender<Tagged>,
     inbound_rx: Mutex<mpsc::UnboundedReceiver<Tagged>>,
@@ -72,9 +84,11 @@ impl Drop for QuicMeshTransport {
 }
 
 impl QuicMeshTransport {
-    /// Bind a dual-role (accept + dial) QUIC endpoint to serve the mesh.
-    pub async fn bind(local: SocketAddr) -> Result<Self, TransportError> {
-        let endpoint = build_endpoint(local)?;
+    /// Bind a dual-role (accept + dial) QUIC endpoint to serve the mesh,
+    /// presenting `identity` (pass [`TlsIdentity::from_wireguard_key`] so peers
+    /// can pin it across restarts).
+    pub async fn bind(local: SocketAddr, identity: &TlsIdentity) -> Result<Self, TransportError> {
+        let endpoint = build_endpoint(local, identity)?;
         let local_addr = endpoint.local_addr().map_err(TransportError::Io)?;
 
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
@@ -83,7 +97,10 @@ impl QuicMeshTransport {
         Ok(Self {
             endpoint,
             local_addr,
+            fingerprint: identity.fingerprint(),
+            pins: std::sync::Mutex::new(HashMap::new()),
             dialed: Mutex::new(HashMap::new()),
+            backoff: std::sync::Mutex::new(DialBackoff::default()),
             inbound_tx,
             inbound_rx: Mutex::new(inbound_rx),
             accept_task,
@@ -95,6 +112,40 @@ impl QuicMeshTransport {
         self.local_addr
     }
 
+    /// The SHA-256 pin of the cert this node presents.
+    pub fn fingerprint(&self) -> Fingerprint {
+        self.fingerprint
+    }
+
+    /// Replace the expected cert pins, keyed by each address a peer may be dialed
+    /// at. Applies to connections dialed from now on; one already established to
+    /// an address keeps the pin it was verified against.
+    pub fn set_peer_pins(&self, pins: &[(SocketAddr, Vec<Fingerprint>)]) {
+        let mut map = self.pins.lock().expect("quic mesh pins poisoned");
+        map.clear();
+        map.extend(pins.iter().cloned());
+        // New pins are new information: retry previously refused peers now.
+        self.backoff
+            .lock()
+            .expect("quic mesh backoff poisoned")
+            .clear();
+    }
+
+    /// Client config for dialing `dst`, pinned to its expected cert(s).
+    fn client_config_for(&self, dst: SocketAddr) -> Result<ClientConfig, TransportError> {
+        let pins = self
+            .pins
+            .lock()
+            .expect("quic mesh pins poisoned")
+            .get(&dst)
+            .cloned()
+            .unwrap_or_default();
+        let crypto = tls::client_crypto(pins, format!("QUIC mesh peer {dst}"), &[]);
+        Ok(ClientConfig::new(Arc::new(
+            QuicClientConfig::try_from(crypto).map_err(|e| setup(format!("quic client: {e}")))?,
+        )))
+    }
+
     /// Get the connection to `dst`, dialing (and announcing ourselves) if needed.
     async fn connection_to(&self, dst: SocketAddr) -> Result<Connection, TransportError> {
         let mut dialed = self.dialed.lock().await;
@@ -103,7 +154,7 @@ impl QuicMeshTransport {
         }
         let conn = self
             .endpoint
-            .connect(dst, SERVER_NAME)
+            .connect_with(self.client_config_for(dst)?, dst, SERVER_NAME)
             .map_err(|e| conn_err(format!("connect {dst}: {e}")))?
             .await
             .map_err(|e| conn_err(format!("handshake {dst}: {e}")))?;
@@ -117,10 +168,44 @@ impl QuicMeshTransport {
 }
 
 impl MeshTransport for QuicMeshTransport {
+    /// Send to one peer. Like a UDP datagram, a send that can't be delivered
+    /// — the peer is unreachable, refused our pin, or its connection died — is
+    /// **dropped and logged, not an error**: the mesh loop treats a send error
+    /// as fatal to the whole session, and one bad peer (or an on-path attacker
+    /// presenting the wrong cert for it) must not take every other peer down.
+    /// Failed dials back off (see [`DialBackoff`]) so a refused peer doesn't
+    /// stall the loop with a handshake per packet.
     async fn send_to(&self, dst: SocketAddr, datagram: &[u8]) -> Result<(), TransportError> {
-        let conn = self.connection_to(dst).await?;
-        conn.send_datagram(Bytes::copy_from_slice(datagram))
-            .map_err(|e| conn_err(format!("send_datagram {dst}: {e}")))
+        if self
+            .backoff
+            .lock()
+            .expect("quic mesh backoff poisoned")
+            .is_waiting(dst, Instant::now())
+        {
+            return Ok(());
+        }
+        let conn = match self.connection_to(dst).await {
+            Ok(conn) => conn,
+            Err(e) => {
+                let retry_in = self
+                    .backoff
+                    .lock()
+                    .expect("quic mesh backoff poisoned")
+                    .note_failure(dst, Instant::now());
+                warn!("QUIC mesh: can't reach {dst} ({e}); dropping, retrying in {retry_in:?}");
+                return Ok(());
+            }
+        };
+        self.backoff
+            .lock()
+            .expect("quic mesh backoff poisoned")
+            .note_success(dst);
+        if let Err(e) = conn.send_datagram(Bytes::copy_from_slice(datagram)) {
+            // A dead connection: forget it so the next send re-dials.
+            debug!("QUIC mesh: send to {dst} failed ({e}); re-dialing on the next send");
+            self.dialed.lock().await.remove(&dst);
+        }
+        Ok(())
     }
 
     async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr), TransportError> {
@@ -132,6 +217,45 @@ impl MeshTransport for QuicMeshTransport {
         let n = datagram.len().min(buf.len());
         buf[..n].copy_from_slice(&datagram[..n]);
         Ok((n, src))
+    }
+}
+
+/// Per-destination exponential backoff for failed dials: 1 s, doubling to 30 s,
+/// reset on a successful dial (or new pins).
+#[derive(Default)]
+pub(crate) struct DialBackoff {
+    /// `dst -> (retry not before, current delay)`.
+    failed: HashMap<SocketAddr, (Instant, Duration)>,
+}
+
+const DIAL_BACKOFF_MIN: Duration = Duration::from_secs(1);
+const DIAL_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+impl DialBackoff {
+    /// Whether `dst` is still waiting out a previous failure.
+    pub(crate) fn is_waiting(&self, dst: SocketAddr, now: Instant) -> bool {
+        self.failed
+            .get(&dst)
+            .is_some_and(|(retry_at, _)| now < *retry_at)
+    }
+
+    /// Record a failed dial; returns how long until the next attempt.
+    pub(crate) fn note_failure(&mut self, dst: SocketAddr, now: Instant) -> Duration {
+        let delay = self
+            .failed
+            .get(&dst)
+            .map(|(_, d)| (*d * 2).min(DIAL_BACKOFF_MAX))
+            .unwrap_or(DIAL_BACKOFF_MIN);
+        self.failed.insert(dst, (now + delay, delay));
+        delay
+    }
+
+    pub(crate) fn note_success(&mut self, dst: SocketAddr) {
+        self.failed.remove(&dst);
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.failed.clear();
     }
 }
 
@@ -186,56 +310,107 @@ async fn read_hello(conn: &Connection) -> Option<SocketAddr> {
     std::str::from_utf8(&bytes).ok()?.parse().ok()
 }
 
-/// Build a quinn endpoint that can both accept connections and dial peers,
-/// using a self-signed cert (transport encryption/camouflage only).
-fn build_endpoint(local: SocketAddr) -> Result<Endpoint, TransportError> {
-    install_provider();
-
-    // Server side: self-signed cert (the inner WireGuard handshake authenticates).
-    let cert = rcgen::generate_simple_self_signed(vec![SERVER_NAME.to_string()])
-        .map_err(|e| setup(format!("self-signed cert: {e}")))?;
-    let cert_der = rustls::pki_types::CertificateDer::from(cert.cert);
-    let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
-    let server_crypto = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der], key_der.into())
-        .map_err(|e| setup(format!("server tls: {e}")))?;
+/// Build a quinn endpoint that accepts connections presenting `identity`; dials
+/// get a per-destination pinned client config (see `client_config_for`).
+fn build_endpoint(local: SocketAddr, identity: &TlsIdentity) -> Result<Endpoint, TransportError> {
+    let server_crypto = identity.server_crypto(&[])?;
     let server_config = ServerConfig::with_crypto(Arc::new(
         QuicServerConfig::try_from(server_crypto)
             .map_err(|e| setup(format!("quic server: {e}")))?,
     ));
-
-    let mut endpoint = Endpoint::server(server_config, local).map_err(TransportError::Io)?;
-
-    // Client side: accept any server cert (peer identity is WireGuard's job).
-    let client_crypto = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SkipServerVerification::new()))
-        .with_no_client_auth();
-    let client_config = ClientConfig::new(Arc::new(
-        QuicClientConfig::try_from(client_crypto)
-            .map_err(|e| setup(format!("quic client: {e}")))?,
-    ));
-    endpoint.set_default_client_config(client_config);
-
-    Ok(endpoint)
+    Endpoint::server(server_config, local).map_err(TransportError::Io)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A mesh node on loopback with the stable identity for key `k`.
+    async fn node(k: u8) -> QuicMeshTransport {
+        let id = TlsIdentity::from_wireguard_key(&[k; 32]).unwrap();
+        QuicMeshTransport::bind("127.0.0.1:0".parse().unwrap(), &id)
+            .await
+            .unwrap()
+    }
+
+    /// SEC-004 AC: dialing a peer whose cert doesn't match its pin fails, so
+    /// nothing is sent to an interceptor; the right pin then works.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quic_mesh_refuses_a_peer_with_the_wrong_pin() {
+        let a = node(3).await;
+        let b = node(4).await;
+        let addr_b = b.local_addr();
+        let impostor = TlsIdentity::from_wireguard_key(&[5; 32]).unwrap();
+
+        a.set_peer_pins(&[(addr_b, vec![impostor.fingerprint()])]);
+        // Refused, but as a dropped datagram — not an error that would take
+        // the whole mesh session down (review fix).
+        a.send_to(addr_b, b"x").await.unwrap();
+        let mut buf = [0u8; 16];
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), b.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "nothing may reach a peer that failed its pin"
+        );
+        // While backing off, a send doesn't even re-dial.
+        let t0 = std::time::Instant::now();
+        a.send_to(addr_b, b"y").await.unwrap();
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(100),
+            "re-dialed during backoff"
+        );
+
+        // With the right pin (which also clears the backoff), the same dial
+        // succeeds and B receives.
+        a.set_peer_pins(&[(addr_b, vec![b.fingerprint()])]);
+        a.send_to(addr_b, b"hello").await.unwrap();
+        let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(5), b.recv_from(&mut buf))
+            .await
+            .expect("B did not receive after a correctly pinned dial")
+            .unwrap();
+        assert_eq!(&buf[..n], b"hello");
+    }
+
+    #[test]
+    fn dial_backoff_doubles_caps_and_resets() {
+        let dst: SocketAddr = "192.0.2.1:1".parse().unwrap();
+        let t0 = Instant::now();
+        let mut b = DialBackoff::default();
+        assert!(!b.is_waiting(dst, t0));
+        assert_eq!(b.note_failure(dst, t0), DIAL_BACKOFF_MIN);
+        assert!(b.is_waiting(dst, t0));
+        assert!(!b.is_waiting(dst, t0 + DIAL_BACKOFF_MIN));
+        assert_eq!(b.note_failure(dst, t0), DIAL_BACKOFF_MIN * 2);
+        for _ in 0..10 {
+            b.note_failure(dst, t0);
+        }
+        assert_eq!(b.note_failure(dst, t0), DIAL_BACKOFF_MAX);
+        b.note_success(dst);
+        assert!(!b.is_waiting(dst, t0));
+    }
+
+    /// No pin for a peer: still dialed (with the unauthenticated warning).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quic_mesh_dials_unpinned_peers_with_a_warning() {
+        let a = node(6).await;
+        let b = node(7).await;
+        a.send_to(b.local_addr(), b"unpinned").await.unwrap();
+        let mut buf = [0u8; 16];
+        let (n, _) = b.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"unpinned");
+    }
+
     /// Two QUIC mesh endpoints exchange a datagram both ways, with each side
     /// identified by its advertised address (proves the hello attribution).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn quic_mesh_roundtrip_both_directions() {
-        let a = QuicMeshTransport::bind("127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
-        let b = QuicMeshTransport::bind("127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
+        let a = node(1).await;
+        let b = node(2).await;
         let (addr_a, addr_b) = (a.local_addr(), b.local_addr());
+        // Each side pins the other's stable cert.
+        a.set_peer_pins(&[(addr_b, vec![b.fingerprint()])]);
+        b.set_peer_pins(&[(addr_a, vec![a.fingerprint()])]);
 
         // A -> B.
         a.send_to(addr_b, b"from-a").await.unwrap();

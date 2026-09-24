@@ -43,6 +43,11 @@ pub mod relay_xdp;
 pub use relay_xdp::{RelayXdpError, RelayXdpLoader};
 
 #[cfg(feature = "quic")]
+pub mod tls;
+#[cfg(feature = "quic")]
+pub use tls::{Fingerprint, TlsIdentity};
+
+#[cfg(feature = "quic")]
 pub mod quic;
 #[cfg(feature = "quic")]
 pub use quic::QuicTransport;

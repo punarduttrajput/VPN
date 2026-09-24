@@ -81,6 +81,34 @@ QUIC requires building with the feature: `cargo build --features ferrum-cli/quic
 See [config.quic.example.toml](config.quic.example.toml). Omitting `[transport]`
 keeps plain UDP (Phase 1 behavior).
 
+**Certificate pinning (SEC-004):** QUIC and MASQUE run inside TLS, and the
+client checks the server's certificate against `cert_pins` in `[transport]`.
+A pin is the SHA-256 of the certificate's **public key**, so it survives the
+certificate being re-issued. A Ferrum node's key is derived from its WireGuard
+private key, so its pin stays the same across restarts: print it on the server
+with `ferrum tls-fingerprint --config <server config>` and put it in the
+client's `cert_pins`. For a third-party MASQUE proxy, compute it with
+`openssl x509 -in cert.pem -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256`.
+
+What a pin protects, and what it doesn't:
+
+- **Your traffic's contents never depend on it.** Everything inside the tunnel
+  is WireGuard-encrypted and only the real peer can read it, pinned or not.
+- **With a pin**, someone on the network path (a hostile Wi-Fi, ISP or
+  middlebox) can't pose as the QUIC server or MASQUE proxy. If they try, the
+  connection fails instead of being quietly intercepted. They can still see that
+  you're talking to that address, how much, and when, and they can still block
+  it.
+- **Without a pin**, that same attacker could sit in the middle of the outer
+  QUIC/HTTP-3 layer. They could watch its timing and sizes more closely, probe
+  it to confirm it's a VPN, or tamper with it. Ferrum still connects in this case
+  (so existing setups keep working) but logs an "outer transport
+  UNAUTHENTICATED" warning every time it connects.
+
+The coordinator-managed QUIC mesh (`up-mesh`) dials each peer with the peer's
+pin once the coordinator distributes pins (the second SEC-004 PR). Until then,
+mesh peers are dialed with the warning.
+
 **Padding (obfuscation, FR5):** add `padding = true` (optionally `pad_to = 1280`)
 to `[transport]` to normalize datagram sizes against fingerprinting. Both peers
 must set the same values; works with either UDP or QUIC.
