@@ -22,15 +22,21 @@ removes the trust boundary the daemon exists to enforce.
 
 ## Acceptance criteria
 
-- [ ] The daemon verifies the connecting peer via `SO_PEERCRED`
+- [x] The daemon verifies the connecting peer via `SO_PEERCRED`
       (uid/gid/pid) and rejects callers outside an allow-list.
-- [ ] **Fail closed:** if the configured group does not exist, the daemon
+      *(root, `--group` members, `--allow-uid`; see `AccessPolicy`.)*
+- [x] **Fail closed:** if the configured group does not exist, the daemon
       refuses to start (or binds owner-only 0600) — the 0666 fallback is
-      removed.
-- [ ] Per-connection request quota to bound abuse of a compromised allowed
-      caller.
-- [ ] Test: a disallowed uid/gid connection is refused; the missing-group case
+      removed. *(Refuses to start; `chown`/`chmod` failure is fatal too.)*
+- [x] Per-connection request quota to bound abuse of a compromised allowed
+      caller. *(One request per connection + per-uid token bucket, in-flight
+      cap, I/O timeouts, 64 KiB request cap.)*
+- [x] Test: a disallowed uid/gid connection is refused; the missing-group case
       does not produce a 0666 socket.
+
+**Follow-up (not in this ticket's Linux scope):** the Windows named-pipe
+service still uses the default pipe security descriptor with no client
+identity check — see STATUS.md 2026-09-28.
 
 ## Implementation notes
 
