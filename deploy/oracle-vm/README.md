@@ -189,6 +189,11 @@ see the main `README.md`), rotate the signing key, and consider not keeping
 `secrets/signing-key.pem` on the VM at all (mint tokens from your own machine,
 copy only `jwks.json` over).
 
+If clients use the QUIC or MASQUE transports, their outer TLS layer is pinned
+(SEC-004). Roll those keys with the advertise-next → roll → drop-old runbook in
+[`../transport-cert-rotation.md`](../transport-cert-rotation.md), so no pinned
+client ever sees an unlisted key.
+
 ## Also want metrics/dashboards?
 
 `../observability/docker-compose.yml` already expects the coordinator/relay

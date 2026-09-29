@@ -17,7 +17,7 @@ use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
 use crate::metrics::Metrics;
-use crate::registry::{normalize_tls_pin, Registry, RegistryError};
+use crate::registry::{Registry, RegistryError, TlsPins};
 
 /// How often a relay should heartbeat, directed to it in every
 /// [`RelayHeartbeatResponse`] (PRD `phase-6-anycast-autoscaling.md` FR3).
@@ -128,6 +128,7 @@ fn current_map(
             allowed_ips: vec![format!("{}/32", d.tunnel_ip)],
             candidates: d.candidates,
             tls_cert_sha256: d.tls_cert_sha256,
+            tls_next_pins: d.tls_next_pins,
         })
         .collect();
     NetworkMapResponse {
@@ -404,11 +405,11 @@ impl Coordinator for CoordinatorService {
             Some(c) => &c.tags,
             None => &req.tags,
         };
-        // SEC-004: the device's TLS cert pin, distributed to peers that dial it
-        // over QUIC. Bound to this (authenticated, SEC-002) registration.
-        let tls_pin = normalize_tls_pin(&req.tls_cert_sha256).ok_or_else(|| {
-            Status::invalid_argument("tls_cert_sha256 must be 64 hex digits or empty")
-        })?;
+        // SEC-004: the device's TLS cert pin, plus (SEC-007) any next pins it
+        // pre-announces for a rotation, distributed to peers that dial it over
+        // QUIC. Bound to this (authenticated, SEC-002) registration.
+        let tls_pins = TlsPins::normalize(&req.tls_cert_sha256, &req.tls_next_pins)
+            .map_err(Status::invalid_argument)?;
         let ip = {
             let mut reg = self.registry.lock().expect("registry mutex poisoned");
             // SEC-002: an authenticated caller (OIDC token or mTLS client cert)
@@ -417,13 +418,13 @@ impl Coordinator for CoordinatorService {
                 reg.bind_identity(identity, &req.public_key)
                     .map_err(|e| Status::failed_precondition(e.to_string()))?;
             }
-            // One store write carries the device and its pin.
-            reg.register_with_pin(
+            // One store write carries the device and its pins.
+            reg.register_with_pins(
                 &req.public_key,
                 &req.name,
                 &req.endpoint,
                 tags,
-                Some(&tls_pin),
+                Some(&tls_pins),
             )
             .map_err(|e| Status::invalid_argument(e.to_string()))?
         };
@@ -582,10 +583,9 @@ impl Coordinator for CoordinatorService {
         self.metrics.inc_rotate_key();
         let req = request.into_inner();
         // The device's TLS cert is derived from its WireGuard key, so a rotation
-        // carries the new pin (or clears it) — never keep the stale one.
-        let tls_pin = normalize_tls_pin(&req.new_tls_cert_sha256).ok_or_else(|| {
-            Status::invalid_argument("new_tls_cert_sha256 must be 64 hex digits or empty")
-        })?;
+        // carries the new pin set (or clears it) — never keep the stale one.
+        let tls_pins = TlsPins::normalize(&req.new_tls_cert_sha256, &req.new_tls_next_pins)
+            .map_err(Status::invalid_argument)?;
         let ip = {
             let mut reg = self.registry.lock().expect("registry mutex poisoned");
             // SEC-002: the authorized rotation path — an authenticated caller
@@ -604,7 +604,7 @@ impl Coordinator for CoordinatorService {
                     }
                     other => Status::internal(other.to_string()),
                 })?;
-            reg.set_tls_pin(&req.new_public_key, &tls_pin)
+            reg.set_tls_pins(&req.new_public_key, &tls_pins)
                 .map_err(|e| Status::internal(e.to_string()))?;
             ip
         };
@@ -860,6 +860,7 @@ mod tests {
                 old_public_key: "A".into(),
                 new_public_key: "A2".into(),
                 new_tls_cert_sha256: "ef".repeat(32),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1222,6 +1223,113 @@ mod tests {
             .tags
             .clone();
         assert_eq!(tags, vec!["dev".to_string()]);
+    }
+
+    /// SEC-007: pre-announced next pins reach peers alongside the current pin
+    /// (normalized, deduplicated), bad ones are refused, a registration
+    /// replaces them, and the rotation that completes the roll promotes the
+    /// next pin to current and clears the announcement.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn next_tls_pins_are_distributed_and_completed_by_rotation() {
+        let registry = Arc::new(Mutex::new(Registry::new(Ipv4Addr::new(10, 8, 0, 0), 24)));
+        let svc = CoordinatorService::new(registry);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(CoordinatorServer::new(svc))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let mut client = CoordinatorClient::connect(format!("http://{addr}"))
+            .await
+            .unwrap();
+
+        let (p1, p2) = ("11".repeat(32), "22".repeat(32));
+        let register = |pk: &str, current: &str, next: Vec<String>| RegisterDeviceRequest {
+            public_key: pk.into(),
+            name: pk.into(),
+            endpoint: "1.1.1.1:51820".into(),
+            tls_cert_sha256: current.into(),
+            tls_next_pins: next,
+            ..Default::default()
+        };
+        async fn pins_of(
+            client: &mut CoordinatorClient<tonic::transport::Channel>,
+            pk: &str,
+        ) -> (String, Vec<String>) {
+            let map = client
+                .get_network_map(NetworkMapRequest {
+                    public_key: "B".into(),
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            let p = map
+                .peers
+                .into_iter()
+                .find(|p| p.public_key == pk)
+                .expect("peer in map");
+            (p.tls_cert_sha256, p.tls_next_pins)
+        }
+
+        client
+            .register_device(register("B", "", vec![]))
+            .await
+            .unwrap();
+        // The openssl form is normalized; a duplicate and a copy of the
+        // current pin are dropped.
+        let p2_openssl = vec!["22"; 32].join(":");
+        client
+            .register_device(register("A", &p1, vec![p2_openssl, p2.clone(), p1.clone()]))
+            .await
+            .unwrap();
+        assert_eq!(
+            pins_of(&mut client, "A").await,
+            (p1.clone(), vec![p2.clone()])
+        );
+
+        for bad in [
+            vec!["not-a-pin".to_string()],
+            vec![String::new()],
+            (1..=5).map(|i| format!("{i:02}").repeat(32)).collect(),
+        ] {
+            let err = client
+                .register_device(register("A", &p1, bad.clone()))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{bad:?}");
+        }
+        assert_eq!(
+            pins_of(&mut client, "A").await,
+            (p1.clone(), vec![p2.clone()]),
+            "a refused registration changes nothing"
+        );
+
+        // Registration replaces the whole set, so an old client that
+        // re-registers without next pins withdraws them.
+        client
+            .register_device(register("A", &p1, vec![]))
+            .await
+            .unwrap();
+        assert_eq!(pins_of(&mut client, "A").await, (p1.clone(), vec![]));
+
+        // Announce, then complete the roll: the next pin becomes current.
+        client
+            .register_device(register("A", &p1, vec![p2.clone()]))
+            .await
+            .unwrap();
+        client
+            .rotate_key(RotateKeyRequest {
+                old_public_key: "A".into(),
+                new_public_key: "A2".into(),
+                new_tls_cert_sha256: p2.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(pins_of(&mut client, "A2").await, (p2, vec![]));
     }
 
     /// SEC-002: a verified token cannot register a second/unbound public key —

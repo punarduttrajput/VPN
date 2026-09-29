@@ -28,7 +28,7 @@ pub mod admin;
 
 pub use metrics::Metrics;
 pub use policy::{AclRule, Policy};
-pub use registry::{Device, Registry, RegistryError};
+pub use registry::{Device, Registry, RegistryError, TlsPins};
 pub use service::{CoordinatorService, VerifiedClaims};
 pub use store::{MemoryStore, Store, StoreError};
 
