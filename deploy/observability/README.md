@@ -71,6 +71,9 @@ and gauges only — see the module docs in `crates/coordinator/src/metrics.rs` a
 - `ferrum_register_total`, `ferrum_network_map_requests_total`,
   `ferrum_rotate_key_total`, `ferrum_publish_candidates_total`,
   `ferrum_unauthenticated_total`
+- `ferrum_register_throttled_total`, `ferrum_relay_heartbeat_throttled_total`,
+  `ferrum_watch_streams_rejected_total`: rate-limit / stream-quota refusals
+  (SEC-006; aggregate only)
 - `ferrum_relay_clients_registered`, `ferrum_relay_frames_forwarded_total`,
   `ferrum_relay_bytes_forwarded_total`, `ferrum_relay_frames_dropped_total`
 
