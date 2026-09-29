@@ -18,12 +18,14 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use ferrum_core::config::Cidr;
 use ferrum_transport::{Transport, BATCH_SIZE};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use crate::device::TunDevice;
+use crate::mesh::accept_inbound_source;
 use crate::session::{Action, Session, MAX_PACKET};
 use crate::Result;
 
@@ -35,11 +37,20 @@ const CHANNEL_CAP: usize = 1024;
 
 /// Run the pipelined tunnel data plane until `shutdown` resolves.
 ///
-/// * `session`   — the WireGuard session (constructed from config keys)
-/// * `device`    — the TUN device (real on Unix, mock in tests)
-/// * `transport` — the network transport to the peer (UDP, QUIC, …)
-/// * `shutdown`  — completes to request graceful shutdown (FR1 teardown)
-pub async fn run<D, T, S>(session: Session, device: D, transport: T, shutdown: S) -> Result<()>
+/// * `session`     — the WireGuard session (constructed from config keys)
+/// * `allowed_ips` — the source addresses the peer may send from (its
+///   `peer.allowed_ips`). A decrypted packet from anywhere else is dropped
+///   (WireGuard's inbound crypto-routing rule, SEC-011).
+/// * `device`      — the TUN device (real on Unix, mock in tests)
+/// * `transport`   — the network transport to the peer (UDP, QUIC, …)
+/// * `shutdown`    — completes to request graceful shutdown (FR1 teardown)
+pub async fn run<D, T, S>(
+    session: Session,
+    allowed_ips: Vec<Cidr>,
+    device: D,
+    transport: T,
+    shutdown: S,
+) -> Result<()>
 where
     D: TunDevice + Send + 'static,
     T: Transport + Send + Sync + 'static,
@@ -179,7 +190,13 @@ where
                     maybe = in_net.recv() => {
                         let Some(datagram) = maybe else { break };
                         match session.decapsulate(&datagram, &mut out) {
-                            Ok(Action::WriteToTun(pkt, _ip)) => { let _ = out_tun.send(pkt.to_vec()).await; }
+                            Ok(Action::WriteToTun(pkt, src)) => {
+                                if accept_inbound_source(&allowed_ips, src) {
+                                    let _ = out_tun.send(pkt.to_vec()).await;
+                                } else {
+                                    debug!("dropped decrypted packet whose source is outside the peer's allowed_ips");
+                                }
+                            }
                             Ok(Action::SendToPeer(pkt)) => { let _ = out_net.send(pkt.to_vec()).await; }
                             Ok(Action::Done) => {}
                             Err(e) => debug!("decapsulate error (dropped packet): {e}"),

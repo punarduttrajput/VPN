@@ -590,6 +590,15 @@ async fn up(config_path: &str, iface: &str, mtu: u16) -> Result<()> {
 
     let session = Session::from_base64(&config.private_key, &config.peer.public_key)
         .context("building wireguard session")?;
+    // The addresses the peer may send from: inbound packets from anywhere else
+    // are dropped (WireGuard crypto-routing, SEC-011).
+    let peer_allowed: Vec<Cidr> = config
+        .peer
+        .allowed_ips
+        .iter()
+        .map(|c| c.parse())
+        .collect::<std::result::Result<_, _>>()
+        .context("parsing peer.allowed_ips")?;
 
     // QUIC and MASQUE (HTTP/3 over QUIC) both need a reduced MTU; shrink the
     // inner MTU so encrypted packets fit inside a QUIC datagram.
@@ -633,7 +642,16 @@ async fn up(config_path: &str, iface: &str, mtu: u16) -> Result<()> {
                 .await
                 .with_context(|| format!("binding UDP socket on {bind_addr}"))?;
             info!("transport: udp");
-            drive(session, dev, transport, pad_to, jitter_ms, shutdown).await?;
+            drive(
+                session,
+                peer_allowed,
+                dev,
+                transport,
+                pad_to,
+                jitter_ms,
+                shutdown,
+            )
+            .await?;
         }
         TransportMode::Quic => {
             #[cfg(feature = "quic")]
@@ -659,7 +677,16 @@ async fn up(config_path: &str, iface: &str, mtu: u16) -> Result<()> {
                         let transport = QuicTransport::accept(ep)
                             .await
                             .context("accepting quic connection")?;
-                        drive(session, dev, transport, pad_to, jitter_ms, shutdown).await?;
+                        drive(
+                            session,
+                            peer_allowed,
+                            dev,
+                            transport,
+                            pad_to,
+                            jitter_ms,
+                            shutdown,
+                        )
+                        .await?;
                     }
                     Some(TransportRole::Client) => {
                         info!("transport: quic (client), connecting to {peer}");
@@ -671,7 +698,16 @@ async fn up(config_path: &str, iface: &str, mtu: u16) -> Result<()> {
                         )
                         .await
                         .context("connecting quic transport")?;
-                        drive(session, dev, transport, pad_to, jitter_ms, shutdown).await?;
+                        drive(
+                            session,
+                            peer_allowed,
+                            dev,
+                            transport,
+                            pad_to,
+                            jitter_ms,
+                            shutdown,
+                        )
+                        .await?;
                     }
                     None => anyhow::bail!("transport.role (client|server) required for quic"),
                 }
@@ -711,7 +747,16 @@ async fn up(config_path: &str, iface: &str, mtu: u16) -> Result<()> {
                     MasqueTransport::connect(bind_addr, proxy_addr, &authority, peer, pins)
                         .await
                         .context("connecting to masque proxy")?;
-                drive(session, dev, transport, pad_to, jitter_ms, shutdown).await?;
+                drive(
+                    session,
+                    peer_allowed,
+                    dev,
+                    transport,
+                    pad_to,
+                    jitter_ms,
+                    shutdown,
+                )
+                .await?;
             }
             #[cfg(not(feature = "masque"))]
             {
@@ -1076,6 +1121,7 @@ const DEFAULT_PAD_TO: u16 = 1280;
 /// Run the tunnel, optionally wrapping the transport in padding and/or jitter.
 async fn drive<D, T>(
     session: Session,
+    peer_allowed: Vec<Cidr>,
     device: D,
     transport: T,
     pad_to: Option<u16>,
@@ -1092,6 +1138,7 @@ where
     match (pad_to, jitter_ms) {
         (Some(p), Some(ms)) => ferrum_tunnel::run(
             session,
+            peer_allowed,
             device,
             JitteredTransport::new(
                 ferrum_transport::PaddedTransport::new(transport, p as usize),
@@ -1103,6 +1150,7 @@ where
         .context("tunnel event loop")?,
         (Some(p), None) => ferrum_tunnel::run(
             session,
+            peer_allowed,
             device,
             ferrum_transport::PaddedTransport::new(transport, p as usize),
             shutdown,
@@ -1111,13 +1159,14 @@ where
         .context("tunnel event loop")?,
         (None, Some(ms)) => ferrum_tunnel::run(
             session,
+            peer_allowed,
             device,
             JitteredTransport::new(transport, ms),
             shutdown,
         )
         .await
         .context("tunnel event loop")?,
-        (None, None) => ferrum_tunnel::run(session, device, transport, shutdown)
+        (None, None) => ferrum_tunnel::run(session, peer_allowed, device, transport, shutdown)
             .await
             .context("tunnel event loop")?,
     }
