@@ -15,7 +15,9 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::io;
 use std::net::IpAddr;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
+#[cfg(test)]
 use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::sync::{Arc, Mutex};
@@ -200,8 +202,47 @@ fn handle_connection(
         let resp = HelperResponse::Err("rate limited; retry shortly".to_string());
         return send_response(&stream, &resp, None);
     }
+    if let Err(reason) = validate_request(&req) {
+        warn!(
+            uid = peer.uid,
+            "refusing malformed helper request: {reason}"
+        );
+        return send_response(&stream, &HelperResponse::Err(reason), None);
+    }
     let (resp, fd) = dispatch(req);
-    send_response(&stream, &resp, fd)
+    // Send a duplicate of the TUN fd (if any); our copy is closed when `fd`
+    // drops at the end of this function, on success and failure alike, so
+    // the daemon never accumulates descriptors (SEC-012).
+    send_response(&stream, &resp, fd.as_ref().map(AsRawFd::as_raw_fd))
+}
+
+/// Lowest / highest TUN MTU the helper will configure. 576 is the IPv4
+/// minimum datagram size; 9000 covers jumbo frames. Anything outside is a
+/// malformed (or hostile) request, not a real tunnel.
+const MIN_TUN_MTU: u16 = 576;
+const MAX_TUN_MTU: u16 = 9000;
+
+/// Reject a request whose fields aren't safe to act on as root (SEC-012):
+/// interface names are checked against [`ferrum_tunnel::ifname::validate`]
+/// (they end up in nft scripts and `resolvectl` arguments) and the TUN MTU is
+/// range-checked. IP addresses are parsed later by the handlers themselves.
+fn validate_request(req: &HelperRequest) -> Result<(), String> {
+    let iface = match req {
+        HelperRequest::OpenTun { name, mtu, .. } => {
+            if !(MIN_TUN_MTU..=MAX_TUN_MTU).contains(mtu) {
+                return Err(format!(
+                    "invalid MTU {mtu}: expected {MIN_TUN_MTU}-{MAX_TUN_MTU}"
+                ));
+            }
+            name
+        }
+        HelperRequest::KillSwitchEngage { iface, .. }
+        | HelperRequest::SetDns { iface, .. }
+        | HelperRequest::RestoreDns { iface }
+        | HelperRequest::LeakGuardEngage { iface, .. } => iface,
+        HelperRequest::KillSwitchDisengage | HelperRequest::LeakGuardDisengage => return Ok(()),
+    };
+    ferrum_tunnel::ifname::validate(iface).map_err(|e| e.to_string())
 }
 
 /// Per-uid token buckets ([`RATE_BURST`] / [`RATE_REFILL_PER_SEC`]). Only
@@ -237,7 +278,7 @@ impl RateLimiter {
 
 /// Handle one request, returning the response and (for a successful
 /// `OpenTun`) the fd to send alongside it.
-fn dispatch(req: HelperRequest) -> (HelperResponse, Option<RawFd>) {
+fn dispatch(req: HelperRequest) -> (HelperResponse, Option<OwnedFd>) {
     match req {
         HelperRequest::OpenTun { name, address, mtu } => open_tun(&name, &address, mtu),
         HelperRequest::KillSwitchEngage { iface, allow_ips } => {
@@ -290,7 +331,7 @@ fn parse_ips(ips: &[String]) -> Result<Vec<IpAddr>, HelperResponse> {
         .map_err(|e| HelperResponse::Err(format!("invalid IP address: {e}")))
 }
 
-fn set_dns(iface: &str, servers: &[String]) -> (HelperResponse, Option<RawFd>) {
+fn set_dns(iface: &str, servers: &[String]) -> (HelperResponse, Option<OwnedFd>) {
     let ips = match parse_ips(servers) {
         Ok(ips) => ips,
         Err(resp) => return (resp, None),
@@ -311,7 +352,7 @@ fn leak_guard_engage(
     iface: &str,
     dns_servers: &[String],
     block_ipv6: bool,
-) -> (HelperResponse, Option<RawFd>) {
+) -> (HelperResponse, Option<OwnedFd>) {
     let ips = match parse_ips(dns_servers) {
         Ok(ips) => ips,
         Err(resp) => return (resp, None),
@@ -328,7 +369,7 @@ fn leak_guard_engage(
     }
 }
 
-fn open_tun(name: &str, address: &str, mtu: u16) -> (HelperResponse, Option<RawFd>) {
+fn open_tun(name: &str, address: &str, mtu: u16) -> (HelperResponse, Option<OwnedFd>) {
     let cidr: Cidr = match address.parse() {
         Ok(c) => c,
         Err(e) => {
@@ -355,7 +396,7 @@ fn open_tun(name: &str, address: &str, mtu: u16) -> (HelperResponse, Option<RawF
     }
 }
 
-fn kill_switch_engage(iface: &str, allow_ips: &[String]) -> (HelperResponse, Option<RawFd>) {
+fn kill_switch_engage(iface: &str, allow_ips: &[String]) -> (HelperResponse, Option<OwnedFd>) {
     let ips: Result<Vec<IpAddr>, _> = allow_ips.iter().map(|s| s.parse()).collect();
     let ips = match ips {
         Ok(ips) => ips,
@@ -790,6 +831,109 @@ mod tests {
         assert!(fd.is_none());
         assert!(matches!(resp, HelperResponse::Err(msg) if msg.contains("invalid IP")));
 
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// SEC-012: hostile interface names and out-of-range MTUs are refused at
+    /// the boundary with a clean error, before any privileged call (so the
+    /// response never mentions nft or a TUN failure).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn malformed_requests_are_refused_before_any_privileged_call() {
+        let socket_path = spawn_server("malformed", allow_self()).await;
+        let inject = "x\" accept; flush ruleset".to_string();
+        let open_tun = |name: &str, mtu| HelperRequest::OpenTun {
+            name: name.to_string(),
+            address: "10.99.0.1/24".to_string(),
+            mtu,
+        };
+        let cases = [
+            HelperRequest::KillSwitchEngage {
+                iface: inject.clone(),
+                allow_ips: vec![],
+            },
+            HelperRequest::LeakGuardEngage {
+                iface: "ferrum0\nflush ruleset".to_string(),
+                dns_servers: vec![],
+                block_ipv6: true,
+            },
+            HelperRequest::SetDns {
+                iface: "--help".to_string(),
+                servers: vec!["10.99.0.53".to_string()],
+            },
+            HelperRequest::RestoreDns {
+                iface: "a".repeat(16),
+            },
+            open_tun(&inject, 1420),
+            open_tun("ferrum0", 0),
+            open_tun("ferrum0", 65_000),
+        ];
+        for req in &cases {
+            let (resp, fd) = round_trip(&socket_path, req).await;
+            assert!(fd.is_none());
+            match resp {
+                HelperResponse::Err(msg) => assert!(
+                    msg.starts_with("invalid interface name") || msg.starts_with("invalid MTU"),
+                    "{req:?} -> {msg}"
+                ),
+                other => panic!("{req:?} must be refused, got {other:?}"),
+            }
+        }
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[test]
+    fn well_formed_requests_pass_validation() {
+        let ok = [
+            HelperRequest::OpenTun {
+                name: "ferrum0".into(),
+                address: "10.8.0.2/32".into(),
+                mtu: 1420,
+            },
+            HelperRequest::KillSwitchEngage {
+                iface: "ferrum0".into(),
+                allow_ips: vec!["203.0.113.7".into()],
+            },
+            HelperRequest::KillSwitchDisengage,
+            HelperRequest::LeakGuardDisengage,
+        ];
+        for req in &ok {
+            validate_request(req).unwrap_or_else(|e| panic!("{req:?}: {e}"));
+        }
+    }
+
+    /// SEC-012: a successful `OpenTun` must not leave the daemon holding the
+    /// TUN fd it handed out. Needs root to actually create a TUN, so it's
+    /// skipped elsewhere (CI runs unprivileged); run it with `sudo -E cargo test`.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn open_tun_does_not_leak_the_daemons_fd() {
+        use std::os::fd::FromRawFd;
+
+        // SAFETY: `geteuid` has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping: needs root to create a TUN device");
+            return;
+        }
+        let open_fds = || std::fs::read_dir("/proc/self/fd").unwrap().count();
+        let socket_path = spawn_server("fdleak", allow_self()).await;
+        let req = HelperRequest::OpenTun {
+            name: "ferrumleak0".to_string(),
+            address: "10.99.7.1/24".to_string(),
+            mtu: 1420,
+        };
+        // Warm up (runtime threads, the first connection) before measuring.
+        let (_, fd) = round_trip(&socket_path, &req).await;
+        // SAFETY: as below — a freshly received fd owned by nothing else.
+        drop(fd.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }));
+        let before = open_fds();
+        for _ in 0..5 {
+            let (resp, fd) = round_trip(&socket_path, &req).await;
+            assert!(matches!(resp, HelperResponse::TunOpened), "{resp:?}");
+            // Close the client's copy; only the daemon's copy could remain.
+            // SAFETY: the fd was just received and is owned by nothing else.
+            drop(fd.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }));
+        }
+        assert_eq!(open_fds(), before, "the daemon kept TUN fds open");
         let _ = std::fs::remove_file(&socket_path);
     }
 
