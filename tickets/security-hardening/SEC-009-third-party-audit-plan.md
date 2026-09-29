@@ -25,13 +25,20 @@ specific code bug.
 
 ## Acceptance criteria
 
-- [ ] An inventory of every hand-rolled security primitive with its risk and a
+- [x] An inventory of every hand-rolled security primitive with its risk and a
       disposition: (a) replace with a vetted crate, (b) schedule for external
       review, or (c) accept-with-rationale.
-- [ ] A written plan (owners + target dates + budget ask) to commission a
+      *([docs/security/audit-plan.md](../../docs/security/audit-plan.md) §2:
+      20 primitives, P1–P20.)*
+- [x] A written plan (owners + target dates + budget ask) to commission a
       third-party audit of the crypto/transport/control-plane core.
-- [ ] Where a vetted replacement exists and cargo is online (see CLAUDE.md env
+      *(§4. Owners, dates and budget are **proposals** for the project owner to
+      confirm; vendor and budget are business decisions per PRD §7.)*
+- [x] Where a vetted replacement exists and cargo is online (see CLAUDE.md env
       note), a follow-up ticket to adopt it (e.g. `jsonwebtoken` for OIDC).
+      *(SEC-014 `jsonwebtoken`; SEC-016 `rustix`/`nix`, `quinn-udp`, `subtle`,
+      and a shared SPKI parser. The inventory also found confirmed defects,
+      filed as SEC-011 to SEC-013, SEC-015, SEC-017 and SEC-018.)*
 
 ## Implementation notes
 
