@@ -3,6 +3,9 @@
 * text=auto
 # Vendored native libraries (e.g. wintun.dll) are binary — never EOL-normalize.
 *.dll binary
+*.jar binary
+# Pinned digests for the above (SEC-008): `sha256sum -c` needs LF paths.
+vendor/SHA256SUMS text eol=lf
 *.sh text eol=lf
 *.rs text
 *.toml text

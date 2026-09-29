@@ -21,6 +21,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2.6.3", features = [] }
+# build.rs verifies the vendored wintun.dll against vendor/SHA256SUMS (SEC-008).
+sha2 = "0.10"
 
 [dependencies]
 serde_json = "1.0"
