@@ -80,6 +80,10 @@ resolves at compile time, so `cargo build --features admin-api` fails if
 `dist/admin-panel/browser/` doesn't exist yet.
 
 Run the result with `--admin-listen <ip:port>` plus the three `--oidc-*`
-flags (the admin API has no other auth mode) and open `http://<ip:port>/` —
+flags (the admin API has no other auth mode) and open `http://<ip:port>/`.
+The pasted token must be for the admin API's own audience (`--admin-audience`,
+default `<--oidc-audience>-admin`) and carry `admin` in its `tags` claim, so a
+device token never works here (SEC-014). The coordinator serves the built app
+directly —
 the coordinator serves the built app directly, including a SPA fallback to
 `index.html` for a hard refresh on `/dashboard`, `/devices`, or `/policy`.

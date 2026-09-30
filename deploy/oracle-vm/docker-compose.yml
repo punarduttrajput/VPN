@@ -38,6 +38,8 @@ services:
       - ${OIDC_ISSUER}
       - --oidc-audience
       - ${OIDC_AUDIENCE}
+      - --admin-audience
+      - ${OIDC_ADMIN_AUDIENCE:-ferrum-panel}
       - --oidc-jwks
       - /secrets/jwks.json
       - --relay

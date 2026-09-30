@@ -76,8 +76,10 @@ Edit `.env`:
 - `DOMAIN` — your domain for the admin panel, if you have one pointed at this
   VM's IP (A record). Leave blank to reach the panel over the raw IP instead
   (Caddy self-signs; one browser warning to click through).
-- `OIDC_ISSUER` / `OIDC_AUDIENCE` — the defaults are fine to leave as-is; see
-  the note in `.env.example` about what these actually mean here.
+- `OIDC_ISSUER` / `OIDC_AUDIENCE` / `OIDC_ADMIN_AUDIENCE` — the defaults are
+  fine to leave as-is; see the note in `.env.example` about what these
+  actually mean here. Device tokens use `OIDC_AUDIENCE`; admin-panel tokens use
+  `OIDC_ADMIN_AUDIENCE`, which must be different (SEC-014).
 
 ## 5. Generate the auth key and mint yourself an admin token
 
@@ -95,17 +97,24 @@ container) and `secrets/signing-key.pem` (**private** — never commit it, never
 share it; consider keeping it only on your own machine rather than the VM
 long-term, and just copying `jwks.json` over).
 
-Mint yourself an admin token (matches whatever you put in `.env`):
+Mint yourself an admin token for the **admin audience** (`OIDC_ADMIN_AUDIENCE`
+in `.env`). It must carry the `admin` tag in its `tags` claim:
 
 ```sh
 python3 scripts/mint-token.py mint --sub yourname --tags admin \
-  --issuer https://ferrum.internal --audience ferrum-admin --ttl 86400
+  --issuer https://ferrum.internal --audience ferrum-panel --ttl 86400
 ```
 
 Save the printed token somewhere you can paste from — the admin panel asks
 for it once per browser session (`sessionStorage`, never sent anywhere but
-this coordinator). Mint a **device** token the same way for clients that need
-one (`--tags dev`, or whatever tag your ACL policy expects).
+this coordinator). Mint a **device** token the same way but for the *device*
+audience (`--audience ferrum-admin`, i.e. `OIDC_AUDIENCE`) for clients that
+need one (`--tags dev`, or whatever tag your ACL policy expects).
+
+> **Upgrading from before SEC-014:** admin tokens minted for `ferrum-admin` no
+> longer open the panel, because that's the device audience. Re-mint them with
+> `--audience ferrum-panel`. Device tokens are unaffected. Tokens must now also
+> carry `exp` and a non-empty `sub`, which `mint-token.py` always sets.
 
 ## 5b. DNS through the tunnel (leak protection)
 
