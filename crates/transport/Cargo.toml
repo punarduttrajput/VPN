@@ -39,6 +39,9 @@ rcgen = { workspace = true, optional = true }
 # SEC-004: SHA-256 cert pins + HKDF for the stable TLS identity. Already in the
 # tree as rustls/rcgen's crypto backend (the same pin the coordinator uses).
 ring = { version = "0.17", optional = true }
+# Constant-time comparison of the relay register challenge's MACs (SEC-016;
+# already in the tree).
+subtle = "2.6"
 # Wipes the derived TLS private key from memory (already in the tree).
 zeroize = { version = "1", optional = true }
 bytes ={ workspace = true, optional = true }

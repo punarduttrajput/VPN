@@ -127,8 +127,11 @@ mod imp {
             .map_err(|e| crate::TunnelError::Io(std::io::Error::other(e.to_string())))?;
         let raw = dev.into_raw_fd();
         // SAFETY: `into_raw_fd` just released this fd from the device we
-        // exclusively owned; nothing else holds or will close it.
-        Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+        // exclusively owned; nothing else holds or will close it. (The `tun`
+        // crate offers no `Into<OwnedFd>`, so this one conversion is unsafe.)
+        #[allow(unsafe_code)]
+        let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+        Ok(owned)
     }
 
     /// Assign an IPv6 address (with its on-link prefix) and MTU to the named
@@ -319,7 +322,7 @@ pub fn open_via_helper(socket_path: &str, cfg: &TunConfig) -> Result<impl TunDev
                     "helper reported TunOpened but sent no fd",
                 ))
             })?;
-            from_fd(fd)
+            from_owned_fd(fd)
         }
         HelperResponse::Err(msg) => Err(crate::TunnelError::Io(std::io::Error::other(format!(
             "helper: {msg}"
@@ -353,55 +356,75 @@ impl TunDevice for NoopTun {
     }
 }
 
-/// Wrap a platform-provided TUN file descriptor (Phase 5).
+/// Wrap an owned, platform-provided TUN file descriptor (Phase 5).
 ///
 /// Native VPN shells (iOS `NEPacketTunnelProvider`, Android `FerrumService`) don't
 /// open `/dev/net/tun` themselves — the OS hands them an already-configured fd.
-/// [`from_fd`] adopts that fd and does readiness-based async I/O on it directly
-/// (the `tun` crate ignores a supplied fd on Linux, and no address/MTU setup is
-/// needed — the platform already did it). Takes ownership: the fd is closed on
-/// drop.
+/// This adopts that fd and does readiness-based async I/O on it directly (the
+/// `tun` crate ignores a supplied fd on Linux, and no address/MTU setup is
+/// needed — the platform already did it). The fd is closed on drop.
 #[cfg(unix)]
-pub fn from_fd(fd: std::os::unix::io::RawFd) -> Result<impl TunDevice> {
-    fd_device::FdTun::from_raw_fd(fd)
+pub fn from_owned_fd(fd: std::os::fd::OwnedFd) -> Result<impl TunDevice> {
+    fd_device::FdTun::new(fd)
+}
+
+/// [`from_owned_fd`] for a raw fd number, as it arrives across an FFI boundary.
+///
+/// # Safety
+///
+/// `fd` must be an open file descriptor that the caller **owns and hands over**:
+/// nothing else may use or close it afterwards, since the returned device closes
+/// it on drop (SEC-016: this used to be a safe function, which let any integer
+/// be adopted and later closed out from under its real owner).
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub unsafe fn from_fd(fd: std::os::unix::io::RawFd) -> Result<impl TunDevice> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    if fd < 0 {
+        return Err(crate::TunnelError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid TUN file descriptor",
+        )));
+    }
+    // SAFETY: the caller guarantees `fd` is open and owned, and transfers it.
+    from_owned_fd(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 /// Stub on non-Unix: there is no fd-based TUN.
+///
+/// # Safety
+///
+/// Nothing to uphold (the fd is ignored); `unsafe` only to match the Unix
+/// signature.
 #[cfg(not(unix))]
-pub fn from_fd(_fd: i32) -> Result<NoopTun> {
+#[allow(unsafe_code)]
+pub unsafe fn from_fd(_fd: i32) -> Result<NoopTun> {
     Err(crate::TunnelError::UnsupportedPlatform)
 }
 
 #[cfg(unix)]
 mod fd_device {
     use std::io;
-    use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+    use std::os::fd::OwnedFd;
 
     use tokio::io::unix::AsyncFd;
 
     use super::TunDevice;
     use crate::Result;
 
-    /// A [`TunDevice`] backed by a raw, OS-provided fd.
+    /// A [`TunDevice`] backed by an OS-provided fd. Its I/O goes through
+    /// `rustix`'s safe wrappers (SEC-016), so this module has no `unsafe`.
     pub struct FdTun {
         inner: AsyncFd<OwnedFd>,
     }
 
     impl FdTun {
-        /// Adopt `fd` (must be a valid, open TUN fd) and prepare it for async I/O.
-        pub fn from_raw_fd(fd: RawFd) -> Result<Self> {
-            if fd < 0 {
-                return Err(crate::TunnelError::Io(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "invalid TUN file descriptor",
-                )));
-            }
-            set_nonblocking(fd)?;
-            // SAFETY: the caller transfers ownership of a valid, open fd; the
-            // resulting `OwnedFd` closes it on drop.
-            let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        /// Adopt `fd` (an open TUN fd) and prepare it for async I/O.
+        pub fn new(fd: OwnedFd) -> Result<Self> {
+            // Non-blocking, so `AsyncFd` can drive it.
+            rustix::io::ioctl_fionbio(&fd, true).map_err(io::Error::from)?;
             Ok(Self {
-                inner: AsyncFd::new(owned)?,
+                inner: AsyncFd::new(fd)?,
             })
         }
     }
@@ -410,18 +433,9 @@ mod fd_device {
         async fn read_packet(&mut self, buf: &mut [u8]) -> Result<usize> {
             loop {
                 let mut guard = self.inner.readable().await?;
-                match guard.try_io(|fd| {
-                    // SAFETY: read up to `buf.len()` bytes into `buf` from a fd the
-                    // reactor reports readable; returns the count or -1 + errno.
-                    let n = unsafe {
-                        libc::read(fd.get_ref().as_raw_fd(), buf.as_mut_ptr().cast(), buf.len())
-                    };
-                    if n < 0 {
-                        Err(io::Error::last_os_error())
-                    } else {
-                        Ok(n as usize)
-                    }
-                }) {
+                match guard
+                    .try_io(|fd| rustix::io::read(fd.get_ref(), &mut *buf).map_err(io::Error::from))
+                {
                     Ok(result) => return result.map_err(Into::into),
                     Err(_would_block) => continue,
                 }
@@ -432,19 +446,13 @@ mod fd_device {
             loop {
                 let mut guard = self.inner.writable().await?;
                 match guard.try_io(|fd| {
-                    // SAFETY: write `packet.len()` bytes from `packet` to a fd the
-                    // reactor reports writable; returns the count or -1 + errno.
-                    let n = unsafe {
-                        libc::write(
-                            fd.get_ref().as_raw_fd(),
-                            packet.as_ptr().cast(),
-                            packet.len(),
-                        )
-                    };
-                    if n < 0 {
-                        Err(io::Error::last_os_error())
-                    } else {
+                    // A TUN write takes the whole packet or fails; a short count
+                    // isn't expected, but don't silently report success on one.
+                    let n = rustix::io::write(fd.get_ref(), packet).map_err(io::Error::from)?;
+                    if n == packet.len() {
                         Ok(())
+                    } else {
+                        Err(io::Error::new(io::ErrorKind::WriteZero, "short TUN write"))
                     }
                 }) {
                     Ok(result) => return result.map_err(Into::into),
@@ -452,19 +460,6 @@ mod fd_device {
                 }
             }
         }
-    }
-
-    /// Put `fd` into non-blocking mode so `AsyncFd` can drive it.
-    fn set_nonblocking(fd: RawFd) -> io::Result<()> {
-        // SAFETY: F_GETFL/F_SETFL on a valid fd only read/modify status flags.
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if flags < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
     }
 
     #[cfg(test)]
@@ -476,34 +471,22 @@ mod fd_device {
         /// without `/dev/net/tun` or root.
         #[tokio::test]
         async fn fd_tun_reads_and_writes_over_socketpair() {
-            let mut fds = [0 as RawFd; 2];
-            // SAFETY: socketpair fills the 2-element array with connected fds.
-            let rc =
-                unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
-            assert_eq!(rc, 0, "socketpair failed");
-            let (ours, peer) = (fds[0], fds[1]);
+            use std::io::{Read, Write};
 
-            let mut tun = FdTun::from_raw_fd(ours).unwrap();
+            let (ours, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            let mut tun = FdTun::new(OwnedFd::from(ours)).unwrap();
 
             // Peer writes a "packet"; FdTun reads it.
-            let payload = b"hello-tun";
-            // SAFETY: write `payload` to the peer fd.
-            let n = unsafe { libc::write(peer, payload.as_ptr().cast(), payload.len()) };
-            assert_eq!(n, payload.len() as isize);
+            peer.write_all(b"hello-tun").unwrap();
             let mut buf = [0u8; 64];
             let got = tun.read_packet(&mut buf).await.unwrap();
-            assert_eq!(&buf[..got], payload);
+            assert_eq!(&buf[..got], b"hello-tun");
 
             // FdTun writes a "packet"; peer reads it.
             tun.write_packet(b"from-tun").await.unwrap();
             let mut rbuf = [0u8; 64];
-            // SAFETY: read from the peer fd into `rbuf`.
-            let m = unsafe { libc::read(peer, rbuf.as_mut_ptr().cast(), rbuf.len()) };
-            assert!(m > 0);
-            assert_eq!(&rbuf[..m as usize], b"from-tun");
-
-            // SAFETY: close the peer fd (FdTun owns and closes `ours`).
-            unsafe { libc::close(peer) };
+            let m = peer.read(&mut rbuf).unwrap();
+            assert_eq!(&rbuf[..m], b"from-tun");
         }
     }
 }
