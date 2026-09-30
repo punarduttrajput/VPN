@@ -543,18 +543,22 @@ async fn masque_mesh_node_reaches_udp_peer() {
         .await
     });
 
-    tokio::time::sleep(Duration::from_millis(1200)).await; // MASQUE + WG handshake
-
     // M sends a packet to X's tunnel IP; it must traverse MASQUE -> proxy -> X.
+    // The MASQUE session, the WireGuard handshake and X's roam onto the proxy
+    // path all have to complete first, and a packet sent before then can be
+    // dropped. So rather than sleeping a fixed time and sending once (flaky
+    // on a loaded host), re-send every 500 ms until one arrives, within a
+    // generous deadline.
     let to_x = ipv4([10, 8, 0, 1]);
-    inject_m.lock().unwrap().push_back(to_x.clone());
-
     let mut x_pkt = None;
-    for _ in 0..100 {
-        x_pkt = x_pkt.or_else(|| recv_x.lock().unwrap().first().cloned());
-        if x_pkt.is_some() {
-            break;
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut next_send = std::time::Instant::now() + Duration::from_millis(300);
+    while x_pkt.is_none() && std::time::Instant::now() < deadline {
+        if std::time::Instant::now() >= next_send {
+            inject_m.lock().unwrap().push_back(to_x.clone());
+            next_send += Duration::from_millis(500);
         }
+        x_pkt = recv_x.lock().unwrap().first().cloned();
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
