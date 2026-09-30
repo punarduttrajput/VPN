@@ -1,0 +1,92 @@
+[package]
+name = "ferrum-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "cargo-fuzz targets for Ferrum's parsers of untrusted input (SEC-017)"
+
+[package.metadata]
+cargo-fuzz = true
+
+# The target bodies live in `src/lib.rs` as ordinary functions, so they can be
+# smoke-tested (`cargo test --no-default-features`) on hosts where libFuzzer
+# can't build. The `fuzz_targets/` binaries are thin libFuzzer wrappers.
+[features]
+default = ["libfuzzer"]
+libfuzzer = ["dep:libfuzzer-sys"]
+
+[dependencies]
+libfuzzer-sys = { version = "0.4", optional = true }
+ferrum-transport = { path = "../crates/transport", features = ["fuzzing", "quic", "masque"] }
+ferrum-coordinator = { path = "../crates/coordinator", features = ["oidc"] }
+
+[target.'cfg(unix)'.dependencies]
+ferrum-tunnel = { path = "../crates/tunnel", features = ["helper-ipc"] }
+
+# Standalone: not a member of the root workspace (cargo-fuzz convention).
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "stun_response"
+path = "fuzz_targets/stun_response.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "relay_challenge"
+path = "fuzz_targets/relay_challenge.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "pad_deframe"
+path = "fuzz_targets/pad_deframe.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "tls_spki"
+path = "fuzz_targets/tls_spki.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "pin_parse"
+path = "fuzz_targets/pin_parse.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "jwt_verify"
+path = "fuzz_targets/jwt_verify.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "masque_target"
+path = "fuzz_targets/masque_target.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "helper_request"
+path = "fuzz_targets/helper_request.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]

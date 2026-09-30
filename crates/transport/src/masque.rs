@@ -203,7 +203,7 @@ impl Transport for MasqueTransport {
 /// assigned addresses, not names). IPv6 colons are valid path characters and
 /// parse directly; an optional bracketed form (`[2001:db8::1]`) is also accepted
 /// for robustness against clients that bracket the literal.
-fn parse_connect_udp_target(path: &str) -> Option<SocketAddr> {
+pub(crate) fn parse_connect_udp_target(path: &str) -> Option<SocketAddr> {
     let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     // Find the "udp" marker; host and port are the next two segments.
     let i = segs.iter().position(|s| *s == "udp")?;

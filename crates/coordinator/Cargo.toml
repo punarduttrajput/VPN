@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+# Internal workspace crate, never published (lets cargo-deny accept its path
+# dependencies; SEC-017).
+publish = false
 
 [[bin]]
 name = "ferrum-coordinator"

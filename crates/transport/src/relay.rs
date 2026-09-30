@@ -123,7 +123,7 @@ fn challenge_frame(relay_pub: &[u8; 32], cookie: &[u8; COOKIE_LEN]) -> Vec<u8> {
 
 /// The response to a challenge frame, proving we hold `secret` — or `None` if
 /// `frame` isn't a well-formed challenge (or names a low-order relay key).
-fn answer_challenge(secret: &StaticSecret, frame: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn answer_challenge(secret: &StaticSecret, frame: &[u8]) -> Option<Vec<u8>> {
     if frame.len() != CHALLENGE_LEN || frame[0] != TAG_CHALLENGE {
         return None;
     }
