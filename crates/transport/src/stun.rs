@@ -20,7 +20,6 @@
 //! socket for this reason; [`reflexive_address`] is a convenience that binds one.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::net::UdpSocket;
@@ -294,27 +293,34 @@ fn parse_address(value: &[u8], txid: &TransactionId, xor: bool) -> Option<Socket
     }
 }
 
-/// Generate a transaction ID unique enough to match a response to its request.
+/// Generate a random transaction ID (RFC 5389 §6: "uniformly and randomly
+/// chosen").
 ///
-/// STUN only needs the ID to disambiguate concurrent transactions on one socket
-/// (it is not a security boundary here), so a process-wide counter mixed with
-/// the wall clock is sufficient and keeps the crate dependency-free.
+/// The ID is the only thing that ties a response to our request, so an
+/// off-path attacker who can predict it can forge the reflexive address we
+/// publish as a candidate (SEC-018: it used to be the wall clock plus a
+/// counter). From the OS CSPRNG, like the relay's cookie key.
 fn new_transaction_id() -> TransactionId {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
     let mut id = [0u8; 12];
-    id[0..8].copy_from_slice(&nanos.to_be_bytes());
-    id[8..12].copy_from_slice(&(count as u32).to_be_bytes());
+    getrandom::getrandom(&mut id).expect("OS RNG unavailable");
     id
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SEC-018: transaction ids are random, not a guessable clock/counter.
+    #[test]
+    fn transaction_ids_are_random() {
+        let ids: std::collections::HashSet<TransactionId> =
+            (0..64).map(|_| new_transaction_id()).collect();
+        assert_eq!(ids.len(), 64, "ids must not repeat");
+        // A counter-based id shares its leading clock bytes between calls made
+        // in the same instant; random ones essentially never do.
+        let (a, b) = (new_transaction_id(), new_transaction_id());
+        assert_ne!(a[..4], b[..4]);
+    }
 
     /// Build a Binding success response carrying a single XOR-MAPPED-ADDRESS for
     /// `addr`, echoing `txid` — i.e. what a STUN server would send back.

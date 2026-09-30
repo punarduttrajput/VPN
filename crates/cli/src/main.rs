@@ -515,71 +515,30 @@ async fn relay_heartbeat_loop(
     }
 }
 
-/// Serve the relay's privacy-preserving metrics (PRD Phase 6 FR4) on a tiny
-/// HTTP/1 endpoint at `GET /metrics` — enough for a Prometheus scraper,
-/// hand-rolled over a `TcpListener` so the CLI gains no HTTP-server dependency.
-/// The same listener answers `GET /healthz` (liveness) and `GET /readyz`
-/// (readiness — 503 once the relay is draining), the probe surface for anycast
-/// health gates, LBs, and orchestrators (PRD `phase-6-anycast-autoscaling.md`
-/// FR1). Probe bodies are constant strings — nothing user- or peer-derived
-/// (NFR5).
+/// Serve the relay's privacy-preserving metrics (PRD Phase 6 FR4) at
+/// `GET /metrics`, plus `GET /healthz` (liveness) and `GET /readyz` (readiness,
+/// 503 once the relay is draining): the probe surface for anycast health gates,
+/// LBs and orchestrators (PRD `phase-6-anycast-autoscaling.md` FR1). The HTTP
+/// handling is the shared `ferrum_transport::http_probe` server (SEC-018: exact
+/// routes, request timeout, connection cap). Probe bodies are constant
+/// strings, nothing user- or peer-derived (NFR5).
 async fn serve_relay_metrics(
     addr: SocketAddr,
     metrics: std::sync::Arc<ferrum_transport::RelayMetrics>,
     server: std::sync::Arc<ferrum_transport::RelayServer>,
 ) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use ferrum_transport::http_probe;
 
-    let listener = match TcpListener::bind(addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!(%addr, error = %e, "failed to bind relay metrics endpoint");
-            return;
+    let handler: http_probe::Handler = std::sync::Arc::new(move |path| match path {
+        "/metrics" => Some(http_probe::prometheus(&metrics.render())),
+        "/healthz" => Some(http_probe::plain("200 OK", "ok")),
+        "/readyz" if server.is_draining() => {
+            Some(http_probe::plain("503 Service Unavailable", "draining"))
         }
-    };
-    loop {
-        let Ok((mut stream, _)) = listener.accept().await else {
-            continue;
-        };
-        let metrics = metrics.clone();
-        let server = server.clone();
-        tokio::spawn(async move {
-            let mut buf = [0u8; 1024];
-            let n = stream.read(&mut buf).await.unwrap_or(0);
-            let response = if buf[..n].starts_with(b"GET /metrics") {
-                let body = metrics.render();
-                format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\n\
-                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                )
-            } else if buf[..n].starts_with(b"GET /healthz") {
-                plain_response("200 OK", "ok")
-            } else if buf[..n].starts_with(b"GET /readyz") {
-                if server.is_draining() {
-                    plain_response("503 Service Unavailable", "draining")
-                } else {
-                    plain_response("200 OK", "ready")
-                }
-            } else {
-                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                    .to_string()
-            };
-            let _ = stream.write_all(response.as_bytes()).await;
-            let _ = stream.shutdown().await;
-        });
-    }
-}
-
-/// A minimal `text/plain` HTTP/1 response for the health probes.
-fn plain_response(status: &str, body: &str) -> String {
-    format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    )
+        "/readyz" => Some(http_probe::plain("200 OK", "ready")),
+        _ => None,
+    });
+    http_probe::bind_and_serve(addr, handler).await;
 }
 
 /// FR1–FR3: load config, build the session + TUN device + UDP socket, run loop.

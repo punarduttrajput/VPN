@@ -5,70 +5,56 @@
 //! inter-packet timing patterns. Receive is passed through unchanged — jitter
 //! on the send side is sufficient and keeps latency impact bounded.
 //!
-//! Randomness uses a lock-free LCG seeded from system-time nanoseconds at
-//! construction. This is not cryptographically secure, but timing obfuscation
-//! does not require it — any unguessable-looking distribution prevents an
-//! observer from correlating packets by fixed inter-arrival times.
+//! Each delay is drawn from the OS CSPRNG (SEC-018). It used to come from an
+//! LCG seeded with the clock, so an observer who could guess the seed could
+//! predict every delay and subtract the jitter back out. The per-draw syscall
+//! is negligible next to the sleep it decides.
 //!
 //! Both peers do *not* need to agree on jitter settings; it is applied
 //! independently on each side.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::{Transport, TransportError};
 
-/// A lock-free linear-congruential generator (Knuth MMIX constants).
-struct Lcg(AtomicU64);
-
-impl Lcg {
-    fn new(seed: u64) -> Self {
-        Self(AtomicU64::new(seed | 1)) // odd seed keeps the LCG full-period
+/// A uniformly random delay in `0..max` milliseconds (0 when `max == 0`),
+/// from the OS CSPRNG. Rejection sampling avoids modulo bias. If the RNG is
+/// unavailable, no delay (the packet still goes out; only the jitter is lost).
+fn random_millis(max: u64) -> u64 {
+    if max == 0 {
+        return 0;
     }
-
-    /// Return a random value in `0..max` (0 when `max == 0`).
-    fn next_millis(&self, max: u64) -> u64 {
-        if max == 0 {
+    // The largest multiple of `max` that fits, so `v % max` is uniform below it.
+    let zone = u64::MAX - (u64::MAX % max);
+    loop {
+        let mut bytes = [0u8; 8];
+        if getrandom::getrandom(&mut bytes).is_err() {
             return 0;
         }
-        let s = self
-            .0
-            .fetch_add(6_364_136_223_846_793_005, Ordering::Relaxed);
-        s.wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407)
-            % max
+        let v = u64::from_le_bytes(bytes);
+        if v < zone {
+            return v % max;
+        }
     }
-}
-
-fn time_seed() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u64 ^ (d.as_secs().wrapping_mul(0x9e37_79b9_7f4a_7c15)))
-        .unwrap_or(0xdead_beef_cafe_babe)
 }
 
 /// A [`Transport`] decorator that randomises outgoing packet timing (FR5).
 pub struct JitteredTransport<T> {
     inner: T,
     max_ms: u64,
-    rng: Lcg,
 }
 
 impl<T: Transport> JitteredTransport<T> {
     /// Wrap `inner`, delaying each send by a uniform random duration in
     /// `[0, max_ms)` milliseconds.
     pub fn new(inner: T, max_ms: u64) -> Self {
-        Self {
-            inner,
-            max_ms,
-            rng: Lcg::new(time_seed()),
-        }
+        Self { inner, max_ms }
     }
 }
 
 impl<T: Transport> Transport for JitteredTransport<T> {
     async fn send(&self, datagram: &[u8]) -> Result<(), TransportError> {
-        let delay = self.rng.next_millis(self.max_ms);
+        let delay = random_millis(self.max_ms);
         if delay > 0 {
             tokio::time::sleep(Duration::from_millis(delay)).await;
         }
@@ -86,7 +72,7 @@ impl<T: Transport> Transport for JitteredTransport<T> {
     async fn send_batch(&self, datagrams: &[Vec<u8>]) -> Result<(), TransportError> {
         // One random delay for the burst — still obfuscates inter-burst
         // timing without multiplying latency by batch size.
-        let delay = self.rng.next_millis(self.max_ms);
+        let delay = random_millis(self.max_ms);
         if delay > 0 {
             tokio::time::sleep(Duration::from_millis(delay)).await;
         }
@@ -118,18 +104,22 @@ mod tests {
     }
 
     #[test]
-    fn lcg_stays_within_range() {
-        let rng = Lcg::new(42);
+    fn delays_stay_in_range_and_vary() {
         let max = 50u64;
-        for _ in 0..10_000 {
-            let v = rng.next_millis(max);
-            assert!(v < max, "LCG output {v} exceeds max {max}");
-        }
+        let draws: Vec<u64> = (0..2_000).map(|_| random_millis(max)).collect();
+        assert!(draws.iter().all(|&v| v < max), "a delay exceeded max");
+        // Not a statistical test, just a guard against a constant generator.
+        let distinct: std::collections::HashSet<_> = draws.iter().collect();
+        assert!(
+            distinct.len() > 25,
+            "only {} distinct delays",
+            distinct.len()
+        );
     }
 
     #[test]
-    fn lcg_returns_zero_for_zero_max() {
-        let rng = Lcg::new(1);
-        assert_eq!(rng.next_millis(0), 0);
+    fn zero_max_means_no_delay() {
+        assert_eq!(random_millis(0), 0);
+        assert_eq!(random_millis(1), 0);
     }
 }

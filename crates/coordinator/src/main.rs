@@ -8,10 +8,8 @@ use std::sync::{Arc, Mutex};
 
 use ferrum_control_proto::coordinator::coordinator_server::CoordinatorServer;
 use ferrum_coordinator::{AuthMode, CoordinatorService, Metrics, Policy, Registry};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 use tonic::transport::Server;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 fn arg_value(flag: &str) -> Option<String> {
     std::env::args().skip_while(|a| a != flag).nth(1)
@@ -35,69 +33,32 @@ async fn warn_insecure_periodically(period: std::time::Duration) {
     }
 }
 
-/// Serve the privacy-preserving metrics (PRD Phase 6 FR4) on a tiny HTTP/1
-/// endpoint at `GET /metrics` — enough for a Prometheus scraper, hand-rolled over
-/// a `TcpListener` so the coordinator gains no HTTP-server dependency. Runs on its
-/// own port (separate from the gRPC `--listen`). `device_count` is sampled from
-/// the registry at scrape time.
-///
-/// The same listener answers `GET /healthz` (liveness) and `GET /readyz`
-/// (readiness) probes for load balancers and orchestrators (PRD
-/// `phase-6-anycast-autoscaling.md` FR1). The coordinator has no drain state
-/// yet (that's the M2 relay-registry work), so readiness mirrors liveness;
-/// both bodies are constant strings — nothing user-derived (NFR5).
+/// Serve the privacy-preserving metrics (PRD Phase 6 FR4) at `GET /metrics`,
+/// plus the `GET /healthz` (liveness) and `GET /readyz` (readiness) probes for
+/// load balancers and orchestrators (PRD `phase-6-anycast-autoscaling.md` FR1),
+/// on its own port (separate from the gRPC `--listen`). The HTTP handling
+/// (exact routes, request timeout, connection cap) is the shared
+/// `ferrum_transport::http_probe` server (SEC-018). `device_count` is sampled
+/// from the registry at scrape time. The coordinator has no drain state yet, so
+/// readiness mirrors liveness; both bodies are constant strings, nothing
+/// user-derived (NFR5).
 async fn serve_metrics(addr: SocketAddr, metrics: Arc<Metrics>, registry: Arc<Mutex<Registry>>) {
-    let listener = match TcpListener::bind(addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            error!(%addr, error = %e, "failed to bind metrics endpoint");
-            return;
-        }
-    };
-    info!(%addr, "metrics endpoint listening on GET /metrics (+ /healthz, /readyz)");
-    loop {
-        let Ok((mut stream, _)) = listener.accept().await else {
-            continue;
-        };
-        let metrics = metrics.clone();
-        let registry = registry.clone();
-        tokio::spawn(async move {
-            // The request is tiny; one read captures the request line we need.
-            let mut buf = [0u8; 1024];
-            let n = stream.read(&mut buf).await.unwrap_or(0);
-            let response = if buf[..n].starts_with(b"GET /metrics") {
-                let device_count = registry
-                    .lock()
-                    .expect("registry mutex poisoned")
-                    .device_count();
-                let body = metrics.render(device_count);
-                format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\n\
-                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                )
-            } else if buf[..n].starts_with(b"GET /healthz") {
-                plain_response("200 OK", "ok")
-            } else if buf[..n].starts_with(b"GET /readyz") {
-                plain_response("200 OK", "ready")
-            } else {
-                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                    .to_string()
-            };
-            let _ = stream.write_all(response.as_bytes()).await;
-            let _ = stream.shutdown().await;
-        });
-    }
-}
+    use ferrum_transport::http_probe;
 
-/// A minimal `text/plain` HTTP/1 response for the health probes.
-fn plain_response(status: &str, body: &str) -> String {
-    format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    )
+    info!(%addr, "metrics endpoint listening on GET /metrics (+ /healthz, /readyz)");
+    let handler: http_probe::Handler = Arc::new(move |path| match path {
+        "/metrics" => {
+            let device_count = registry
+                .lock()
+                .expect("registry mutex poisoned")
+                .device_count();
+            Some(http_probe::prometheus(&metrics.render(device_count)))
+        }
+        "/healthz" => Some(http_probe::plain("200 OK", "ok")),
+        "/readyz" => Some(http_probe::plain("200 OK", "ready")),
+        _ => None,
+    });
+    http_probe::bind_and_serve(addr, handler).await;
 }
 
 #[tokio::main]
@@ -304,7 +265,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!(%addr, "admin API + panel listening");
         tokio::spawn(async move {
             if let Err(e) = ferrum_coordinator::admin::serve(addr, router).await {
-                error!(%addr, error = %e, "admin API server failed");
+                tracing::error!(%addr, error = %e, "admin API server failed");
             }
         });
     }

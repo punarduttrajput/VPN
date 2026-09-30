@@ -29,12 +29,25 @@ each is cheaper to fix than to explain to an auditor:
 
 ## Acceptance criteria
 
-- [ ] STUN transaction IDs from `getrandom`.
-- [ ] Metrics/health endpoints served by hyper/axum (already dependencies)
+- [x] STUN transaction IDs from `getrandom`.
+- [x] Metrics/health endpoints served by hyper/axum (already dependencies)
       with exact routes and a request timeout; existing probe tests pass.
-- [ ] Jitter delays from a CSPRNG (`getrandom`-seeded).
-- [ ] `send_batch` enforces the same length limit as `send`, with a test.
+      *(Done with a shared ~60-line `ferrum_transport::http_probe` server rather
+      than hyper/axum: `axum` is only an optional `admin-api` dependency, and
+      pulling an HTTP framework into the relay binary for three constant routes
+      isn't worth it. What the criterion is after is covered: routes parsed
+      from the request line and matched exactly (`/metricsX` → 404), non-GET →
+      405, a 5 s request timeout (slowloris), and a 64-connection cap. The
+      coordinator and relay now share it instead of two copies.)*
+- [x] Jitter delays from a CSPRNG (`getrandom`-seeded). *(Each delay drawn from
+      `getrandom`, with rejection sampling for no modulo bias.)*
+- [x] `send_batch` enforces the same length limit as `send`, with a test.
 - [ ] XDP parser rejects non-IPv4-version, fragmented, and not-for-us packets
       (falls back to `XDP_PASS`) and validates lengths; `GatewayInfo` gets
       explicit padding; `checksum_update` gets unit tests against a reference
       full checksum. Re-run the `relay_traffic` netns check.
+      *(**Deferred to a Linux-host follow-up:** `relay-ebpf` is its own
+      workspace that needs nightly, the `bpfel-unknown-none` target and
+      `bpf-linker`, and changes to it only count once the verifier accepts them
+      and the netns traffic check passes. None of that can run on the Windows
+      dev host.)*
