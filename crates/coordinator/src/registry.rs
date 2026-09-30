@@ -5,7 +5,7 @@
 //! written through to a [`Store`] for durability: in-memory by default, or SQLite
 //! (the `sqlite` feature) so the registry survives a restart.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 
 use serde::Serialize;
@@ -34,6 +34,10 @@ pub enum RegistryError {
     /// from a key it does not own) — PRD security-hardening.md SEC-002.
     #[error("public key is not authorized for this identity")]
     IdentityKeyMismatch,
+    /// The public key, or the authenticated identity, has been revoked by an
+    /// operator and may not register, bind or rotate (SEC-013).
+    #[error("device has been revoked")]
+    Revoked,
     /// The persistence backend failed.
     #[error("persistence error: {0}")]
     Store(String),
@@ -88,6 +92,14 @@ pub struct Registry {
     /// claimed, and a public key already claimed by one identity cannot be
     /// claimed by another.
     identity_keys: HashMap<String, String>,
+    /// Durable revocations (SEC-013): revoked public keys, and the identities
+    /// that were bound to them when revoked. Consulted by every registration,
+    /// binding and rotation, so a revoked device can't simply re-register.
+    revoked_keys: HashSet<String>,
+    revoked_identities: HashSet<String>,
+    /// Which identities were revoked along with each key, so
+    /// [`unrevoke`](Registry::unrevoke) lifts exactly what `revoke` imposed.
+    revoked_with: HashMap<String, Vec<String>>,
 }
 
 impl Registry {
@@ -106,6 +118,9 @@ impl Registry {
             policy,
             store: Box::new(MemoryStore),
             identity_keys: HashMap::new(),
+            revoked_keys: HashSet::new(),
+            revoked_identities: HashSet::new(),
+            revoked_with: HashMap::new(),
         }
     }
 
@@ -129,7 +144,7 @@ impl Registry {
             .map_err(|e| RegistryError::Store(e.to_string()))?
             .into_iter()
             .collect();
-        Ok(Self {
+        let mut registry = Self {
             base,
             prefix,
             next_host: 2,
@@ -137,7 +152,18 @@ impl Registry {
             policy,
             store,
             identity_keys,
-        })
+            revoked_keys: HashSet::new(),
+            revoked_identities: HashSet::new(),
+            revoked_with: HashMap::new(),
+        };
+        for (key, identity) in registry
+            .store
+            .load_revocations()
+            .map_err(|e| RegistryError::Store(e.to_string()))?
+        {
+            registry.note_revocation(key, identity);
+        }
+        Ok(registry)
     }
 
     /// Enforce and record the identity -> public-key binding for an
@@ -148,6 +174,9 @@ impl Registry {
     /// is rejected. Re-registering the same (identity, public_key) pair is a
     /// no-op.
     pub fn bind_identity(&mut self, identity: &str, public_key: &str) -> Result<(), RegistryError> {
+        if self.revoked_identities.contains(identity) || self.revoked_keys.contains(public_key) {
+            return Err(RegistryError::Revoked);
+        }
         if let Some(bound) = self.identity_keys.get(identity) {
             return if bound == public_key {
                 Ok(())
@@ -180,6 +209,9 @@ impl Registry {
         old_key: &str,
         new_key: &str,
     ) -> Result<(), RegistryError> {
+        if self.revoked_identities.contains(identity) || self.revoked_keys.contains(new_key) {
+            return Err(RegistryError::Revoked);
+        }
         // If `old_key` already belongs to someone, only its owner may rotate
         // it away.
         match self.identity_keys.iter().find(|(_, k)| *k == old_key) {
@@ -238,6 +270,9 @@ impl Registry {
     ) -> Result<Ipv4Addr, RegistryError> {
         if public_key.trim().is_empty() {
             return Err(RegistryError::InvalidKey);
+        }
+        if self.revoked_keys.contains(public_key) {
+            return Err(RegistryError::Revoked);
         }
         // Build (or refresh) the device, then write through to the store. The
         // device is cloned out so the `&mut self.by_key` borrow ends before the
@@ -327,6 +362,9 @@ impl Registry {
     pub fn rotate_key(&mut self, old: &str, new: &str) -> Result<Ipv4Addr, RegistryError> {
         if new.trim().is_empty() {
             return Err(RegistryError::InvalidKey);
+        }
+        if self.revoked_keys.contains(new) {
+            return Err(RegistryError::Revoked);
         }
         if old == new {
             // No change requested: report the existing assignment (or that the
@@ -427,6 +465,81 @@ impl Registry {
             .remove(public_key)
             .map_err(|e| RegistryError::Store(e.to_string()))?;
         Ok(())
+    }
+
+    /// Revoke a device durably (SEC-013): evict it like [`remove`](Self::remove),
+    /// unbind every identity bound to its key, and record both the key and
+    /// those identities as revoked, so neither the key nor the identity's token
+    /// can register, bind or rotate again until [`unrevoke`](Self::unrevoke).
+    /// The revocation is persisted before the in-memory state changes.
+    pub fn revoke(&mut self, public_key: &str) -> Result<(), RegistryError> {
+        if !self.by_key.contains_key(public_key) {
+            return Err(RegistryError::UnknownDevice);
+        }
+        let identities: Vec<String> = self
+            .identity_keys
+            .iter()
+            .filter(|(_, k)| *k == public_key)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let store_err = |e: crate::store::StoreError| RegistryError::Store(e.to_string());
+        if identities.is_empty() {
+            self.store
+                .add_revocation(public_key, "")
+                .map_err(store_err)?;
+        }
+        for identity in &identities {
+            self.store
+                .add_revocation(public_key, identity)
+                .map_err(store_err)?;
+            self.store.remove_binding(identity).map_err(store_err)?;
+        }
+        self.remove(public_key)?;
+        for identity in identities {
+            self.identity_keys.remove(&identity);
+            self.note_revocation(public_key.to_string(), identity);
+        }
+        self.revoked_keys.insert(public_key.to_string());
+        Ok(())
+    }
+
+    /// Lift a revocation (SEC-013): the key and the identities revoked with it
+    /// may register again. Returns whether anything was revoked under that key.
+    pub fn unrevoke(&mut self, public_key: &str) -> Result<bool, RegistryError> {
+        if !self.revoked_keys.contains(public_key) {
+            return Ok(false);
+        }
+        self.store
+            .remove_revocation(public_key)
+            .map_err(|e| RegistryError::Store(e.to_string()))?;
+        self.revoked_keys.remove(public_key);
+        for identity in self.revoked_with.remove(public_key).unwrap_or_default() {
+            self.revoked_identities.remove(&identity);
+        }
+        Ok(true)
+    }
+
+    /// Whether `public_key` has been revoked (SEC-013).
+    pub fn is_key_revoked(&self, public_key: &str) -> bool {
+        self.revoked_keys.contains(public_key)
+    }
+
+    /// The public key bound to an authenticated `identity` (SEC-002), if any.
+    pub fn key_for_identity(&self, identity: &str) -> Option<&str> {
+        self.identity_keys.get(identity).map(String::as_str)
+    }
+
+    /// Record a (loaded or new) revocation in memory. An empty `identity`
+    /// means the key had no bound identity.
+    fn note_revocation(&mut self, key: String, identity: String) {
+        if !identity.is_empty() {
+            self.revoked_identities.insert(identity.clone());
+            self.revoked_with
+                .entry(key.clone())
+                .or_default()
+                .push(identity);
+        }
+        self.revoked_keys.insert(key);
     }
 
     /// The current ACL policy, for an operator surface to inspect.
