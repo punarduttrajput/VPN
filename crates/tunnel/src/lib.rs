@@ -25,7 +25,7 @@ pub mod leakguard;
 
 mod runner;
 
-pub use mesh::{run_mesh, run_mesh_relayed, MeshPeer};
+pub use mesh::{run_mesh, run_mesh_relayed, spoofed_source_drops, MeshPeer};
 pub use path::{Path, PathMachine, PathState};
 pub use runner::{run, RunHandle};
 

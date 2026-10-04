@@ -71,6 +71,9 @@ and gauges only — see the module docs in `crates/coordinator/src/metrics.rs` a
 - `ferrum_register_total`, `ferrum_network_map_requests_total`,
   `ferrum_rotate_key_total`, `ferrum_publish_candidates_total`,
   `ferrum_unauthenticated_total`
+- `ferrum_register_throttled_total`, `ferrum_relay_heartbeat_throttled_total`,
+  `ferrum_watch_streams_rejected_total`: rate-limit / stream-quota refusals
+  (SEC-006; aggregate only)
 - `ferrum_relay_clients_registered`, `ferrum_relay_frames_forwarded_total`,
   `ferrum_relay_bytes_forwarded_total`, `ferrum_relay_frames_dropped_total`
 
@@ -142,5 +145,8 @@ docker compose -f deploy/observability/docker-compose.yml down -v      # wipe vo
   the WSL2 VM gateway IP (`ip route | grep default`) via a local
   `docker-compose.override.yml` that remaps `extra_hosts`. This file is intended
   for the portable Docker-Desktop/Linux path.
+- **Privacy:** metrics are aggregate-only and spans are `skip_all` (NFR5), so
+  nothing scraped or traced here identifies a device or user. Keep it that way
+  when adding metrics: see the [threat model](../../docs/security/threat-model.md) §3.4.
 - Dashboards and alert rules are provisioned from files, so they're versioned in
   git and reproducible. Alerting (SLO rules) is a follow-up on top of this stack.

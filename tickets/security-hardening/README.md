@@ -31,3 +31,10 @@ Highs are gates for the third-party audit.
 | [SEC-016](SEC-016-replace-hand-rolled-unsafe.md) | Replace hand-rolled `unsafe` FFI and parsers with vetted crates | Medium | M4 |
 | [SEC-017](SEC-017-fuzzing-and-supply-chain.md) | No fuzzing, no dependency-vulnerability gate | Medium | M4 |
 | [SEC-018](SEC-018-low-severity-hardening.md) | Low-severity hardening batch | Low | M4 |
+
+Follow-ups from the SEC-010 threat model
+([docs/security/threat-model.md](../../docs/security/threat-model.md)).
+
+| ID | Title | Severity | Milestone |
+|----|-------|----------|-----------|
+| [SEC-020](SEC-020-default-sni-fingerprint.md) | Default TLS SNI `ferrum` names the product to on-path DPI | Low | M4 |
