@@ -276,8 +276,9 @@ Ferrum for them.
    connected devices. It is an ordinary DNS server (dnsmasq/unbound), so trust
    whoever runs it like a DNS provider.
 9. **Upstream boringtun.** Ferrum relies on it for WireGuard correctness. Its
-   own advisories are tracked by the `cargo-deny` gate (SEC-017), and the
-   0.6 → 0.7 upgrade is SEC-019.
+   own advisories are tracked by the `cargo-deny` gate (SEC-017). Ferrum is on
+   boringtun 0.7 (SEC-019), which brought `curve25519-dalek` 4.1.3 and
+   `ring` 0.17, with no advisory exceptions left for the WireGuard engine.
 10. **Apple platforms.** iOS and macOS clients don't exist yet, so nothing here
     applies to them.
 
@@ -296,7 +297,8 @@ Ferrum for them.
 
 **Status of fixes referenced here.** SEC-001 to SEC-018 are on `main`, except
 SEC-018's eBPF/XDP parser checks, which need a Linux host. SEC-019 (the
-boringtun upgrade) and SEC-020 (the SNI default) are open.
+boringtun upgrade) is implemented and in review. SEC-020 (the SNI default) is
+open.
 
 ## 9. Keeping this document true
 

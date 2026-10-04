@@ -62,9 +62,10 @@ rustls = { workspace = true, optional = true }
 ring = { version = "0.17", optional = true }
 # SEC-014: replaces the hand-rolled JWT verifier. Pinned to 9.x, the last major
 # with a `ring` backend (the crypto library already in the tree): 10+/11 need
-# either aws-lc-rs or a rust_crypto backend whose ed25519-dalek -> curve25519-dalek
-# 4.1 can't coexist with boringtun 0.6's exact x25519-dalek =2.0.0-rc.3 pin.
-# Move to 11.x (rust_crypto) together with a boringtun 0.7 upgrade.
+# either aws-lc-rs or a rust_crypto backend (ed25519-dalek -> curve25519-dalek
+# 4.1). That used to clash with boringtun 0.6's x25519-dalek =2.0.0-rc.3 pin;
+# since boringtun 0.7 (SEC-019) the tree is on curve25519-dalek 4.1.3, so 11.x
+# with rust_crypto is now a follow-up rather than blocked.
 jsonwebtoken = { version = "9.3", default-features = false, optional = true }
 opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }

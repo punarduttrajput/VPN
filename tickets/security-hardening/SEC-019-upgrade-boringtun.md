@@ -27,12 +27,23 @@ clarification is needed in `deny.toml`.
 
 ## Acceptance criteria
 
-- [ ] `boringtun` 0.7.x (and `x25519-dalek` 2.0.x stable) in the workspace;
+- [x] `boringtun` 0.7.x (and `x25519-dalek` 2.0.x stable) in the workspace;
       the session wrapper (`ferrum-tunnel::session`) adapted to any API
-      changes.
-- [ ] The three `ignore` entries and the `ring@0.16.20` licence clarification
+      changes. *(0.7.1 and `x25519-dalek` 2.0.1, so `curve25519-dalek` 4.1.3
+      and `ring` 0.17.14 only, in all three lockfiles: root, desktop, fuzz.
+      The only API change hit is that `Tunn::new` became infallible; a diff of
+      boringtun's `noise` module shows no protocol changes. One fix rides
+      along: the per-session send counter is now an `AtomicU64` rather than
+      `usize`, so 32-bit targets (Android armv7/i686) no longer wrap it at
+      2^32.)*
+- [x] The three `ignore` entries and the `ring@0.16.20` licence clarification
       removed from `deny.toml`; `cargo deny check` passes without them.
 - [ ] Full test matrix green, plus a real-TUN run (`verify-linux.sh`,
       including `TEST_MESH=1 MESH_QUIC=1`) and a throughput check
       (`STRICT_THROUGHPUT=1`), since this is the data-plane crypto engine.
-- [ ] Follow-up noted: `jsonwebtoken` 11 (`rust_crypto`) becomes possible.
+      *(Full matrix green on the Windows dev host, including the Linux
+      cross-compile clippy. The real-TUN run and the throughput check need a
+      Linux host with root and are still to do.)*
+- [x] Follow-up noted: `jsonwebtoken` 11 (`rust_crypto`) becomes possible.
+      *(Noted in `crates/coordinator/Cargo.toml` next to the `jsonwebtoken`
+      pin.)*

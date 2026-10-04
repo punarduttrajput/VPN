@@ -46,6 +46,9 @@ impl Session {
     }
 
     /// Build a session from raw 32-byte keys and a session index.
+    ///
+    /// Infallible since boringtun 0.7 (SEC-019), which made `Tunn::new` total;
+    /// the `Result` is kept so callers don't change if a check is added here.
     pub fn from_bytes(private: [u8; 32], peer_public: [u8; 32], index: u32) -> Result<Self> {
         let peer_public_bytes = peer_public;
         let static_private = StaticSecret::from(private);
@@ -57,8 +60,7 @@ impl Session {
             None, // no persistent keepalive in Phase 1
             index,
             None, // no rate limiter (single peer)
-        )
-        .map_err(|e| TunnelError::Session(e.to_string()))?;
+        );
         Ok(Self {
             tunn,
             peer_public: peer_public_bytes,

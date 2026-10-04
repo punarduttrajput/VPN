@@ -13,15 +13,6 @@ all-features = false
 unmaintained = "all"
 yanked = "deny"
 ignore = [
-    # curve25519-dalek 4.0.0-rc.3: timing variability in Scalar29/52::sub.
-    # Pinned exactly by boringtun 0.6 (x25519-dalek =2.0.0-rc.3); the fix
-    # (>= 4.1.3) needs boringtun 0.7. Tracked in SEC-019.
-    { id = "RUSTSEC-2024-0344", reason = "pinned by boringtun 0.6; SEC-019 upgrades boringtun" },
-    # ring 0.16: some AES functions may panic when overflow checks are
-    # enabled (release builds don't enable them). ring 0.16 is only in the
-    # tree through boringtun 0.6. Tracked in SEC-019.
-    { id = "RUSTSEC-2025-0009", reason = "ring 0.16 via boringtun 0.6; SEC-019 upgrades boringtun" },
-    { id = "RUSTSEC-2025-0010", reason = "ring 0.16 (unmaintained) via boringtun 0.6; SEC-019" },
     # rustls-pemfile is unmaintained (its function moved into
     # rustls-pki-types); not a vulnerability. It arrives via tonic 0.12's TLS
     # support and goes away with a tonic upgrade.
@@ -43,19 +34,6 @@ allow = [
     "WTFPL",
 ]
 confidence-threshold = 0.9
-
-# ring 0.16 (via boringtun 0.6) has no `license` field. Its LICENSE file is
-# ISC for the Rust code plus the OpenSSL/SSLeay licences for code derived from
-# BoringSSL; `hash` pins the exact file reviewed. OpenSSL is allowed for this
-# crate only, and the whole entry goes away with SEC-019 (boringtun 0.7 -> ring 0.17).
-[[licenses.clarify]]
-crate = "ring@0.16.20"
-expression = "MIT AND ISC AND OpenSSL"
-license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
-
-[[licenses.exceptions]]
-crate = "ring@0.16.20"
-allow = ["OpenSSL"]
 
 [bans]
 # Duplicate versions are common transitively (windows-sys, socket2, ...) and not
