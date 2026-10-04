@@ -62,7 +62,11 @@ pub use quic_mesh::QuicMeshTransport;
 #[cfg(feature = "masque")]
 pub mod masque;
 #[cfg(feature = "masque")]
-pub use masque::{MasqueMeshTransport, MasqueProxy, MasqueTransport};
+pub use masque::{MasqueMeshTransport, MasqueProxy, MasqueTransport, ProxyAuthorizer};
+#[cfg(feature = "masque")]
+pub mod masque_policy;
+#[cfg(feature = "masque")]
+pub use masque_policy::{IpNet, TargetPolicy};
 
 /// Errors produced by a transport.
 #[derive(Debug, Error)]

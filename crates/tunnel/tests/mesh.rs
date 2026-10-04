@@ -471,7 +471,7 @@ async fn mesh_probes_candidates_to_reach_a_peer() {
 #[cfg(feature = "masque")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn masque_mesh_node_reaches_udp_peer() {
-    use ferrum_transport::{MasqueMeshTransport, MasqueProxy};
+    use ferrum_transport::{MasqueMeshTransport, MasqueProxy, TargetPolicy};
 
     let (m, x) = (KeyPair::generate(), KeyPair::generate());
 
@@ -488,7 +488,10 @@ async fn masque_mesh_node_reaches_udp_peer() {
     });
 
     // MASQUE proxy M tunnels through.
-    let proxy = MasqueProxy::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    // X lives on loopback, which the proxy refuses by default (SEC-015).
+    let proxy = MasqueProxy::bind("127.0.0.1:0".parse().unwrap())
+        .unwrap()
+        .with_target_policy(TargetPolicy::allowlist(["127.0.0.0/8"]).unwrap());
     let proxy_addr = proxy.local_addr().unwrap();
     let proxy_pin = proxy.fingerprint();
     tokio::spawn(async move {
