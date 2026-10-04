@@ -20,9 +20,10 @@ sqlite = ["dep:rusqlite", "dep:serde_json"]
 # the client-certificate fingerprint used for identity->key binding (SEC-002).
 mtls = ["tonic/tls", "dep:rcgen", "dep:rustls", "dep:ring"]
 # OIDC bearer-token authentication: verify JWTs (RS256/ES256) against a JWKS so
-# device tags become a verified authorization boundary. Offline JWT verify via
-# in-tree `ring` (no external IdP needed to test).
-oidc = ["dep:ring", "dep:base64", "dep:serde_json"]
+# device tags become a verified authorization boundary. Offline verification via
+# the vetted `jsonwebtoken` crate on its pure-Rust backend (SEC-014); no external
+# IdP is needed to test.
+oidc = ["dep:jsonwebtoken", "dep:serde_json"]
 # OpenTelemetry span export (PRD Phase 6 FR4): export the existing RPC-handler
 # tracing spans to an OTLP collector (gRPC, default :4317) via --otlp-endpoint.
 # The spans use skip_all already (NFR5), so this exports aggregate timing only.
@@ -59,7 +60,12 @@ serde_json = { version = "1", optional = true }
 rcgen = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 ring = { version = "0.17", optional = true }
-base64 = { workspace = true, optional = true }
+# SEC-014: replaces the hand-rolled JWT verifier. Pinned to 9.x, the last major
+# with a `ring` backend (the crypto library already in the tree): 10+/11 need
+# either aws-lc-rs or a rust_crypto backend whose ed25519-dalek -> curve25519-dalek
+# 4.1 can't coexist with boringtun 0.6's exact x25519-dalek =2.0.0-rc.3 pin.
+# Move to 11.x (rust_crypto) together with a boringtun 0.7 upgrade.
+jsonwebtoken = { version = "9.3", default-features = false, optional = true }
 opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
@@ -68,5 +74,8 @@ axum = { version = "0.7", optional = true }
 rust-embed = { version = "8", optional = true, features = ["mime-guess"] }
 
 [dev-dependencies]
+# The OIDC tests mint their own ES256 tokens (auth::testsign).
+ring = "0.17"
+base64 = { workspace = true }
 tokio-stream = { version = "0.1", features = ["net"] }
 tower = { version = "0.5", features = ["util"] }

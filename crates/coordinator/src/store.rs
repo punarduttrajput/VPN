@@ -39,6 +39,28 @@ pub trait Store: Send + Sync {
     fn upsert_binding(&self, _identity: &str, _public_key: &str) -> Result<(), StoreError> {
         Ok(())
     }
+    /// Drop an identity's key binding (a revoked device's identity is unbound
+    /// so it can't keep claiming the key — SEC-013). Default: a no-op.
+    fn remove_binding(&self, _identity: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// Load all persisted revocations (SEC-013): `(public_key, identity)`
+    /// pairs, `identity` empty when the key had no bound identity. Called once
+    /// at startup. Default: none.
+    fn load_revocations(&self) -> Result<Vec<(String, String)>, StoreError> {
+        Ok(Vec::new())
+    }
+    /// Persist a revocation of `public_key` (and of `identity`, when non-empty).
+    /// Default: a no-op (in-memory only).
+    fn add_revocation(&self, _public_key: &str, _identity: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+    /// Lift every revocation recorded for `public_key` (the key and any
+    /// identity revoked with it). Default: a no-op.
+    fn remove_revocation(&self, _public_key: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
 }
 
 /// A no-op store: devices live only in memory (lost on restart).

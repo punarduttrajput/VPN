@@ -16,8 +16,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
+use crate::limits::{source_key, KeyedLimiter, Limits, LimitsConfig};
 use crate::metrics::Metrics;
-use crate::registry::{normalize_tls_pin, Registry, RegistryError};
+use crate::registry::{Registry, RegistryError, TlsPins};
 
 /// How often a relay should heartbeat, directed to it in every
 /// [`RelayHeartbeatResponse`] (PRD `phase-6-anycast-autoscaling.md` FR3).
@@ -27,6 +28,12 @@ const RELAY_HEARTBEAT_INTERVAL_SECS: u32 = 15;
 /// missed beats. Comfortably inside the parent PRD's < 90 s scale-out/withdraw
 /// reaction target (NFR4).
 const DEFAULT_RELAY_TTL: Duration = Duration::from_secs(45);
+
+/// The verified tag that grants the relay role (SEC-013): only a caller whose
+/// token carries it (or an identity in `--relay-identity`) may announce a relay.
+/// Any other authenticated device is refused, since the announced relay is
+/// advertised to the whole mesh.
+pub const RELAY_TAG: &str = "relay";
 
 /// A live, heartbeating relay known to the coordinator.
 struct RelayEntry {
@@ -128,6 +135,7 @@ fn current_map(
             allowed_ips: vec![format!("{}/32", d.tunnel_ip)],
             candidates: d.candidates,
             tls_cert_sha256: d.tls_cert_sha256,
+            tls_next_pins: d.tls_next_pins,
         })
         .collect();
     NetworkMapResponse {
@@ -168,6 +176,13 @@ pub struct CoordinatorService {
     dns_servers: Vec<String>,
     /// Aggregate, privacy-preserving control-plane metrics (PRD Phase 6 FR4).
     metrics: Arc<Metrics>,
+    /// Authenticated identities (`oidc:<sub>` / `mtls:<fp>`) allowed to act as
+    /// relays in addition to tokens carrying the [`RELAY_TAG`] (SEC-013). For
+    /// mTLS-only deployments, whose client certs carry no tags.
+    relay_identities: Vec<String>,
+    /// Per-source / per-identity rate limits and the watch-stream quota
+    /// (SEC-006). Always on; tune with [`Self::with_limits`].
+    limits: Arc<Limits>,
     /// When set (the `oidc` feature + a configured verifier), every RPC requires
     /// a valid bearer token and registration tags come from the token.
     #[cfg(feature = "oidc")]
@@ -185,9 +200,17 @@ impl CoordinatorService {
             relays: Arc::new(Mutex::new(RelayRegistry::new(DEFAULT_RELAY_TTL))),
             dns_servers: Vec::new(),
             metrics: Metrics::new(),
+            relay_identities: Vec::new(),
+            limits: Arc::new(Limits::new(&LimitsConfig::default())),
             #[cfg(feature = "oidc")]
             verifier: None,
         }
+    }
+
+    /// Replace the default rate limits and watch-stream quota (SEC-006).
+    pub fn with_limits(mut self, cfg: &LimitsConfig) -> Self {
+        self.limits = Arc::new(Limits::new(cfg));
+        self
     }
 
     /// A handle to this service's metrics, for the `/metrics` exporter to render.
@@ -261,6 +284,15 @@ impl CoordinatorService {
         })
     }
 
+    /// Allow these authenticated identities (`oidc:<sub>` or `mtls:<sha256 hex>`)
+    /// to announce relays, in addition to tokens carrying [`RELAY_TAG`]
+    /// (SEC-013). Needed for mTLS-only deployments, whose client certs carry
+    /// no tags.
+    pub fn with_relay_identities(mut self, identities: Vec<String>) -> Self {
+        self.relay_identities = identities;
+        self
+    }
+
     /// Advertise DNS resolvers (bare IPs, reachable through the tunnel) to
     /// every device in the network map (PRD leak-protection.md). Devices point
     /// their system DNS at them while connected unless locally overridden.
@@ -284,6 +316,8 @@ impl CoordinatorService {
             relays: Arc::new(Mutex::new(RelayRegistry::new(DEFAULT_RELAY_TTL))),
             dns_servers: Vec::new(),
             metrics: Metrics::new(),
+            relay_identities: Vec::new(),
+            limits: Arc::new(Limits::new(&LimitsConfig::default())),
             verifier: Some(verifier),
         }
     }
@@ -350,6 +384,68 @@ impl CoordinatorService {
     }
 }
 
+impl CoordinatorService {
+    /// SEC-013: may this caller act for `public_key`? A revoked key is refused
+    /// in every mode. An authenticated caller must additionally be the identity
+    /// bound to that key (SEC-002). Open mode (no identity) has no binding to
+    /// check.
+    #[allow(clippy::result_large_err)] // tonic::Status is the trait-wide error type
+    fn authorize_key<T>(
+        &self,
+        request: &Request<T>,
+        claims: &Option<VerifiedClaims>,
+        public_key: &str,
+    ) -> Result<(), Status> {
+        let reg = self.registry.lock().expect("registry mutex poisoned");
+        if reg.is_key_revoked(public_key) {
+            return Err(Status::permission_denied("device has been revoked"));
+        }
+        if let Some(identity) = self.bound_identity(request, claims) {
+            if reg.key_for_identity(&identity) != Some(public_key) {
+                return Err(Status::permission_denied(
+                    "public_key is not bound to the caller's identity (register it first)",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// SEC-013: may this caller announce a relay? The announcement is pushed to
+    /// every device, so an authenticated caller needs the relay role: a
+    /// [`RELAY_TAG`] in its verified token, or an identity listed via
+    /// [`with_relay_identities`](Self::with_relay_identities). Open mode is
+    /// unchanged.
+    #[allow(clippy::result_large_err)] // tonic::Status is the trait-wide error type
+    fn authorize_relay<T>(
+        &self,
+        request: &Request<T>,
+        claims: &Option<VerifiedClaims>,
+    ) -> Result<(), Status> {
+        let Some(identity) = self.bound_identity(request, claims) else {
+            return Ok(());
+        };
+        let tagged = claims
+            .as_ref()
+            .is_some_and(|c| c.tags.iter().any(|t| t == RELAY_TAG));
+        if tagged || self.relay_identities.contains(&identity) {
+            Ok(())
+        } else {
+            Err(Status::permission_denied(
+                "RelayHeartbeat requires the relay role",
+            ))
+        }
+    }
+}
+
+/// Map a registry error to a gRPC status: a revocation is always
+/// `permission_denied` (SEC-013); anything else goes through `other`.
+fn registry_status(e: RegistryError, other: impl FnOnce(String) -> Status) -> Status {
+    match e {
+        RegistryError::Revoked => Status::permission_denied(e.to_string()),
+        e => other(e.to_string()),
+    }
+}
+
 /// Derive a stable identity from the mTLS client leaf certificate presented on
 /// this connection, if any: the SHA-256 fingerprint of its DER encoding,
 /// hex-encoded (PRD security-hardening.md SEC-002). `None` when the
@@ -383,6 +479,19 @@ fn bearer_token(meta: &tonic::metadata::MetadataMap) -> Result<&str, Status> {
         .ok_or_else(|| Status::unauthenticated("authorization must be a Bearer token"))
 }
 
+/// Charge one request for `key` against `limiter` (SEC-006), mapping a refusal
+/// to `resource_exhausted`. Neither the key nor the caller is logged (NFR5).
+#[allow(clippy::result_large_err)] // tonic::Status is the trait-wide error type
+fn rate_limit(limiter: &KeyedLimiter, key: &str, rpc: &'static str) -> Result<(), Status> {
+    if limiter.check(key, Instant::now()) {
+        return Ok(());
+    }
+    tracing::debug!(rpc, "request rate limited");
+    Err(Status::resource_exhausted(format!(
+        "{rpc} rate limit exceeded; retry later"
+    )))
+}
+
 #[tonic::async_trait]
 impl Coordinator for CoordinatorService {
     // `skip_all`: the request carries the device public key/name/endpoint; none of
@@ -394,8 +503,19 @@ impl Coordinator for CoordinatorService {
         request: Request<RegisterDeviceRequest>,
     ) -> Result<Response<RegisterDeviceResponse>, Status> {
         let _timer = self.metrics.start_request();
+        // SEC-006: the per-source limit runs before authentication so a flood
+        // can't make the coordinator do token verification at an unbounded
+        // rate; the per-identity limit needs the verified identity.
+        let throttled = |_: &Status| self.metrics.inc_register_throttled();
+        let source = source_key(request.remote_addr());
+        rate_limit(&self.limits.register_source, &source, "RegisterDevice")
+            .inspect_err(throttled)?;
         let claims = self.authenticate_metered(&request)?;
         let bound_identity = self.bound_identity(&request, &claims);
+        if let Some(identity) = &bound_identity {
+            rate_limit(&self.limits.register_identity, identity, "RegisterDevice")
+                .inspect_err(throttled)?;
+        }
         self.metrics.inc_register();
         let req = request.into_inner();
         // When authenticated, tags come from the verified token (an authorization
@@ -404,28 +524,28 @@ impl Coordinator for CoordinatorService {
             Some(c) => &c.tags,
             None => &req.tags,
         };
-        // SEC-004: the device's TLS cert pin, distributed to peers that dial it
-        // over QUIC. Bound to this (authenticated, SEC-002) registration.
-        let tls_pin = normalize_tls_pin(&req.tls_cert_sha256).ok_or_else(|| {
-            Status::invalid_argument("tls_cert_sha256 must be 64 hex digits or empty")
-        })?;
+        // SEC-004: the device's TLS cert pin, plus (SEC-007) any next pins it
+        // pre-announces for a rotation, distributed to peers that dial it over
+        // QUIC. Bound to this (authenticated, SEC-002) registration.
+        let tls_pins = TlsPins::normalize(&req.tls_cert_sha256, &req.tls_next_pins)
+            .map_err(Status::invalid_argument)?;
         let ip = {
             let mut reg = self.registry.lock().expect("registry mutex poisoned");
             // SEC-002: an authenticated caller (OIDC token or mTLS client cert)
             // may only ever register the public key it first claimed.
             if let Some(identity) = &bound_identity {
                 reg.bind_identity(identity, &req.public_key)
-                    .map_err(|e| Status::failed_precondition(e.to_string()))?;
+                    .map_err(|e| registry_status(e, Status::failed_precondition))?;
             }
-            // One store write carries the device and its pin.
-            reg.register_with_pin(
+            // One store write carries the device and its pins.
+            reg.register_with_pins(
                 &req.public_key,
                 &req.name,
                 &req.endpoint,
                 tags,
-                Some(&tls_pin),
+                Some(&tls_pins),
             )
-            .map_err(|e| Status::invalid_argument(e.to_string()))?
+            .map_err(|e| registry_status(e, Status::invalid_argument))?
         };
         // Notify watchers that the network changed (ignored if none are connected).
         let _ = self.changes.send(());
@@ -441,7 +561,8 @@ impl Coordinator for CoordinatorService {
         request: Request<NetworkMapRequest>,
     ) -> Result<Response<NetworkMapResponse>, Status> {
         let _timer = self.metrics.start_request();
-        self.authenticate_metered(&request)?;
+        let claims = self.authenticate_metered(&request)?;
+        self.authorize_key(&request, &claims, &request.get_ref().public_key)?;
         self.metrics.inc_network_map_request();
         let req = request.into_inner();
         let relay = {
@@ -462,7 +583,23 @@ impl Coordinator for CoordinatorService {
         request: Request<NetworkMapRequest>,
     ) -> Result<Response<Self::WatchNetworkMapStream>, Status> {
         let _timer = self.metrics.start_request();
-        self.authenticate_metered(&request)?;
+        let source = source_key(request.remote_addr());
+        let claims = self.authenticate_metered(&request)?;
+        self.authorize_key(&request, &claims, &request.get_ref().public_key)?;
+        // SEC-006: cap concurrent streams per source, per identity (when
+        // authenticated) and overall. The permit rides into the serving task
+        // and frees the slot when the stream ends.
+        let mut quota_keys = vec![(source, self.limits.watch_per_source)];
+        if let Some(identity) = self.bound_identity(&request, &claims) {
+            quota_keys.push((identity, self.limits.watch_per_identity));
+        }
+        let Some(permit) = self.limits.watch.try_acquire(quota_keys) else {
+            self.metrics.inc_watch_stream_rejected();
+            tracing::debug!("watch stream refused: concurrent-stream quota");
+            return Err(Status::resource_exhausted(
+                "too many concurrent WatchNetworkMap streams; close one and retry",
+            ));
+        };
         let public_key = request.into_inner().public_key;
         let registry = self.registry.clone();
         let static_relay = self.relay.clone();
@@ -477,12 +614,21 @@ impl Coordinator for CoordinatorService {
 
         tokio::spawn(async move {
             let _guard = guard;
+            let _permit = permit;
             // The advertised relay is recomputed per push (the registry is
             // live state — a heartbeat, goodbye, or sweep can change it
             // between pushes; each such change fires `changes`).
             let advertised = |static_relay: &str| {
                 let reg = relays.lock().expect("relay registry poisoned");
                 effective_relay(static_relay, &reg)
+            };
+            // SEC-013: a device revoked mid-stream gets no further maps. The
+            // revocation fires `changes`, so this is checked promptly.
+            let revoked = || {
+                registry
+                    .lock()
+                    .expect("registry mutex poisoned")
+                    .is_key_revoked(&public_key)
             };
             // Push the current map immediately, then on every change.
             if tx
@@ -498,9 +644,24 @@ impl Coordinator for CoordinatorService {
                 return;
             }
             // On each change (or a missed burst) recompute and push; the loop
-            // ends when the broadcast closes (pattern stops matching) or the
-            // client disconnects.
-            while let Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) = changes.recv().await {
+            // ends when the broadcast closes or the client disconnects. The
+            // `closed()` arm notices a disconnect right away rather than at
+            // the next push, so the stream's quota slot (SEC-006) and gauge
+            // entry are released promptly.
+            loop {
+                let changed = tokio::select! {
+                    _ = tx.closed() => break,
+                    changed = changes.recv() => changed,
+                };
+                if let Err(broadcast::error::RecvError::Closed) = changed {
+                    break;
+                }
+                if revoked() {
+                    let _ = tx
+                        .send(Err(Status::permission_denied("device has been revoked")))
+                        .await;
+                    break;
+                }
                 if tx
                     .send(Ok(current_map(
                         &registry,
@@ -525,7 +686,8 @@ impl Coordinator for CoordinatorService {
         request: Request<PublishCandidatesRequest>,
     ) -> Result<Response<PublishCandidatesResponse>, Status> {
         let _timer = self.metrics.start_request();
-        self.authenticate_metered(&request)?;
+        let claims = self.authenticate_metered(&request)?;
+        self.authorize_key(&request, &claims, &request.get_ref().public_key)?;
         self.metrics.inc_publish_candidates();
         let req = request.into_inner();
         tracing::debug!(candidates = req.candidates.len(), "published candidates");
@@ -548,7 +710,17 @@ impl Coordinator for CoordinatorService {
         request: Request<RelayHeartbeatRequest>,
     ) -> Result<Response<RelayHeartbeatResponse>, Status> {
         let _timer = self.metrics.start_request();
-        self.authenticate_metered(&request)?;
+        // SEC-006: per-source before authentication, per-identity after.
+        let throttled = |_: &Status| self.metrics.inc_relay_heartbeat_throttled();
+        let source = source_key(request.remote_addr());
+        rate_limit(&self.limits.heartbeat_source, &source, "RelayHeartbeat")
+            .inspect_err(throttled)?;
+        let claims = self.authenticate_metered(&request)?;
+        if let Some(identity) = self.bound_identity(&request, &claims) {
+            rate_limit(&self.limits.heartbeat_identity, &identity, "RelayHeartbeat")
+                .inspect_err(throttled)?;
+        }
+        self.authorize_relay(&request, &claims)?;
         let req = request.into_inner();
         req.addr
             .parse::<std::net::SocketAddr>()
@@ -582,10 +754,9 @@ impl Coordinator for CoordinatorService {
         self.metrics.inc_rotate_key();
         let req = request.into_inner();
         // The device's TLS cert is derived from its WireGuard key, so a rotation
-        // carries the new pin (or clears it) — never keep the stale one.
-        let tls_pin = normalize_tls_pin(&req.new_tls_cert_sha256).ok_or_else(|| {
-            Status::invalid_argument("new_tls_cert_sha256 must be 64 hex digits or empty")
-        })?;
+        // carries the new pin set (or clears it) — never keep the stale one.
+        let tls_pins = TlsPins::normalize(&req.new_tls_cert_sha256, &req.new_tls_next_pins)
+            .map_err(Status::invalid_argument)?;
         let ip = {
             let mut reg = self.registry.lock().expect("registry mutex poisoned");
             // SEC-002: the authorized rotation path — an authenticated caller
@@ -593,18 +764,19 @@ impl Coordinator for CoordinatorService {
             // key another identity already owns.
             if let Some(identity) = &bound_identity {
                 reg.rebind_identity(identity, &req.old_public_key, &req.new_public_key)
-                    .map_err(|e| Status::failed_precondition(e.to_string()))?;
+                    .map_err(|e| registry_status(e, Status::failed_precondition))?;
             }
             let ip = reg
                 .rotate_key(&req.old_public_key, &req.new_public_key)
                 .map_err(|e| match e {
                     RegistryError::UnknownDevice => Status::not_found(e.to_string()),
+                    RegistryError::Revoked => Status::permission_denied(e.to_string()),
                     RegistryError::InvalidKey | RegistryError::KeyInUse => {
                         Status::invalid_argument(e.to_string())
                     }
                     other => Status::internal(other.to_string()),
                 })?;
-            reg.set_tls_pin(&req.new_public_key, &tls_pin)
+            reg.set_tls_pins(&req.new_public_key, &tls_pins)
                 .map_err(|e| Status::internal(e.to_string()))?;
             ip
         };
@@ -860,6 +1032,7 @@ mod tests {
                 old_public_key: "A".into(),
                 new_public_key: "A2".into(),
                 new_tls_cert_sha256: "ef".repeat(32),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1224,6 +1397,113 @@ mod tests {
         assert_eq!(tags, vec!["dev".to_string()]);
     }
 
+    /// SEC-007: pre-announced next pins reach peers alongside the current pin
+    /// (normalized, deduplicated), bad ones are refused, a registration
+    /// replaces them, and the rotation that completes the roll promotes the
+    /// next pin to current and clears the announcement.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn next_tls_pins_are_distributed_and_completed_by_rotation() {
+        let registry = Arc::new(Mutex::new(Registry::new(Ipv4Addr::new(10, 8, 0, 0), 24)));
+        let svc = CoordinatorService::new(registry);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(CoordinatorServer::new(svc))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let mut client = CoordinatorClient::connect(format!("http://{addr}"))
+            .await
+            .unwrap();
+
+        let (p1, p2) = ("11".repeat(32), "22".repeat(32));
+        let register = |pk: &str, current: &str, next: Vec<String>| RegisterDeviceRequest {
+            public_key: pk.into(),
+            name: pk.into(),
+            endpoint: "1.1.1.1:51820".into(),
+            tls_cert_sha256: current.into(),
+            tls_next_pins: next,
+            ..Default::default()
+        };
+        async fn pins_of(
+            client: &mut CoordinatorClient<tonic::transport::Channel>,
+            pk: &str,
+        ) -> (String, Vec<String>) {
+            let map = client
+                .get_network_map(NetworkMapRequest {
+                    public_key: "B".into(),
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            let p = map
+                .peers
+                .into_iter()
+                .find(|p| p.public_key == pk)
+                .expect("peer in map");
+            (p.tls_cert_sha256, p.tls_next_pins)
+        }
+
+        client
+            .register_device(register("B", "", vec![]))
+            .await
+            .unwrap();
+        // The openssl form is normalized; a duplicate and a copy of the
+        // current pin are dropped.
+        let p2_openssl = vec!["22"; 32].join(":");
+        client
+            .register_device(register("A", &p1, vec![p2_openssl, p2.clone(), p1.clone()]))
+            .await
+            .unwrap();
+        assert_eq!(
+            pins_of(&mut client, "A").await,
+            (p1.clone(), vec![p2.clone()])
+        );
+
+        for bad in [
+            vec!["not-a-pin".to_string()],
+            vec![String::new()],
+            (1..=5).map(|i| format!("{i:02}").repeat(32)).collect(),
+        ] {
+            let err = client
+                .register_device(register("A", &p1, bad.clone()))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{bad:?}");
+        }
+        assert_eq!(
+            pins_of(&mut client, "A").await,
+            (p1.clone(), vec![p2.clone()]),
+            "a refused registration changes nothing"
+        );
+
+        // Registration replaces the whole set, so an old client that
+        // re-registers without next pins withdraws them.
+        client
+            .register_device(register("A", &p1, vec![]))
+            .await
+            .unwrap();
+        assert_eq!(pins_of(&mut client, "A").await, (p1.clone(), vec![]));
+
+        // Announce, then complete the roll: the next pin becomes current.
+        client
+            .register_device(register("A", &p1, vec![p2.clone()]))
+            .await
+            .unwrap();
+        client
+            .rotate_key(RotateKeyRequest {
+                old_public_key: "A".into(),
+                new_public_key: "A2".into(),
+                new_tls_cert_sha256: p2.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(pins_of(&mut client, "A2").await, (p2, vec![]));
+    }
+
     /// SEC-002: a verified token cannot register a second/unbound public key —
     /// a leaked or replayed token can't be used to swap in an attacker-chosen
     /// key — but the same identity's own `rotate_key` call (the authorized
@@ -1362,5 +1642,430 @@ mod tests {
             ))
             .await
             .unwrap();
+    }
+
+    // ---- SEC-013: per-RPC key binding, relay role, durable revocation ----
+
+    /// Serve `svc` on loopback and return a connected client.
+    async fn start(svc: CoordinatorService) -> CoordinatorClient<tonic::transport::Channel> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(CoordinatorServer::new(svc))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        CoordinatorClient::connect(format!("http://{addr}"))
+            .await
+            .unwrap()
+    }
+
+    fn device(key: &str) -> RegisterDeviceRequest {
+        RegisterDeviceRequest {
+            public_key: key.into(),
+            name: key.into(),
+            endpoint: "1.1.1.1:51820".into(),
+            ..Default::default()
+        }
+    }
+
+    /// A limiter shape that never refills within a test's lifetime.
+    fn no_refill(burst: u32) -> crate::limits::RateSpec {
+        crate::limits::RateSpec::new(burst, 1e-9)
+    }
+
+    fn register_req(key: &str) -> RegisterDeviceRequest {
+        RegisterDeviceRequest {
+            public_key: key.into(),
+            name: "d".into(),
+            endpoint: "1.1.1.1:51820".into(),
+            ..Default::default()
+        }
+    }
+
+    fn map_req(key: &str) -> NetworkMapRequest {
+        NetworkMapRequest {
+            public_key: key.into(),
+        }
+    }
+
+    #[cfg(feature = "oidc")]
+    fn candidates(key: &str) -> PublishCandidatesRequest {
+        PublishCandidatesRequest {
+            public_key: key.into(),
+            candidates: vec!["203.0.113.66:4444".into()],
+        }
+    }
+
+    /// An OIDC-protected service plus a token minter.
+    #[cfg(feature = "oidc")]
+    struct Oidc {
+        signer: crate::auth::testsign::TestSigner,
+    }
+
+    #[cfg(feature = "oidc")]
+    impl Oidc {
+        fn new() -> Self {
+            Self {
+                signer: crate::auth::testsign::TestSigner::new("k1"),
+            }
+        }
+
+        fn service(&self, registry: Arc<Mutex<Registry>>) -> CoordinatorService {
+            let verifier = std::sync::Arc::new(
+                self.signer
+                    .verifier("https://idp.example", "ferrum-coordinator"),
+            );
+            CoordinatorService::with_auth(registry, verifier)
+        }
+
+        /// A token for `sub` carrying `tags`.
+        fn token(&self, sub: &str, tags: &[&str]) -> String {
+            let exp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3600;
+            let tags: Vec<String> = tags.iter().map(|t| format!("\"{t}\"")).collect();
+            self.signer.sign(&format!(
+                r#"{{"iss":"https://idp.example","aud":"ferrum-coordinator","sub":"{sub}","exp":{exp},"tags":[{}]}}"#,
+                tags.join(",")
+            ))
+        }
+    }
+
+    #[cfg(feature = "oidc")]
+    fn authed<T>(msg: T, token: &str) -> Request<T> {
+        let mut r = Request::new(msg);
+        r.metadata_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+        r
+    }
+
+    /// SEC-013: with auth on, a device may publish candidates for, fetch, or
+    /// watch only the key bound to its own identity. Another device (or an
+    /// authenticated caller that never registered) is refused.
+    #[cfg(feature = "oidc")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rpcs_are_bound_to_the_callers_own_key() {
+        let oidc = Oidc::new();
+        let mut client = start(oidc.service(test_registry())).await;
+        let (alice, bob, carol) = (
+            oidc.token("alice", &[]),
+            oidc.token("bob", &[]),
+            oidc.token("carol", &[]),
+        );
+        client
+            .register_device(authed(device("AAA"), &alice))
+            .await
+            .unwrap();
+        client
+            .register_device(authed(device("BBB"), &bob))
+            .await
+            .unwrap();
+
+        fn denied<T>(r: Result<tonic::Response<T>, Status>) {
+            assert_eq!(
+                r.map(|_| ()).unwrap_err().code(),
+                tonic::Code::PermissionDenied
+            );
+        }
+        // Bob acting as Alice: refused on every key-taking RPC.
+        denied(
+            client
+                .publish_candidates(authed(candidates("AAA"), &bob))
+                .await,
+        );
+        denied(client.get_network_map(authed(map_req("AAA"), &bob)).await);
+        denied(client.watch_network_map(authed(map_req("AAA"), &bob)).await);
+        // An authenticated identity with no registration at all: refused too.
+        denied(client.get_network_map(authed(map_req("AAA"), &carol)).await);
+
+        // Each acting for its own key: fine, and Bob's attempt changed nothing.
+        client
+            .publish_candidates(authed(candidates("BBB"), &bob))
+            .await
+            .unwrap();
+        let map = client
+            .get_network_map(authed(map_req("AAA"), &alice))
+            .await
+            .unwrap()
+            .into_inner();
+        let bob_seen = map.peers.iter().find(|p| p.public_key == "BBB").unwrap();
+        assert_eq!(bob_seen.candidates, vec!["203.0.113.66:4444".to_string()]);
+        let map = client
+            .get_network_map(authed(map_req("BBB"), &bob))
+            .await
+            .unwrap()
+            .into_inner();
+        let alice_seen = map.peers.iter().find(|p| p.public_key == "AAA").unwrap();
+        assert!(
+            alice_seen.candidates.is_empty(),
+            "bob must not have set alice's"
+        );
+    }
+
+    /// SEC-013: announcing a relay (advertised to every device) needs the relay
+    /// role: the `relay` tag, or an identity on the operator's allowlist.
+    #[cfg(feature = "oidc")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn relay_heartbeat_requires_the_relay_role() {
+        let oidc = Oidc::new();
+        let svc = oidc
+            .service(test_registry())
+            .with_relay_identities(vec!["oidc:ops-relay".into()]);
+        let mut client = start(svc).await;
+        let beat = || RelayHeartbeatRequest {
+            addr: "198.51.100.7:3478".into(),
+            draining: false,
+        };
+
+        let err = client
+            .relay_heartbeat(authed(beat(), &oidc.token("alice", &["dev"])))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        client
+            .relay_heartbeat(authed(beat(), &oidc.token("relay-1", &[RELAY_TAG])))
+            .await
+            .unwrap();
+        client
+            .relay_heartbeat(authed(beat(), &oidc.token("ops-relay", &[])))
+            .await
+            .unwrap();
+    }
+
+    /// SEC-013: a revocation is durable. The same token can't re-register the
+    /// key or bind a fresh one; other identities are unaffected; unrevoke
+    /// restores both.
+    #[cfg(feature = "oidc")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revoked_device_cannot_re_register_until_unrevoked() {
+        let oidc = Oidc::new();
+        let registry = test_registry();
+        let mut client = start(oidc.service(registry.clone())).await;
+        let (alice, bob) = (oidc.token("alice", &[]), oidc.token("bob", &[]));
+        client
+            .register_device(authed(device("AAA"), &alice))
+            .await
+            .unwrap();
+
+        registry.lock().unwrap().revoke("AAA").unwrap();
+        for key in ["AAA", "ZZZ"] {
+            let err = client
+                .register_device(authed(device(key), &alice))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::PermissionDenied, "{key}");
+        }
+        client
+            .register_device(authed(device("BBB"), &bob))
+            .await
+            .unwrap();
+
+        assert!(registry.lock().unwrap().unrevoke("AAA").unwrap());
+        client
+            .register_device(authed(device("AAA"), &alice))
+            .await
+            .unwrap();
+    }
+
+    fn test_registry() -> Arc<Mutex<Registry>> {
+        Arc::new(Mutex::new(Registry::new(Ipv4Addr::new(10, 8, 0, 0), 24)))
+    }
+
+    /// SEC-013 in open mode: a revoked key can't re-register or fetch its map,
+    /// and its already-open watch stream is closed with `permission_denied`
+    /// instead of receiving the mesh map.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revocation_closes_the_watch_stream_and_blocks_the_key() {
+        let registry = test_registry();
+        let svc = CoordinatorService::new(registry.clone());
+        let changes = svc.changes();
+        let mut client = start(svc).await;
+        client.register_device(device("AAA")).await.unwrap();
+        client.register_device(device("BBB")).await.unwrap();
+        let mut stream = client
+            .watch_network_map(map_req("AAA"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(stream.message().await.unwrap().is_some(), "initial map");
+
+        registry.lock().unwrap().revoke("AAA").unwrap();
+        let _ = changes.send(()); // what the admin API does after a revoke
+        let err = tokio::time::timeout(Duration::from_secs(5), stream.message())
+            .await
+            .expect("stream must react to the revocation")
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        let err = client.register_device(device("AAA")).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        let err = client.get_network_map(map_req("AAA")).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    /// SEC-006: a registration flood from one source is throttled with
+    /// `resource_exhausted` once its burst is spent, and counted in the
+    /// aggregate metric; admitted registrations still count as handled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registration_flood_is_throttled_per_source() {
+        let limits = LimitsConfig {
+            register_per_source: no_refill(3),
+            ..LimitsConfig::default()
+        };
+        let svc = CoordinatorService::new(test_registry()).with_limits(&limits);
+        let metrics = svc.metrics();
+        let mut client = start(svc).await;
+
+        for i in 0..3 {
+            client
+                .register_device(register_req(&format!("K{i}")))
+                .await
+                .unwrap();
+        }
+        for i in 3..6 {
+            let err = client
+                .register_device(register_req(&format!("K{i}")))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::ResourceExhausted, "{err:?}");
+        }
+        let text = metrics.render(3);
+        assert!(
+            text.contains("ferrum_register_throttled_total 3\n"),
+            "{text}"
+        );
+        assert!(text.contains("ferrum_register_total 3\n"), "{text}");
+    }
+
+    /// SEC-006: a heartbeat flood is throttled the same way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn relay_heartbeat_flood_is_throttled_per_source() {
+        let limits = LimitsConfig {
+            heartbeat_per_source: no_refill(2),
+            ..LimitsConfig::default()
+        };
+        let svc = CoordinatorService::new(test_registry()).with_limits(&limits);
+        let metrics = svc.metrics();
+        let mut client = start(svc).await;
+        let beat = || RelayHeartbeatRequest {
+            addr: "198.51.100.1:3478".into(),
+            draining: false,
+        };
+
+        client.relay_heartbeat(beat()).await.unwrap();
+        client.relay_heartbeat(beat()).await.unwrap();
+        let err = client.relay_heartbeat(beat()).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted, "{err:?}");
+        assert!(metrics
+            .render(0)
+            .contains("ferrum_relay_heartbeat_throttled_total 1\n"));
+    }
+
+    /// SEC-006: concurrent watch streams past the per-source cap are refused,
+    /// and closing one frees its slot promptly (not only at the next map push).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn excess_watch_streams_are_refused_and_slots_are_released() {
+        let limits = LimitsConfig {
+            watch_streams_per_source: 2,
+            ..LimitsConfig::default()
+        };
+        let svc = CoordinatorService::new(test_registry()).with_limits(&limits);
+        let metrics = svc.metrics();
+        let mut client = start(svc).await;
+        let watch_req = || NetworkMapRequest {
+            public_key: "AAA".into(),
+        };
+
+        let mut first = client
+            .watch_network_map(watch_req())
+            .await
+            .unwrap()
+            .into_inner();
+        first.message().await.unwrap().expect("initial map");
+        let mut second = client
+            .watch_network_map(watch_req())
+            .await
+            .unwrap()
+            .into_inner();
+        second.message().await.unwrap().expect("initial map");
+
+        let err = client.watch_network_map(watch_req()).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted, "{err:?}");
+        assert!(metrics
+            .render(0)
+            .contains("ferrum_watch_streams_rejected_total 1\n"));
+
+        // Close one stream with no registry change afterwards: the slot must
+        // still come back.
+        drop(first);
+        let mut reopened = None;
+        for _ in 0..100 {
+            match client.watch_network_map(watch_req()).await {
+                Ok(s) => {
+                    reopened = Some(s.into_inner());
+                    break;
+                }
+                Err(e) => {
+                    assert_eq!(e.code(), tonic::Code::ResourceExhausted);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+        let mut reopened = reopened.expect("closing a stream must release its slot");
+        reopened.message().await.unwrap().expect("initial map");
+        drop(second);
+    }
+
+    /// SEC-006: with OIDC on, the per-identity limit applies independently of
+    /// the source: one subject's flood doesn't throttle another subject behind
+    /// the same address.
+    #[cfg(feature = "oidc")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registration_limit_is_per_identity_when_authenticated() {
+        use crate::auth::testsign::TestSigner;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let signer = TestSigner::new("k1");
+        let verifier =
+            std::sync::Arc::new(signer.verifier("https://idp.example", "ferrum-coordinator"));
+        let limits = LimitsConfig {
+            register_per_identity: no_refill(2),
+            ..LimitsConfig::default()
+        };
+        let svc = CoordinatorService::with_auth(test_registry(), verifier).with_limits(&limits);
+        let mut client = start(svc).await;
+
+        let exp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let token_for = |sub: &str| {
+            signer.sign(&format!(
+                r#"{{"iss":"https://idp.example","aud":"ferrum-coordinator","sub":"{sub}","exp":{exp}}}"#
+            ))
+        };
+        let authed = |key: &str, token: &str| {
+            let mut r = Request::new(register_req(key));
+            r.metadata_mut()
+                .insert("authorization", format!("Bearer {token}").parse().unwrap());
+            r
+        };
+        let (alice, bob) = (token_for("alice"), token_for("bob"));
+
+        client.register_device(authed("AAA", &alice)).await.unwrap();
+        client.register_device(authed("AAA", &alice)).await.unwrap();
+        let err = client
+            .register_device(authed("AAA", &alice))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted, "{err:?}");
+        // Same source, different identity: unaffected.
+        client.register_device(authed("BBB", &bob)).await.unwrap();
     }
 }

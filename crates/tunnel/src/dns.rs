@@ -106,6 +106,9 @@ fn restore_resolv_conf(conf: &Path, backup: &Path) -> io::Result<()> {
 /// systemd-resolved when available, else the `/etc/resolv.conf` swap.
 #[cfg(target_os = "linux")]
 pub fn set_dns(iface: &str, servers: &[IpAddr]) -> io::Result<()> {
+    // `iface` is an argv element (no shell), but it could still be read as an
+    // option, and it may come from an unprivileged helper client (SEC-012).
+    crate::ifname::validate(iface)?;
     if servers.is_empty() {
         return Err(io::Error::other("no DNS servers to set"));
     }
@@ -127,6 +130,7 @@ pub fn set_dns(iface: &str, servers: &[IpAddr]) -> io::Result<()> {
 /// disconnect — including cleaning up after a crashed previous session.
 #[cfg(target_os = "linux")]
 pub fn restore_dns(iface: &str) -> io::Result<()> {
+    crate::ifname::validate(iface)?;
     // The revert fails harmlessly when resolvectl/the link isn't there.
     let _ = run_resolvectl(&resolvectl_revert_args(iface));
     restore_resolv_conf(Path::new(RESOLV_CONF), Path::new(RESOLV_CONF_BACKUP))

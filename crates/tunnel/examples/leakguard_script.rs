@@ -26,10 +26,9 @@ fn main() {
                 .unwrap_or_else(|e| panic!("bad dns_ip '{a}': {e}"))
         })
         .collect();
-    print!(
-        "{}",
-        ferrum_tunnel::leakguard::engage_script(&iface, &dns, block_ipv6)
-    );
+    let script = ferrum_tunnel::leakguard::engage_script(&iface, &dns, block_ipv6)
+        .unwrap_or_else(|e| panic!("{e}"));
+    print!("{script}");
 }
 
 #[cfg(not(target_os = "linux"))]

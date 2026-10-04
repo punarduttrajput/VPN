@@ -237,6 +237,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // Relay role (SEC-013): with authentication on, only a token carrying the
+    // `relay` tag may announce a relay (it's advertised to every device). An
+    // mTLS-only deployment's client certs carry no tags, so their relays are
+    // allowed by identity instead: `--relay-identity mtls:<sha256 hex>,...`
+    // (or `oidc:<sub>`), comma-separated.
+    let svc = match arg_value("--relay-identity") {
+        Some(list) => {
+            let identities: Vec<String> = list
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            for id in &identities {
+                if !(id.starts_with("mtls:") || id.starts_with("oidc:")) {
+                    return Err(format!(
+                        "--relay-identity '{id}' must be 'mtls:<sha256 hex>' or 'oidc:<sub>'"
+                    )
+                    .into());
+                }
+            }
+            info!(
+                count = identities.len(),
+                "relay role granted to listed identities"
+            );
+            svc.with_relay_identities(identities)
+        }
+        None => svc,
+    };
+
     // Advertise DNS resolvers (PRD leak-protection.md): every device points its
     // system DNS at them through the tunnel while connected, unless locally
     // overridden. Bare IPs (comma-separated), validated so a typo fails fast.
@@ -295,11 +324,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
             }
         };
+        // SEC-014: admin tokens are for their own audience, never the device
+        // audience (`--admin-audience`, default `<audience>-admin`).
+        let admin_audience = ferrum_coordinator::resolve_admin_audience(
+            &audience,
+            arg_value("--admin-audience").as_deref(),
+        )?;
         let jwks_doc = std::fs::read_to_string(&jwks_path)?;
         let jwks = ferrum_coordinator::Jwks::from_json(&jwks_doc)?;
         let verifier = Arc::new(ferrum_coordinator::OidcVerifier::new(
-            &issuer, &audience, jwks,
+            &issuer,
+            &admin_audience,
+            jwks,
         ));
+        info!(audience = %admin_audience, "admin API accepts tokens for its own audience only");
         let router = ferrum_coordinator::admin::router(admin_registry, admin_changes, verifier);
         info!(%addr, "admin API + panel listening");
         tokio::spawn(async move {

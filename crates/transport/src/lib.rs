@@ -7,11 +7,10 @@
 //! QUIC ([`quic`]) adds roaming and DPI-evasion. MASQUE/HTTP3, connection
 //! migration, and padding are later Phase 2 increments.
 //!
-//! `unsafe` is denied crate-wide; the only exceptions are the two Linux-only
-//! `sendmmsg(2)` FFI helpers in [`udp`], each annotated `#[allow(unsafe_code)]`
-//! with a `// SAFETY:` justification. (`deny`, not `forbid`, so those localized
-//! allows are permitted; everything else still fails to compile on `unsafe`.)
-#![deny(unsafe_code)]
+//! `unsafe` is **forbidden** crate-wide (SEC-016): the UDP batch-I/O offloads
+//! that used to be hand-rolled `sendmsg`/`recvmsg`/`sendmmsg` FFI now go
+//! through `quinn-udp`, so no exceptions remain.
+#![forbid(unsafe_code)]
 
 use std::net::SocketAddr;
 
@@ -63,7 +62,11 @@ pub use quic_mesh::QuicMeshTransport;
 #[cfg(feature = "masque")]
 pub mod masque;
 #[cfg(feature = "masque")]
-pub use masque::{MasqueMeshTransport, MasqueProxy, MasqueTransport};
+pub use masque::{MasqueMeshTransport, MasqueProxy, MasqueTransport, ProxyAuthorizer};
+#[cfg(feature = "masque")]
+pub mod masque_policy;
+#[cfg(feature = "masque")]
+pub use masque_policy::{IpNet, TargetPolicy};
 
 /// Errors produced by a transport.
 #[derive(Debug, Error)]
