@@ -437,13 +437,15 @@ where
             .await
         }
     }
-    .map_err(|e| format!("data plane: {e}"))
 }
 
 /// Run the supervised (always-on) mesh session over a chosen transport. Generic
 /// over the concrete `MeshTransport` (the runner monomorphizes per type); the TUN
 /// factory is built from `tun_cfg` (a session consumes and closes its device, so
 /// each reconnect reopens it). `shutdown` winds the whole supervisor down.
+/// Errors come back as the user-facing `data plane: …` string: every caller
+/// wanted that, and it keeps `ferrum_client_core::Error` (which embeds a large
+/// `tonic::Status`) out of this function's return type.
 // Nine independent inputs (identity, keys, TUN config, the transport factory,
 // NAT-traversal candidates + relay, and shutdown). Grouping them into a struct
 // would only move the noise, so allow the lint — mirroring the data-plane runner.
@@ -458,7 +460,7 @@ async fn supervise_session<M, MkM, FutM, F>(
     candidates: Vec<String>,
     relay: Option<String>,
     shutdown: F,
-) -> Result<(), ferrum_client_core::Error>
+) -> Result<(), String>
 where
     M: MeshTransport + Send + 'static,
     MkM: FnMut() -> FutM + Send,
@@ -482,6 +484,7 @@ where
         shutdown,
     )
     .await
+    .map_err(|e| format!("data plane: {e}"))
 }
 
 #[cfg(test)]
