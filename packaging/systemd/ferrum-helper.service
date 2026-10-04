@@ -5,8 +5,11 @@ After=network.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/ferrum-helper --socket /run/ferrum/helper.sock --group ferrum
-# Creates and owns /run/ferrum (mode 0750, root:root) before ExecStart; the
-# daemon itself chowns the socket inside it to the `ferrum` group.
+# Still uid 0 (TUN/nft/DNS need root); the `ferrum` primary gid makes systemd
+# create /run/ferrum as root:ferrum 0750 below, so group members can reach the
+# socket inside it — and the unit fails to start if the group doesn't exist
+# (the daemon itself also refuses to start without it; SEC-005).
+Group=ferrum
 RuntimeDirectory=ferrum
 RuntimeDirectoryMode=0750
 Restart=on-failure

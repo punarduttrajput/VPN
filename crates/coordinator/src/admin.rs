@@ -6,16 +6,21 @@
 //! `WatchNetworkMap` streams — a separate process touching the SQLite file
 //! directly would have no way to notify them.
 //!
-//! **Auth**: every `/api/*` route requires a bearer JWT verified by the same
-//! [`crate::auth::OidcVerifier`] used for device auth, whose claims must
-//! additionally include the `"admin"` tag. There is no other auth mode: the
-//! caller (`main.rs`) refuses to start the admin listener at all if OIDC isn't
-//! configured, rather than serving this surface unauthenticated.
+//! **Auth**: every `/api/*` route sits behind one middleware layer
+//! ([`require_admin`]) that requires a bearer JWT for the admin API's **own
+//! audience** (`--admin-audience`, never the device audience), carrying the
+//! `"admin"` role in its explicit `tags` claim (SEC-014). A device token, or an
+//! IdP *group* that happens to be named `admin`, doesn't qualify. Because the
+//! check is a layer rather than a call inside each handler, a new route can't
+//! forget it. There is no other auth mode: the caller (`main.rs`) refuses to
+//! start the admin listener at all if OIDC isn't configured, rather than
+//! serving this surface unauthenticated.
 
 use std::sync::{Arc, Mutex};
 
-use axum::extract::State;
+use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -23,7 +28,7 @@ use rust_embed::RustEmbed;
 use serde::Deserialize;
 use tokio::sync::broadcast;
 
-use crate::auth::OidcVerifier;
+use crate::auth::{AuthError, OidcVerifier};
 use crate::policy::Policy;
 use crate::registry::{Device, Registry, RegistryError};
 
@@ -51,7 +56,14 @@ pub fn router(
     Router::new()
         .route("/api/devices", get(list_devices))
         .route("/api/devices/revoke", axum::routing::post(revoke_device))
+        .route(
+            "/api/devices/unrevoke",
+            axum::routing::post(unrevoke_device),
+        )
         .route("/api/policy", get(get_policy).put(put_policy))
+        // Every route above requires the admin role; the static fallback below
+        // (the panel's own assets) is deliberately outside the layer.
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_admin))
         // Anything that isn't an /api/* route falls through to here — the
         // embedded Angular build, with an index.html fallback for its
         // client-side routes (/devices, /policy, a hard refresh on either).
@@ -80,20 +92,28 @@ fn authorize(headers: &HeaderMap, state: &AdminState) -> Result<(), Response> {
                 .or_else(|| h.strip_prefix("bearer "))
         })
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, "missing bearer token").into_response())?;
-    let claims = state
-        .verifier
-        .verify(token)
-        .map_err(|e| (StatusCode::UNAUTHORIZED, format!("token rejected: {e}")).into_response())?;
-    if !claims.tags.iter().any(|t| t == "admin") {
-        return Err((StatusCode::FORBIDDEN, "token lacks the admin tag").into_response());
+    match state.verifier.verify_role(token, ADMIN_ROLE) {
+        Ok(_) => Ok(()),
+        Err(AuthError::MissingRole(_)) => {
+            Err((StatusCode::FORBIDDEN, "token lacks the admin tag").into_response())
+        }
+        Err(e) => Err((StatusCode::UNAUTHORIZED, format!("token rejected: {e}")).into_response()),
     }
-    Ok(())
 }
 
-async fn list_devices(State(state): State<AdminState>, headers: HeaderMap) -> Response {
-    if let Err(resp) = authorize(&headers, &state) {
+/// The role (an entry in the token's `tags` claim) the admin API requires.
+const ADMIN_ROLE: &str = "admin";
+
+/// Middleware on every `/api` route: reject the request unless [`authorize`]
+/// accepts its bearer token.
+async fn require_admin(State(state): State<AdminState>, req: Request, next: Next) -> Response {
+    if let Err(resp) = authorize(req.headers(), &state) {
         return resp;
     }
+    next.run(req).await
+}
+
+async fn list_devices(State(state): State<AdminState>) -> Response {
     let devices: Vec<Device> = state
         .registry
         .lock()
@@ -109,17 +129,15 @@ struct RevokeRequest {
 
 async fn revoke_device(
     State(state): State<AdminState>,
-    headers: HeaderMap,
     Json(body): Json<RevokeRequest>,
 ) -> Response {
-    if let Err(resp) = authorize(&headers, &state) {
-        return resp;
-    }
     let result = state
         .registry
         .lock()
         .expect("registry mutex poisoned")
-        .remove(&body.public_key);
+        // Durable (SEC-013): the key and its bound identity stay refused until
+        // an explicit unrevoke, so the same token can't simply re-register.
+        .revoke(&body.public_key);
     match result {
         Ok(()) => {
             // A revoked device must vanish from every connected peer's map now,
@@ -134,10 +152,25 @@ async fn revoke_device(
     }
 }
 
-async fn get_policy(State(state): State<AdminState>, headers: HeaderMap) -> Response {
-    if let Err(resp) = authorize(&headers, &state) {
-        return resp;
+/// Lift a revocation (SEC-013): the key, and any identity revoked with it, may
+/// register again. `404` if the key isn't revoked.
+async fn unrevoke_device(
+    State(state): State<AdminState>,
+    Json(body): Json<RevokeRequest>,
+) -> Response {
+    let result = state
+        .registry
+        .lock()
+        .expect("registry mutex poisoned")
+        .unrevoke(&body.public_key);
+    match result {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "key is not revoked").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+async fn get_policy(State(state): State<AdminState>) -> Response {
     let policy: Policy = state
         .registry
         .lock()
@@ -146,14 +179,7 @@ async fn get_policy(State(state): State<AdminState>, headers: HeaderMap) -> Resp
     Json(policy).into_response()
 }
 
-async fn put_policy(
-    State(state): State<AdminState>,
-    headers: HeaderMap,
-    Json(policy): Json<Policy>,
-) -> Response {
-    if let Err(resp) = authorize(&headers, &state) {
-        return resp;
-    }
+async fn put_policy(State(state): State<AdminState>, Json(policy): Json<Policy>) -> Response {
     state
         .registry
         .lock()
@@ -245,6 +271,55 @@ mod tests {
         signer.sign(&format!(
             r#"{{"iss":"https://idp.example","aud":"ferrum-admin","sub":"bob","exp":{exp},"tags":["dev"]}}"#
         ))
+    }
+
+    /// SEC-014: an `admin` *group* (the IdP's `groups` claim, which device ACL
+    /// tags fall back to) doesn't grant the admin API, and neither does an
+    /// otherwise-perfect admin token minted for a different (device) audience.
+    /// Every `/api` route is covered by the one middleware layer.
+    #[tokio::test]
+    async fn admin_role_needs_the_tags_claim_and_the_admin_audience() {
+        let signer = TestSigner::new("k1");
+        let (_registry, router) =
+            state_and_router(signer.verifier("https://idp.example", "ferrum-admin"));
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let group_admin = signer.sign(&format!(
+            r#"{{"iss":"https://idp.example","aud":"ferrum-admin","sub":"eve","exp":{exp},"groups":["admin"]}}"#
+        ));
+        let device_audience = signer.sign(&format!(
+            r#"{{"iss":"https://idp.example","aud":"ferrum-coordinator","sub":"eve","exp":{exp},"tags":["admin"]}}"#
+        ));
+        for (token, want) in [
+            (group_admin, StatusCode::FORBIDDEN),
+            (device_audience, StatusCode::UNAUTHORIZED),
+        ] {
+            for (method, uri) in [
+                ("GET", "/api/devices"),
+                ("POST", "/api/devices/revoke"),
+                ("POST", "/api/devices/unrevoke"),
+                ("GET", "/api/policy"),
+                ("PUT", "/api/policy"),
+            ] {
+                let resp = router
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri(uri)
+                            .header("authorization", format!("Bearer {token}"))
+                            .header("content-type", "application/json")
+                            .body(Body::from("{}"))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), want, "{method} {uri}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -358,6 +433,57 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// SEC-013: an admin revoke is durable (the key can't re-register) until
+    /// `/api/devices/unrevoke` lifts it; unrevoking a key that isn't revoked
+    /// is a 404.
+    #[tokio::test]
+    async fn revoke_is_durable_until_unrevoked() {
+        let signer = TestSigner::new("k1");
+        let (registry, router) =
+            state_and_router(signer.verifier("https://idp.example", "ferrum-admin"));
+        registry
+            .lock()
+            .unwrap()
+            .register("AAA", "laptop", "1.1.1.1:51820", &[])
+            .unwrap();
+        let token = admin_token(&signer, 3600);
+        let post = |uri: &str| {
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"public_key":"AAA"}"#))
+                .unwrap()
+        };
+
+        let resp = router
+            .clone()
+            .oneshot(post("/api/devices/revoke"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            registry.lock().unwrap().register("AAA", "laptop", "", &[]),
+            Err(RegistryError::Revoked)
+        );
+
+        let resp = router
+            .clone()
+            .oneshot(post("/api/devices/unrevoke"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        registry
+            .lock()
+            .unwrap()
+            .register("AAA", "laptop", "", &[])
+            .unwrap();
+
+        let resp = router.oneshot(post("/api/devices/unrevoke")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 

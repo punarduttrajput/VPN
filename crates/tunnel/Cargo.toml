@@ -38,11 +38,12 @@ tun = { version = "0.6", features = ["async"], optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { version = "1", optional = true }
 
-# Raw fd I/O for `device::from_fd` (a platform-provided TUN fd, Phase 5) and
-# `fdpass`/`helper_proto`/`firewall` (Phase 5 privileged helper). Unix only;
-# needs no driver, so it's not behind `real-tun`.
+# fd I/O for `device::from_fd` (a platform-provided TUN fd, Phase 5) and
+# `fdpass`/`helper_proto` (Phase 5 privileged helper). Unix only; needs no
+# driver, so it's not behind `real-tun`. SEC-016: rustix's safe, typed wrappers
+# replaced the hand-rolled libc FFI (rustix is already in the tree).
 [target.'cfg(unix)'.dependencies]
-libc.workspace = true
+rustix = { version = "1.1", features = ["net"] }
 
 [dev-dependencies]
 ferrum-transport = { path = "../transport" }

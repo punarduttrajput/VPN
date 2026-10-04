@@ -217,3 +217,17 @@ groups:
         annotations:
           summary: "Sustained auth-rejected RPCs at the coordinator"
           description: "{{ $value | humanize }} unauthenticated RPCs/s over 10m — possible misconfigured client or credential-stuffing attempt."
+
+      # SEC-006: the coordinator's rate limits / stream quota refusing work for
+      # a sustained period — a flood, or limits too tight for the fleet.
+      - alert: FerrumCoordinatorThrottlingSpike
+        expr: >
+          sum(rate(ferrum_register_throttled_total[5m]))
+          + sum(rate(ferrum_relay_heartbeat_throttled_total[5m]))
+          + sum(rate(ferrum_watch_streams_rejected_total[5m])) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sustained rate-limited / quota-refused RPCs at the coordinator"
+          description: "{{ $value | humanize }} throttled RPCs/s over 10m — a registration/heartbeat/watch flood, or limits too tight for the fleet (see LimitsConfig)."

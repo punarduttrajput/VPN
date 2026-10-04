@@ -28,18 +28,29 @@ alg/key-type pairing is sound (no `none`/HS256 confusion), but:
 
 ## Acceptance criteria
 
-- [ ] Signature and standard-claim validation use `jsonwebtoken` (algorithms
+- [x] Signature and standard-claim validation use `jsonwebtoken` (algorithms
       pinned to RS256/ES256, `iss`/`aud`/`exp`/`nbf` validated, leeway kept at
       60 s). The hand-rolled verifier is deleted; Ferrum's tag/subject policy
-      stays as a thin layer on top.
-- [ ] `exp` required; non-empty `sub` required.
-- [ ] Admin API requires a **separate** audience (e.g. `--admin-audience`,
+      stays as a thin layer on top. *(**jsonwebtoken 9.3 on its `ring`
+      backend**: 10+/11 have no ring backend, and 11's `rust_crypto` backend
+      can't resolve next to boringtun 0.6's exact `x25519-dalek =2.0.0-rc.3` pin.
+      Move to 11.x with a boringtun 0.7 upgrade. The algorithm is pinned by the
+      selected key, not the token header. JWKS entries with `use: enc` or a
+      mismatched `alg` are skipped.)*
+- [x] `exp` required; non-empty `sub` required. *(`iss` and `aud` too.)*
+- [x] Admin API requires a **separate** audience (e.g. `--admin-audience`,
       defaulting to `<audience>-admin`) *and* the admin role; the role comes
       only from the `tags` claim, never the `groups` fallback. Enforced by an
-      axum middleware layer on every `/api` route.
-- [ ] Existing auth tests pass unchanged, plus new ones: RS256, missing `exp`,
+      axum middleware layer on every `/api` route. *(`resolve_admin_audience`
+      refuses an admin audience equal to the device one; `verify_role`;
+      `require_admin` route layer.)*
+- [x] Existing auth tests pass unchanged, plus new ones: RS256, missing `exp`,
       missing `sub`, `nbf` in the future, `kid` selection, device token refused
       by the admin API.
+
+**Operator-visible:** admin tokens minted for the device audience stop working;
+re-mint them for the admin audience. `deploy/oracle-vm` gains
+`OIDC_ADMIN_AUDIENCE=ferrum-panel` (README has an upgrade note).
 
 ## Implementation notes
 

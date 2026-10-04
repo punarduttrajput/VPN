@@ -24,7 +24,11 @@ pub const TABLE: &str = "ferrum_killswitch";
 /// `allow_ips` (the coordinator/relay endpoints, so reconnect still works).
 ///
 /// Pure (no I/O) so the rule logic is unit-testable without root or a live `nft`.
-pub fn engage_script(iface: &str, allow_ips: &[IpAddr]) -> String {
+/// Fails (`InvalidInput`) on an unsafe interface name rather than interpolate
+/// it: `iface` can come from an unprivileged helper client, and the script runs
+/// as root (SEC-012).
+pub fn engage_script(iface: &str, allow_ips: &[IpAddr]) -> io::Result<String> {
+    crate::ifname::validate(iface)?;
     let mut allow = String::new();
     for ip in allow_ips {
         match ip {
@@ -34,7 +38,7 @@ pub fn engage_script(iface: &str, allow_ips: &[IpAddr]) -> String {
     }
     // Flush first so re-engaging is idempotent (a prior table is replaced, not
     // duplicated). Policy `drop` blocks everything not explicitly accepted.
-    format!(
+    Ok(format!(
         "add table inet {TABLE}
 delete table inet {TABLE}
 table inet {TABLE} {{
@@ -45,7 +49,7 @@ table inet {TABLE} {{
 {allow}  }}
 }}
 "
-    )
+    ))
 }
 
 /// Arguments to `nft` that remove the kill-switch table (disengage / teardown).
@@ -100,7 +104,7 @@ pub fn run_nft(args: &[&str]) -> io::Result<()> {
 
 /// Engage the kill-switch on `iface`: build and run the `nft` script in one call.
 pub fn engage(iface: &str, allow_ips: &[IpAddr]) -> io::Result<()> {
-    run_nft_script(&engage_script(iface, allow_ips))
+    run_nft_script(&engage_script(iface, allow_ips)?)
 }
 
 /// Disengage the kill-switch: remove our dedicated table in one call.
@@ -114,7 +118,7 @@ mod tests {
 
     #[test]
     fn engage_script_blocks_by_default_and_allows_loopback_and_iface() {
-        let s = engage_script("ferrum0", &[]);
+        let s = engage_script("ferrum0", &[]).unwrap();
         assert!(s.contains("policy drop"), "default must drop");
         assert!(s.contains("oifname \"lo\" accept"));
         assert!(s.contains("oifname \"ferrum0\" accept"));
@@ -127,9 +131,19 @@ mod tests {
     fn engage_script_allowlists_coordinator_addresses() {
         let v4: IpAddr = "203.0.113.7".parse().unwrap();
         let v6: IpAddr = "2001:db8::1".parse().unwrap();
-        let s = engage_script("ferrum0", &[v4, v6]);
+        let s = engage_script("ferrum0", &[v4, v6]).unwrap();
         assert!(s.contains("ip daddr 203.0.113.7 accept"));
         assert!(s.contains("ip6 daddr 2001:db8::1 accept"));
+    }
+
+    /// SEC-012: a name that would break out of the quoted `oifname` string is
+    /// refused, never interpolated into a script that runs as root.
+    #[test]
+    fn engage_script_refuses_an_injecting_interface_name() {
+        for bad in ["x\" accept; flush ruleset", "ferrum0\nflush ruleset", ""] {
+            let err = engage_script(bad, &[]).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{bad:?}");
+        }
     }
 
     #[test]

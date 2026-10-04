@@ -16,6 +16,18 @@
 //! [`MasqueMeshTransport`] is the multi-peer counterpart used by the mesh data
 //! plane: one CONNECT-UDP session per peer through a single proxy.
 //!
+//! **Access control (SEC-015).** A proxy that relays anywhere is an SSRF hop and a
+//! UDP reflector, so [`MasqueProxy`] enforces a [`TargetPolicy`] (default:
+//! public unicast targets only; private ranges must be allowlisted), validates
+//! that each request really is an extended CONNECT for `connect-udp`, and can
+//! require client authentication through a [`ProxyAuthorizer`] (the
+//! `authorization` bearer token the client sends via
+//! [`MasqueTransport::connect_with_token`] /
+//! [`MasqueMeshTransport::with_bearer_token`]). Without an authorizer it runs in
+//! **open mode**: any client may use it within the target policy. That's
+//! acceptable only on a network where reaching the proxy is itself the
+//! authorization, and it is logged at startup.
+//!
 //! RFC 9298/9297 conformance: the request/response carry `Capsule-Protocol: ?1`
 //! (RFC 9297 §3.4), the client accepts any 2xx as success, and the proxy parses
 //! the well-known path template (IPv4/IPv6 literals, bracketed or bare). Scope:
@@ -25,7 +37,7 @@
 //! needs a live proxy to confirm.
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -35,6 +47,7 @@ use quinn::{ClientConfig, Endpoint, ServerConfig};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
 
+use crate::masque_policy::TargetPolicy;
 use crate::tls::{self, Fingerprint, TlsIdentity};
 use crate::{MeshTransport, Transport, TransportError};
 
@@ -96,6 +109,20 @@ impl MasqueTransport {
         target: SocketAddr,
         pins: Vec<Fingerprint>,
     ) -> Result<Self, TransportError> {
+        Self::connect_with_token(local, proxy, authority, target, pins, None).await
+    }
+
+    /// [`connect`](Self::connect), presenting `token` as an
+    /// `authorization: Bearer <token>` header on the CONNECT-UDP request, for a
+    /// proxy that requires client authentication (SEC-015).
+    pub async fn connect_with_token(
+        local: SocketAddr,
+        proxy: SocketAddr,
+        authority: &str,
+        target: SocketAddr,
+        pins: Vec<Fingerprint>,
+        token: Option<&str>,
+    ) -> Result<Self, TransportError> {
         let mut endpoint = Endpoint::client(local).map_err(TransportError::Io)?;
         endpoint
             .set_default_client_config(ClientConfig::new(Arc::new(h3_client_crypto(pins, proxy)?)));
@@ -121,12 +148,14 @@ impl MasqueTransport {
         let uri: http::Uri = format!("https://{authority}{path}")
             .parse()
             .map_err(setup)?;
-        let mut req = http::Request::builder()
+        let mut builder = http::Request::builder()
             .method(http::Method::CONNECT)
             .uri(uri)
-            .header("capsule-protocol", "?1")
-            .body(())
-            .map_err(setup)?;
+            .header("capsule-protocol", "?1");
+        if let Some(token) = token {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        let mut req = builder.body(()).map_err(setup)?;
         req.extensions_mut().insert(h3::ext::Protocol::CONNECT_UDP);
 
         let mut req_stream = send_request.send_request(req).await.map_err(conn_err)?;
@@ -217,12 +246,23 @@ pub(crate) fn parse_connect_udp_target(path: &str) -> Option<SocketAddr> {
     Some(SocketAddr::new(ip, port))
 }
 
+/// Decides whether a CONNECT-UDP client may use the proxy (SEC-015). Given the
+/// bearer token from the request's `authorization` header (`None` if absent or
+/// not a bearer token), return `true` to allow. For example, check it against
+/// the coordinator's OIDC verifier, or compare it (in constant time) against a
+/// configured shared secret.
+pub type ProxyAuthorizer = Arc<dyn Fn(Option<&str>) -> bool + Send + Sync>;
+
 /// A MASQUE proxy that terminates HTTP/3 CONNECT-UDP sessions and relays each to
 /// the UDP target named in its request. Handles many concurrent sessions, one
 /// per QUIC connection — which is what a mesh node needs (one session per peer).
+/// Targets are limited by a [`TargetPolicy`] and clients optionally checked by a
+/// [`ProxyAuthorizer`] (see the module docs, SEC-015).
 pub struct MasqueProxy {
     endpoint: Endpoint,
     fingerprint: Fingerprint,
+    policy: Arc<TargetPolicy>,
+    authorizer: Option<ProxyAuthorizer>,
 }
 
 impl MasqueProxy {
@@ -242,7 +282,21 @@ impl MasqueProxy {
         Ok(Self {
             endpoint,
             fingerprint: identity.fingerprint(),
+            policy: Arc::new(TargetPolicy::public_only()),
+            authorizer: None,
         })
+    }
+
+    /// Replace the target policy (default: [`TargetPolicy::public_only`]).
+    pub fn with_target_policy(mut self, policy: TargetPolicy) -> Self {
+        self.policy = Arc::new(policy);
+        self
+    }
+
+    /// Require every client to pass `authorizer` (default: open mode).
+    pub fn with_authorizer(mut self, authorizer: ProxyAuthorizer) -> Self {
+        self.authorizer = Some(authorizer);
+        self
     }
 
     /// The SHA-256 pin of the cert this proxy presents.
@@ -258,11 +312,19 @@ impl MasqueProxy {
     /// Accept connections forever, relaying each CONNECT-UDP session to the
     /// target named in its request path. One session per connection.
     pub async fn serve(&self) -> Result<(), TransportError> {
+        if self.authorizer.is_none() {
+            tracing::warn!(
+                "MASQUE proxy running in OPEN mode: no client authentication, any client \
+                 may relay to targets its target policy allows"
+            );
+        }
         while let Some(incoming) = self.endpoint.accept().await {
+            let (policy, authorizer) = (self.policy.clone(), self.authorizer.clone());
             tokio::spawn(async move {
                 match incoming.await {
                     Ok(conn) => {
-                        if let Err(e) = relay_connection(conn, None).await {
+                        let access = Access::Policy(&policy);
+                        if let Err(e) = relay_connection(conn, access, authorizer.as_ref()).await {
                             tracing::debug!("masque session ended: {e}");
                         }
                     }
@@ -274,7 +336,9 @@ impl MasqueProxy {
     }
 
     /// Accept one CONNECT-UDP session and relay it to `target` (ignoring the
-    /// request path). Retained for the point-to-point path and tests.
+    /// request path). Retained for the point-to-point path and tests. The
+    /// target is the operator's own choice here, so the target policy doesn't
+    /// apply; the authorizer still does.
     pub async fn serve_one(&self, target: SocketAddr) -> Result<(), TransportError> {
         let incoming = self
             .endpoint
@@ -282,15 +346,31 @@ impl MasqueProxy {
             .await
             .ok_or_else(|| conn_err("endpoint closed before a connection arrived"))?;
         let conn = incoming.await.map_err(conn_err)?;
-        relay_connection(conn, Some(target)).await
+        relay_connection(conn, Access::Fixed(target), self.authorizer.as_ref()).await
     }
+}
+
+/// Where a session may relay: a fixed operator-chosen target, or whatever the
+/// request names subject to the policy.
+enum Access<'a> {
+    Fixed(SocketAddr),
+    Policy(&'a TargetPolicy),
+}
+
+/// The bearer token in a request's `authorization` header, if any.
+fn bearer_token<B>(req: &http::Request<B>) -> Option<&str> {
+    let value = req.headers().get("authorization")?.to_str().ok()?;
+    value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))
 }
 
 /// Relay a single CONNECT-UDP session on `conn`. The target is `target_override`
 /// when given (point-to-point), else parsed from the request path (mesh proxy).
 async fn relay_connection(
     conn: quinn::Connection,
-    target_override: Option<SocketAddr>,
+    access: Access<'_>,
+    authorizer: Option<&ProxyAuthorizer>,
 ) -> Result<(), TransportError> {
     let h3c = h3_quinn::Connection::new(conn);
     let mut h3conn = h3::server::builder()
@@ -307,11 +387,50 @@ async fn relay_connection(
         .ok_or_else(|| conn_err("no request on connection"))?;
     let (req, mut req_stream) = resolver.resolve_request().await.map_err(conn_err)?;
 
-    let target = match target_override {
-        Some(t) => t,
-        None => parse_connect_udp_target(req.uri().path())
-            .ok_or_else(|| conn_err(format!("bad CONNECT-UDP path: {}", req.uri().path())))?,
+    // SEC-015: refuse (with a status the client can see) anything that isn't an
+    // authorized extended CONNECT for connect-udp to a permitted target.
+    let refusal = if req.method() != http::Method::CONNECT
+        || req.extensions().get::<h3::ext::Protocol>() != Some(&h3::ext::Protocol::CONNECT_UDP)
+    {
+        Some((
+            http::StatusCode::BAD_REQUEST,
+            "not an extended CONNECT for connect-udp",
+        ))
+    } else if authorizer.is_some_and(|auth| !auth(bearer_token(&req))) {
+        Some((http::StatusCode::UNAUTHORIZED, "client not authorized"))
+    } else {
+        None
     };
+    let target = match (&refusal, &access) {
+        (Some(_), _) => None,
+        (None, Access::Fixed(t)) => Some(*t),
+        (None, Access::Policy(_)) => parse_connect_udp_target(req.uri().path()),
+    };
+    let refusal = refusal.or(match (target, &access) {
+        (None, _) => Some((http::StatusCode::BAD_REQUEST, "bad CONNECT-UDP path")),
+        (Some(t), Access::Policy(policy)) if !policy.allows(t) => {
+            Some((http::StatusCode::FORBIDDEN, "target not permitted"))
+        }
+        _ => None,
+    });
+    if let Some((status, why)) = refusal {
+        // Don't log the requested path: it's client-chosen.
+        tracing::debug!(%status, "refusing CONNECT-UDP request: {why}");
+        let resp = http::Response::builder()
+            .status(status)
+            .body(())
+            .map_err(setup)?;
+        let _ = req_stream.send_response(resp).await;
+        let _ = req_stream.finish().await;
+        // Keep driving the connection until the client hangs up (bounded), or
+        // dropping it here would close QUIC before the status reached them.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while let Ok(Some(_)) = h3conn.accept().await {}
+        })
+        .await;
+        return Err(conn_err(format!("refused CONNECT-UDP request: {why}")));
+    }
+    let target = target.expect("target resolved when not refused");
 
     req_stream
         .send_response(
@@ -328,9 +447,13 @@ async fn relay_connection(
     let mut sender = h3conn.get_datagram_sender(stream_id);
     let mut reader = h3conn.get_datagram_reader();
 
-    let udp = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
-        .await
-        .map_err(TransportError::Io)?;
+    // Bind in the target's family, so IPv6 targets work too.
+    let local: SocketAddr = if target.is_ipv4() {
+        (Ipv4Addr::UNSPECIFIED, 0).into()
+    } else {
+        (Ipv6Addr::UNSPECIFIED, 0).into()
+    };
+    let udp = UdpSocket::bind(local).await.map_err(TransportError::Io)?;
     udp.connect(target).await.map_err(TransportError::Io)?;
     let udp = Arc::new(udp);
 
@@ -376,6 +499,8 @@ pub struct MasqueMeshTransport {
     authority: String,
     /// The proxy's expected cert pins (SEC-004); empty warns per session.
     pins: Vec<Fingerprint>,
+    /// Bearer token for a proxy that requires client authentication (SEC-015).
+    token: Option<String>,
     sessions: Mutex<HashMap<SocketAddr, Arc<MasqueTransport>>>,
     /// Targets whose session setup last failed (e.g. the proxy failed its pin).
     backoff: std::sync::Mutex<crate::quic_mesh::DialBackoff>,
@@ -393,11 +518,19 @@ impl MasqueMeshTransport {
             proxy,
             authority: authority.into(),
             pins,
+            token: None,
             sessions: Mutex::new(HashMap::new()),
             backoff: std::sync::Mutex::new(Default::default()),
             inbound_tx,
             inbound_rx: Mutex::new(inbound_rx),
         }
+    }
+
+    /// Present `token` as a bearer token on every CONNECT-UDP session, for a
+    /// proxy that requires client authentication (SEC-015).
+    pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
+        self.token = Some(token.into());
+        self
     }
 
     /// Get the CONNECT-UDP session to `dst`, opening it (and its reader) if new.
@@ -408,8 +541,15 @@ impl MasqueMeshTransport {
         }
         let local: SocketAddr = (Ipv4Addr::UNSPECIFIED, 0).into();
         let session = Arc::new(
-            MasqueTransport::connect(local, self.proxy, &self.authority, dst, self.pins.clone())
-                .await?,
+            MasqueTransport::connect_with_token(
+                local,
+                self.proxy,
+                &self.authority,
+                dst,
+                self.pins.clone(),
+                self.token.as_deref(),
+            )
+            .await?,
         );
 
         // Pump this session's inbound datagrams into the shared channel, tagged
@@ -488,6 +628,109 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    /// The echo "peers" below live on loopback, which the default policy
+    /// refuses (SEC-015), so these tests opt in explicitly.
+    fn loopback_only() -> TargetPolicy {
+        TargetPolicy::allowlist(["127.0.0.0/8"]).unwrap()
+    }
+
+    async fn echo_server() -> SocketAddr {
+        let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = s.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut b = [0u8; 2048];
+            while let Ok((n, from)) = s.recv_from(&mut b).await {
+                let _ = s.send_to(&b[..n], from).await;
+            }
+        });
+        addr
+    }
+
+    /// SEC-015: the default policy refuses a loopback target (the SSRF case)
+    /// with 403, visible to the client as a refused session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn default_proxy_refuses_a_loopback_target() {
+        let target = echo_server().await;
+        let proxy = MasqueProxy::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let (proxy_addr, pin) = (proxy.local_addr().unwrap(), proxy.fingerprint());
+        tokio::spawn(async move {
+            let _ = proxy.serve().await;
+        });
+        let err = MasqueTransport::connect(
+            "127.0.0.1:0".parse().unwrap(),
+            proxy_addr,
+            "ferrum",
+            target,
+            vec![pin],
+        )
+        .await
+        .err()
+        .expect("a loopback target must be refused");
+        assert!(err.to_string().contains("403"), "{err}");
+    }
+
+    /// SEC-015: with an authorizer, a client without the right bearer token
+    /// is refused (401); the right token gets a working session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn authorizer_gates_the_proxy() {
+        let target = echo_server().await;
+        let authorizer: ProxyAuthorizer = Arc::new(|t| t == Some("s3cret"));
+        let proxy = MasqueProxy::bind("127.0.0.1:0".parse().unwrap())
+            .unwrap()
+            .with_target_policy(loopback_only())
+            .with_authorizer(authorizer);
+        let (proxy_addr, pin) = (proxy.local_addr().unwrap(), proxy.fingerprint());
+        tokio::spawn(async move {
+            let _ = proxy.serve().await;
+        });
+        let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        for bad in [None, Some("wrong")] {
+            let err = MasqueTransport::connect_with_token(
+                local,
+                proxy_addr,
+                "ferrum",
+                target,
+                vec![pin],
+                bad,
+            )
+            .await
+            .err()
+            .expect("an unauthorized client must be refused");
+            assert!(err.to_string().contains("401"), "{bad:?}: {err}");
+        }
+        let ok = MasqueTransport::connect_with_token(
+            local,
+            proxy_addr,
+            "ferrum",
+            target,
+            vec![pin],
+            Some("s3cret"),
+        )
+        .await
+        .unwrap();
+        ok.send(b"authorized").await.unwrap();
+        let mut out = [0u8; 32];
+        let n = tokio::time::timeout(Duration::from_secs(8), ok.recv(&mut out))
+            .await
+            .expect("authorized session timed out")
+            .unwrap();
+        assert_eq!(&out[..n], b"authorized");
+    }
+
+    #[test]
+    fn bearer_token_is_extracted_from_the_authorization_header() {
+        let req = |v: &str| {
+            http::Request::builder()
+                .header("authorization", v)
+                .body(())
+                .unwrap()
+        };
+        assert_eq!(bearer_token(&req("Bearer abc")), Some("abc"));
+        assert_eq!(bearer_token(&req("bearer abc")), Some("abc"));
+        assert_eq!(bearer_token(&req("Basic abc")), None);
+        assert_eq!(bearer_token(&http::Request::new(())), None);
+    }
+
     /// Full CONNECT-UDP path: client -> HTTP/3 datagram -> proxy -> UDP echo and back.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn masque_connect_udp_roundtrip() {
@@ -501,7 +744,9 @@ mod tests {
             }
         });
 
-        let proxy = MasqueProxy::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let proxy = MasqueProxy::bind("127.0.0.1:0".parse().unwrap())
+            .unwrap()
+            .with_target_policy(loopback_only());
         let proxy_addr = proxy.local_addr().unwrap();
         let pin = proxy.fingerprint();
         tokio::spawn(async move {
@@ -585,7 +830,9 @@ mod tests {
         let (t1, _h1) = echo(1).await;
         let (t2, _h2) = echo(2).await;
 
-        let proxy = MasqueProxy::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let proxy = MasqueProxy::bind("127.0.0.1:0".parse().unwrap())
+            .unwrap()
+            .with_target_policy(loopback_only());
         let proxy_addr = proxy.local_addr().unwrap();
         let pin = proxy.fingerprint();
         tokio::spawn(async move {
@@ -641,7 +888,9 @@ mod tests {
         let p1 = echo(1).await;
         let p2 = echo(2).await;
 
-        let proxy = MasqueProxy::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let proxy = MasqueProxy::bind("127.0.0.1:0".parse().unwrap())
+            .unwrap()
+            .with_target_policy(loopback_only());
         let proxy_addr = proxy.local_addr().unwrap();
         let pin = proxy.fingerprint();
         tokio::spawn(async move {
@@ -678,7 +927,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn masque_client_rejects_an_impostor_proxy() {
         let expected = TlsIdentity::from_wireguard_key(&[9; 32]).unwrap();
-        let impostor = MasqueProxy::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let impostor = MasqueProxy::bind("127.0.0.1:0".parse().unwrap())
+            .unwrap()
+            .with_target_policy(loopback_only());
         let impostor_addr = impostor.local_addr().unwrap();
         tokio::spawn(async move {
             let _ = impostor.serve().await;

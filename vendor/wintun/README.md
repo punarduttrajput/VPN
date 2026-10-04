@@ -34,4 +34,8 @@ redistributed freely. See the upstream license at <https://www.wintun.net/>.
 1. Download the desired release zip from <https://www.wintun.net/builds/>.
 2. **Verify the Authenticode signature** of each `bin/<arch>/wintun.dll`
    (`Get-AuthenticodeSignature` → `Status` must be `Valid`, signer WireGuard LLC).
-3. Replace the per-arch DLLs here and update the version + hashes above.
+3. Replace the per-arch DLLs here and update the version + hashes above **and in
+   [`../SHA256SUMS`](../SHA256SUMS)**. That manifest is the enforced pin
+   (SEC-008): `scripts/verify-vendored.sh` checks it in CI, CI re-verifies the
+   Authenticode signature on Windows, and `apps/desktop/src-tauri/build.rs`
+   refuses to copy a DLL whose hash doesn't match.

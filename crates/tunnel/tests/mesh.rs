@@ -471,7 +471,7 @@ async fn mesh_probes_candidates_to_reach_a_peer() {
 #[cfg(feature = "masque")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn masque_mesh_node_reaches_udp_peer() {
-    use ferrum_transport::{MasqueMeshTransport, MasqueProxy};
+    use ferrum_transport::{MasqueMeshTransport, MasqueProxy, TargetPolicy};
 
     let (m, x) = (KeyPair::generate(), KeyPair::generate());
 
@@ -488,7 +488,10 @@ async fn masque_mesh_node_reaches_udp_peer() {
     });
 
     // MASQUE proxy M tunnels through.
-    let proxy = MasqueProxy::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    // X lives on loopback, which the proxy refuses by default (SEC-015).
+    let proxy = MasqueProxy::bind("127.0.0.1:0".parse().unwrap())
+        .unwrap()
+        .with_target_policy(TargetPolicy::allowlist(["127.0.0.0/8"]).unwrap());
     let proxy_addr = proxy.local_addr().unwrap();
     let proxy_pin = proxy.fingerprint();
     tokio::spawn(async move {
@@ -549,7 +552,10 @@ async fn masque_mesh_node_reaches_udp_peer() {
     // dropped. So rather than sleeping a fixed time and sending once (flaky
     // on a loaded host), re-send every 500 ms until one arrives, within a
     // generous deadline.
-    let to_x = ipv4([10, 8, 0, 1]);
+    // Its source is M's own address: X enforces M's allowed_ips (SEC-011), and
+    // the helper's default source (10.8.0.1) is X itself here.
+    let mut to_x = ipv4([10, 8, 0, 1]);
+    to_x[12..16].copy_from_slice(&[10, 8, 0, 2]);
     let mut x_pkt = None;
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     let mut next_send = std::time::Instant::now() + Duration::from_millis(300);
@@ -1110,4 +1116,108 @@ async fn direct_path_is_used_when_available_despite_a_relay() {
         ),
         to_b
     );
+}
+
+/// SEC-011: a mesh peer can't impersonate another peer. A is authenticated to
+/// B (its packets decrypt under B's session for A), but a packet from A that
+/// claims C's tunnel IP (10.8.0.3) is dropped before it reaches B's TUN.
+/// A's genuine traffic still flows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn mesh_drops_packets_spoofing_another_peers_address() {
+    let (a, b, c) = (
+        KeyPair::generate(),
+        KeyPair::generate(),
+        KeyPair::generate(),
+    );
+    let sock_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sock_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let (addr_a, addr_b) = (sock_a.local_addr().unwrap(), sock_b.local_addr().unwrap());
+    // C never runs a mesh; B just knows it as the owner of 10.8.0.3. Its socket
+    // is bound (and held) so B's handshakes to it don't hit a dead port, which
+    // on Windows surfaces as WSAECONNRESET on B's next receive.
+    let sock_c = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr_c = sock_c.local_addr().unwrap();
+
+    let a_peers = vec![MeshPeer::new(
+        Session::from_bytes(a.private.to_bytes(), b.public.to_bytes(), 1).unwrap(),
+        addr_b,
+        vec![cidr("10.8.0.2/32")],
+    )];
+    let b_peers = vec![
+        MeshPeer::new(
+            Session::from_bytes(b.private.to_bytes(), a.public.to_bytes(), 1).unwrap(),
+            addr_a,
+            vec![cidr("10.8.0.1/32")],
+        ),
+        MeshPeer::new(
+            Session::from_bytes(b.private.to_bytes(), c.public.to_bytes(), 2).unwrap(),
+            addr_c,
+            vec![cidr("10.8.0.3/32")],
+        ),
+    ];
+
+    let (tun_a, tun_b) = (MockTun::default(), MockTun::default());
+    let inject_a = tun_a.to_runner.clone();
+    let recv_b = tun_b.from_runner.clone();
+    let (stop_a_tx, stop_a_rx) = oneshot::channel();
+    let (stop_b_tx, stop_b_rx) = oneshot::channel();
+    let (upd_a_tx, upd_a_rx) = tokio::sync::mpsc::channel(1);
+    let (upd_b_tx, upd_b_rx) = tokio::sync::mpsc::channel(1);
+    let ja = tokio::spawn(async move {
+        run_mesh(
+            tun_a,
+            UdpMeshTransport::from_socket(sock_a),
+            a_peers,
+            upd_a_rx,
+            async {
+                stop_a_rx.await.ok();
+            },
+        )
+        .await
+    });
+    let jb = tokio::spawn(async move {
+        run_mesh(
+            tun_b,
+            UdpMeshTransport::from_socket(sock_b),
+            b_peers,
+            upd_b_rx,
+            async {
+                stop_b_rx.await.ok();
+            },
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await; // handshake
+
+    let before = ferrum_tunnel::spoofed_source_drops();
+    let mut spoofed = ipv4([10, 8, 0, 2]);
+    spoofed[12..16].copy_from_slice(&[10, 8, 0, 3]); // claims to be C
+    let genuine = ipv4([10, 8, 0, 2]); // src = A
+    inject_a.lock().unwrap().push_back(spoofed);
+    inject_a.lock().unwrap().push_back(genuine.clone());
+
+    for _ in 0..60 {
+        if !recv_b.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // The spoofed packet was queued first on the same ordered session, so by
+    // the time the genuine one lands it has been processed. Give the loop one
+    // more beat so a late (wrong) delivery would still be caught.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let got = recv_b.lock().unwrap().clone();
+
+    let _ = stop_a_tx.send(());
+    let _ = stop_b_tx.send(());
+    let _ = ja.await;
+    let _ = jb.await;
+    drop((upd_a_tx, upd_b_tx, sock_c));
+
+    assert_eq!(
+        got,
+        vec![genuine],
+        "B's TUN must see only A's genuine packet"
+    );
+    assert!(ferrum_tunnel::spoofed_source_drops() > before);
 }

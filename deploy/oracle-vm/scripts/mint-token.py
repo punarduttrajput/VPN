@@ -19,7 +19,9 @@ Usage:
         Prints a signed bearer token to stdout. Match --issuer/--audience to
         the coordinator's OIDC_ISSUER/OIDC_AUDIENCE (.env) or verification
         fails. Use --tags admin for the admin panel; use --tags <device-tag>
-        (e.g. dev, server) for a device's --token-file.
+        (e.g. dev, server) for a device's --token-file; use --tags relay for a
+        self-announcing relay's --token-file (`ferrum relay --coordinator`;
+        the coordinator refuses relay heartbeats from other tokens, SEC-013).
 
 Requires: pip install cryptography
 """
