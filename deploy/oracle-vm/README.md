@@ -189,6 +189,11 @@ see the main `README.md`), rotate the signing key, and consider not keeping
 `secrets/signing-key.pem` on the VM at all (mint tokens from your own machine,
 copy only `jwks.json` over).
 
+This VM holds the coordinator database and runs the relay, the two components
+that see the most metadata. Read the [threat model](../../docs/security/threat-model.md)
+(§3 coordinator, §4 relay) for what they can observe, and work through the
+operator checklist in [SECURITY.md](../../SECURITY.md) before real users join.
+
 ## Also want metrics/dashboards?
 
 `../observability/docker-compose.yml` already expects the coordinator/relay

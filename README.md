@@ -7,6 +7,11 @@ the mesh covers much of Phase 4. See [STATUS.md](STATUS.md) for dated progress
 and [CLAUDE.md](CLAUDE.md) for agent/developer context (build, conventions,
 architecture, environment notes).
 
+**Security & privacy:** what the coordinator, relays and the network can and
+can't see is in the [threat model](docs/security/threat-model.md) (short
+version: [privacy summary](docs/security/privacy-summary.md)); reporting and
+the operator checklist are in [SECURITY.md](SECURITY.md).
+
 ## Workspace
 
 | Crate | Role |
