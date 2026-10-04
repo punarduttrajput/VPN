@@ -16,13 +16,18 @@ commercial VPN control planes handle at the edge.
 
 ## Acceptance criteria
 
-- [ ] Per-identity and per-source rate limits on `register_device` and
-      `RelayHeartbeat`.
-- [ ] A cap on concurrent `watch_network_map` streams per identity/source.
-- [ ] Rejections use a clear `resource_exhausted` status.
-- [ ] Aggregate-only metrics for throttled/rejected counts (no per-user labels —
+- [x] Per-identity and per-source rate limits on `register_device` and
+      `RelayHeartbeat`. *(Token buckets in `limits.rs`. Per-source runs before
+      authentication, per-identity (`oidc:`/`mtls:`) after. IPv6 sources keyed
+      by /64.)*
+- [x] A cap on concurrent `watch_network_map` streams per identity/source.
+      *(Plus a global cap. A disconnect now frees its slot immediately.)*
+- [x] Rejections use a clear `resource_exhausted` status.
+- [x] Aggregate-only metrics for throttled/rejected counts (no per-user labels —
       NFR5); `tracing_privacy` integration test still passes.
-- [ ] Test: a registration flood and an excess-stream case are throttled.
+      *(`ferrum_register_throttled_total`, `ferrum_relay_heartbeat_throttled_total`,
+      `ferrum_watch_streams_rejected_total`, plus a `FerrumCoordinatorThrottlingSpike` alert.)*
+- [x] Test: a registration flood and an excess-stream case are throttled.
 
 ## Implementation notes
 

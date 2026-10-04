@@ -60,7 +60,12 @@ fn mac16(key: &[u8], parts: &[&[u8]]) -> [u8; 16] {
 
 /// Constant-time equality for short MACs.
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    // `subtle` rather than a hand-rolled fold (SEC-016): it's written to resist
+    // the compiler optimizing the comparison into an early-exit. Length is not
+    // secret (both sides are fixed-size MACs), so a length mismatch is simply
+    // unequal.
+    use subtle::ConstantTimeEq;
+    a.ct_eq(b).into()
 }
 
 /// Canonical bytes for a socket address (family-tagged so v4 and v6 can't alias).

@@ -8,7 +8,7 @@
 //! types over a named pipe instead of a `UnixStream` — not built this pass.
 
 use std::io::{self, Read, Write};
-use std::os::unix::io::RawFd;
+use std::os::fd::{BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
 use serde::{Deserialize, Serialize};
@@ -73,6 +73,11 @@ pub enum HelperResponse {
 /// implement reassembly for a response split across multiple reads.
 const MAX_RESPONSE: usize = 4096;
 
+/// Largest request payload [`recv_request`] accepts. Requests are tiny JSON
+/// messages; without a cap the length prefix alone would let any caller make
+/// the (root) helper allocate up to 4 GiB (SEC-005).
+pub const MAX_REQUEST: usize = 64 * 1024;
+
 /// Write a length-prefixed JSON `HelperRequest` to `stream`. Uses ordinary
 /// `Write`/`read_exact` framing (robust to partial reads/writes) since a
 /// request never carries an fd.
@@ -88,17 +93,24 @@ pub fn recv_request(stream: &mut UnixStream) -> io::Result<HelperRequest> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf)?;
     let len = u32::from_le_bytes(len_buf) as usize;
+    if len > MAX_REQUEST {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("helper request of {len} bytes exceeds the {MAX_REQUEST}-byte limit"),
+        ));
+    }
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf)?;
     serde_json::from_slice(&buf).map_err(io::Error::other)
 }
 
 /// Send a response, optionally carrying a fd (for `HelperResponse::TunOpened`)
-/// as `SCM_RIGHTS` ancillary data in the same call.
+/// as `SCM_RIGHTS` ancillary data in the same call. The fd is borrowed: the
+/// caller keeps (and must close) its own copy.
 pub fn send_response(
     stream: &UnixStream,
     resp: &HelperResponse,
-    fd: Option<RawFd>,
+    fd: Option<BorrowedFd<'_>>,
 ) -> io::Result<()> {
     let bytes = serde_json::to_vec(resp).map_err(io::Error::other)?;
     match fd {
@@ -110,12 +122,13 @@ pub fn send_response(
     }
 }
 
-/// Receive a response, and the fd if one was attached.
-pub fn recv_response(stream: &UnixStream) -> io::Result<(HelperResponse, Option<RawFd>)> {
+/// Receive a response, and the fd if one was attached (owned: it closes on
+/// drop unless the caller keeps it, so an unexpected fd can't leak).
+pub fn recv_response(stream: &UnixStream) -> io::Result<(HelperResponse, Option<OwnedFd>)> {
     let mut buf = [0u8; MAX_RESPONSE];
     let (n, fd) = fdpass::recv_with_fd(stream, &mut buf)?;
     let resp: HelperResponse = serde_json::from_slice(&buf[..n]).map_err(io::Error::other)?;
-    Ok((resp, fd.map(std::os::unix::io::IntoRawFd::into_raw_fd)))
+    Ok((resp, fd))
 }
 
 /// Build the `OpenTun` request for `cfg`.
@@ -147,6 +160,16 @@ mod tests {
             }
             other => panic!("unexpected request: {other:?}"),
         }
+    }
+
+    #[test]
+    fn oversized_request_is_rejected_before_allocating() {
+        let (mut a, mut b) = UnixStream::pair().unwrap();
+        // Only the length prefix is sent: the receiver must refuse on the
+        // prefix alone rather than allocate and wait for a 4 GiB body.
+        a.write_all(&u32::MAX.to_le_bytes()).unwrap();
+        let err = recv_request(&mut b).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -193,32 +216,22 @@ mod tests {
 
     #[test]
     fn tun_opened_response_carries_the_fd() {
-        let (a, b) = UnixStream::pair().unwrap();
-        let mut pipe_fds = [0i32; 2];
-        // SAFETY: fills `pipe_fds` with a valid, connected pipe pair.
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-        let (read_end, write_end) = (pipe_fds[0], pipe_fds[1]);
+        use std::os::fd::AsFd;
 
-        send_response(&a, &HelperResponse::TunOpened, Some(read_end)).unwrap();
-        // SAFETY: our copy is no longer needed once sent.
-        unsafe { libc::close(read_end) };
+        let (a, b) = UnixStream::pair().unwrap();
+        let (reader, mut writer) = std::io::pipe().unwrap();
+
+        send_response(&a, &HelperResponse::TunOpened, Some(reader.as_fd())).unwrap();
+        drop(reader); // our copy is no longer needed once sent
 
         let (resp, fd) = recv_response(&b).unwrap();
         assert!(matches!(resp, HelperResponse::TunOpened));
         let received = fd.expect("a fd should have been received");
 
-        let payload = b"hi";
-        // SAFETY: `write_end` is a valid, open pipe write fd.
-        unsafe { libc::write(write_end, payload.as_ptr().cast(), payload.len()) };
-        let mut rbuf = [0u8; 8];
-        // SAFETY: `received` is the fd handed back by `recv_response`.
-        let r = unsafe { libc::read(received, rbuf.as_mut_ptr().cast(), rbuf.len()) };
-        assert_eq!(r, payload.len() as isize);
-
-        // SAFETY: close the fds we still own.
-        unsafe {
-            libc::close(write_end);
-            libc::close(received);
-        }
+        writer.write_all(b"hi").unwrap();
+        drop(writer);
+        let mut got = Vec::new();
+        std::fs::File::from(received).read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"hi");
     }
 }

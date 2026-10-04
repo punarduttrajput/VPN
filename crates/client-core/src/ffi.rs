@@ -228,8 +228,13 @@ impl FfiFerrumClient {
         stun_server: Option<String>,
         relay: Option<String>,
     ) -> Result<(), Error> {
-        let device =
-            ferrum_tunnel::device::from_fd(tun_fd).map_err(|e| Error::DataPlane(e.to_string()))?;
+        // SAFETY: the FFI contract of `run` is that `tun_fd` is an open TUN fd
+        // whose ownership the shell hands over (Android: the value of
+        // `ParcelFileDescriptor.detachFd()`), so nothing else closes it; the
+        // device closes it when the tunnel ends.
+        #[allow(unsafe_code)]
+        let device = unsafe { ferrum_tunnel::device::from_fd(tun_fd) }
+            .map_err(|e| Error::DataPlane(e.to_string()))?;
         let bind: std::net::SocketAddr = format!("0.0.0.0:{listen_port}")
             .parse()
             .map_err(|e| Error::DataPlane(format!("bind address: {e}")))?;

@@ -17,15 +17,15 @@ will ask, and "trust us" doesn't close enterprise or prosumer deals in 2026.
 
 ## Acceptance criteria
 
-- [ ] A `SECURITY.md` / threat-model doc covering:
+- [x] A `SECURITY.md` / threat-model doc covering: *([docs/security/threat-model.md](../../docs/security/threat-model.md), indexed from the root `SECURITY.md`.)*
       - what the coordinator can observe (identities, keys, endpoints, network
         map, tags) and for how long;
       - what a relay can observe (traffic patterns, endpoints; not payload);
       - what the transports leak on-path (pre- and post-SEC-004);
       - the trust boundaries and each component's failure mode;
       - residual risks and explicit non-goals (e.g. DoH bypass).
-- [ ] A concise, user-facing privacy summary suitable for a product page.
-- [ ] Linked from the README and the deployment docs.
+- [x] A concise, user-facing privacy summary suitable for a product page. *([docs/security/privacy-summary.md](../../docs/security/privacy-summary.md).)*
+- [x] Linked from the README and the deployment docs. *(README, `deploy/oracle-vm/README.md`, `deploy/observability/README.md`, and the audit plan.)*
 
 ## Implementation notes
 
