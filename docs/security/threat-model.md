@@ -198,7 +198,7 @@ middlebox) can see depends on the transport.
 | Transport | Visible to an on-path observer |
 |---|---|
 | `udp` (default) | Endpoint IPs and ports, sizes, timing. The traffic is **recognisably WireGuard**: fixed message types and handshake sizes. Peer public keys are not sent in the clear (WireGuard encrypts the static key in the handshake). |
-| `quic` | Endpoint IPs and ports, sizes, timing, and the TLS ClientHello. Since SEC-020 the ClientHello carries **no SNI** by default (peers are dialed by IP), or the operator's `server_name` if set, in point-to-point and mesh alike. It also offers no ALPN (see residuals below). The certificate is encrypted (TLS 1.3) and names nothing. |
+| `quic` | Endpoint IPs and ports, sizes, timing, and the TLS ClientHello. Since SEC-020 the ClientHello carries **no SNI** by default (peers are dialed by IP), or the operator's `server_name` if set, in point-to-point and mesh alike. Since SEC-021 it offers ALPN `h3`, like web QUIC. The certificate is encrypted (TLS 1.3) and names nothing. |
 | `masque` | The proxy's address (UDP/443) and the ClientHello: ALPN `h3`, and SNI only if `server_name` is set (none by default since SEC-020; a third-party proxy usually needs its real hostname). The real peer's address is inside the encrypted HTTP/3 session. |
 | any + `padding` / `jitter` | Datagram sizes are normalised to `pad_to`, and send timing is randomised (SEC-018: a CSPRNG). Both are **opt-in** and are obfuscation, not a security boundary. |
 | relay fallback | The relay's address; to the network the relay's traffic looks like any UDP flow. |
@@ -221,10 +221,12 @@ timing. They can block it. Default-mode UDP is trivially classified as
 WireGuard. Until SEC-020, QUIC and MASQUE sent the SNI `ferrum` in clear
 text, so one DPI rule could single them out. They now send none by default,
 and the self-signed certificates no longer carry `ferrum` or rcgen's default
-`CN=rcgen self signed cert`. What remains distinguishable: point-to-point and
-mesh QUIC offer **no ALPN** (web QUIC always offers `h3`), a ClientHello
-without SNI is itself less common than one with, and an active prober that
-completes a handshake still gets an anonymous self-signed certificate.
+`CN=rcgen self signed cert`. Until SEC-021, point-to-point and mesh QUIC also
+offered no ALPN, unlike web QUIC's `h3`; they now offer `h3`. What remains
+distinguishable: a ClientHello without SNI is less common than one with, and
+an active prober that completes an `h3` handshake gets an anonymous
+self-signed certificate and then no HTTP/3 behaviour (no SETTINGS, no
+responses), unlike a real HTTP/3 server.
 
 ## 6. Clients and peers
 
@@ -266,8 +268,8 @@ Ferrum for them.
 3. **Traffic analysis.** Sizes and timing are visible on the path and to
    relays. Padding and jitter are opt-in mitigations, not guarantees.
 4. **Censorship resistance against a determined adversary.** QUIC/MASQUE make
-   traffic look like web QUIC/HTTP-3, but the missing ALPN on plain QUIC, the
-   endpoint addresses and active probing can still reveal it.
+   traffic look like web QUIC/HTTP-3, but the endpoint addresses and active
+   probing can still reveal it.
 5. **DoH bypass.** Browsers doing their own DNS-over-HTTPS skip system DNS. Their
    queries leave through whatever route the browser takes and can't be told
    apart from HTTPS (leak-protection PRD non-goal).
@@ -301,7 +303,8 @@ Ferrum for them.
 **Status of fixes referenced here.** SEC-001 to SEC-018 are on `main`, except
 SEC-018's eBPF/XDP parser checks, which need a Linux host. SEC-019 (the
 boringtun upgrade) is on `main`, pending its Linux real-TUN and throughput
-runs. SEC-020 (the SNI default) is implemented and in review.
+runs. SEC-020 (the SNI default) is on `main`. SEC-021 (QUIC ALPN) is
+implemented and in review.
 
 ## 9. Keeping this document true
 

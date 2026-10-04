@@ -52,6 +52,15 @@ use tracing::warn;
 pub use crate::fingerprint::{fingerprint_hex, parse_fingerprint, parse_fingerprints, Fingerprint};
 use crate::TransportError;
 
+/// ALPN every Ferrum QUIC connection offers and accepts: plain QUIC, the QUIC
+/// mesh and MASQUE alike (SEC-021). Web QUIC always offers `h3`; a ClientHello
+/// with no ALPN at all stood out to passive DPI. Plain/mesh QUIC carries
+/// WireGuard in QUIC DATAGRAM frames, which HTTP/3 also uses (RFC 9297).
+///
+/// Wire-incompatible with pre-SEC-021 QUIC nodes: in QUIC mode rustls refuses
+/// any handshake where only one side uses ALPN (RFC 9001 §8.1).
+pub const QUIC_ALPN: &[&[u8]] = &[b"h3"];
+
 /// The TLS server name to dial `addr` with (SEC-020). Identity is the pinned
 /// key (and, underneath, WireGuard), never the name, so the name only decides
 /// what an on-path observer reads in the cleartext ClientHello:

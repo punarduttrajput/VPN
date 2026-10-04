@@ -58,7 +58,7 @@ impl QuicTransport {
         local: SocketAddr,
         identity: &TlsIdentity,
     ) -> Result<Endpoint, TransportError> {
-        let crypto = identity.server_crypto(&[])?;
+        let crypto = identity.server_crypto(tls::QUIC_ALPN)?;
         let quic_crypto =
             QuicServerConfig::try_from(crypto).map_err(|e| setup(format!("quic server: {e}")))?;
         let server_config = ServerConfig::with_crypto(Arc::new(quic_crypto));
@@ -132,7 +132,7 @@ impl QuicTransport {
     ) -> Result<Self, TransportError> {
         let mut endpoint = Endpoint::client(local).map_err(TransportError::Io)?;
 
-        let crypto = tls::client_crypto(pins, format!("QUIC server {server}"), &[]);
+        let crypto = tls::client_crypto(pins, format!("QUIC server {server}"), tls::QUIC_ALPN);
         let quic_crypto =
             QuicClientConfig::try_from(crypto).map_err(|e| setup(format!("quic client: {e}")))?;
         endpoint.set_default_client_config(ClientConfig::new(Arc::new(quic_crypto)));
@@ -182,8 +182,9 @@ mod tests {
         (ep, addr, id.fingerprint())
     }
 
-    /// The SNI the server saw for one client connection dialed with `name`.
-    async fn sni_seen_by_server(name: Option<&str>) -> Option<String> {
+    /// The SNI and ALPN the server saw for one client connection dialed with
+    /// `name`.
+    async fn hello_seen_by_server(name: Option<&str>) -> (Option<String>, Option<Vec<u8>>) {
         let (endpoint, server_addr, pin) = pinned_server(4);
         let server = tokio::spawn(async move {
             let t = QuicTransport::accept(endpoint).await.unwrap();
@@ -192,7 +193,7 @@ mod tests {
                 .downcast::<quinn::crypto::rustls::HandshakeData>()
                 .expect("rustls handshake data");
             t.connection.close(0u32.into(), b"done");
-            data.server_name
+            (data.server_name, data.protocol)
         });
         let _client = QuicTransport::connect(
             "127.0.0.1:0".parse().unwrap(),
@@ -209,11 +210,45 @@ mod tests {
     /// on the path reads a product name; a configured name is sent verbatim.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sni_is_absent_by_default_and_configurable() {
-        assert_eq!(sni_seen_by_server(None).await, None);
+        assert_eq!(hello_seen_by_server(None).await.0, None);
         assert_eq!(
-            sni_seen_by_server(Some("cdn.example.net")).await.as_deref(),
+            hello_seen_by_server(Some("cdn.example.net"))
+                .await
+                .0
+                .as_deref(),
             Some("cdn.example.net")
         );
+    }
+
+    /// SEC-021: plain QUIC negotiates ALPN `h3`, like web QUIC, rather than
+    /// offering none.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quic_negotiates_h3_alpn() {
+        assert_eq!(
+            hello_seen_by_server(None).await.1.as_deref(),
+            Some(&b"h3"[..])
+        );
+    }
+
+    /// SEC-021 is a flag day: a pre-SEC-021 client that offers no ALPN can't
+    /// complete a handshake with an upgraded server (RFC 9001 §8.1, enforced
+    /// by rustls in QUIC mode). Pins the documented incompatibility.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_without_alpn_is_refused() {
+        let (endpoint, server_addr, pin) = pinned_server(5);
+        tokio::spawn(async move {
+            let _ = QuicTransport::accept(endpoint).await;
+        });
+        let mut client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let legacy = tls::client_crypto(vec![pin], "legacy client", &[]);
+        client.set_default_client_config(ClientConfig::new(Arc::new(
+            QuicClientConfig::try_from(legacy).unwrap(),
+        )));
+        let res = client
+            .connect(server_addr, &tls::dial_name(None, server_addr))
+            .unwrap()
+            .await;
+        assert!(res.is_err(), "an ALPN-less client must be refused");
     }
 
     /// A WireGuard-sized packet survives a QUIC datagram round trip (FR2).

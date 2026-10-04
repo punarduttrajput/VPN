@@ -137,7 +137,7 @@ impl QuicMeshTransport {
             .get(&dst)
             .cloned()
             .unwrap_or_default();
-        let crypto = tls::client_crypto(pins, format!("QUIC mesh peer {dst}"), &[]);
+        let crypto = tls::client_crypto(pins, format!("QUIC mesh peer {dst}"), tls::QUIC_ALPN);
         Ok(ClientConfig::new(Arc::new(
             QuicClientConfig::try_from(crypto).map_err(|e| setup(format!("quic client: {e}")))?,
         )))
@@ -329,7 +329,7 @@ async fn read_hello(conn: &Connection) -> Option<SocketAddr> {
 /// Build a quinn endpoint that accepts connections presenting `identity`; dials
 /// get a per-destination pinned client config (see `client_config_for`).
 fn build_endpoint(local: SocketAddr, identity: &TlsIdentity) -> Result<Endpoint, TransportError> {
-    let server_crypto = identity.server_crypto(&[])?;
+    let server_crypto = identity.server_crypto(tls::QUIC_ALPN)?;
     let server_config = ServerConfig::with_crypto(Arc::new(
         QuicServerConfig::try_from(server_crypto)
             .map_err(|e| setup(format!("quic server: {e}")))?,
