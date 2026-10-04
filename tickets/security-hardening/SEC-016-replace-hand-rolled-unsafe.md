@@ -34,9 +34,18 @@ Several pieces reimplement what vetted, widely used crates already provide
       refuses `MSG_CTRUNC` and surplus fds (closing them), and sets `FD_CLOEXEC`
       manually on Apple, which lacks the flag. `helper_proto` now carries
       `BorrowedFd`/`OwnedFd` instead of raw integers.)*
-- [ ] UDP batch I/O on `quinn-udp` (GSO/GRO/`sendmmsg`), keeping the current
+- [x] UDP batch I/O on `quinn-udp` (GSO/GRO/`sendmmsg`), keeping the current
       `UdpTransport` API and the GSO/GRO tests. Or, if a gap blocks that, fix
       the alignment with properly aligned cmsg buffers and record why.
+      *(Part 3. GSO sends one `quinn_udp::Transmit` per equal-size run, and GRO
+      goes through `UdpSocketState::recv` into the existing `GroBuffer`. All
+      ~270 lines of `sendmsg`/`recvmsg`/`sendmmsg`/sockaddr FFI and the
+      hard-coded `UDP_SEGMENT`/`UDP_GRO` numbers are gone, and
+      `ferrum-transport` is now `forbid(unsafe_code)`. **Gap, recorded:**
+      `quinn-udp` has no `sendmmsg`, so on a kernel without GSO (< 4.18) a
+      batch costs one `sendmsg` per datagram. When a kernel refuses GSO at
+      runtime (quinn-udp disables it and drops that run), the run is resent
+      datagram by datagram.)*
 - [x] `FdTun::from_fd` becomes `unsafe fn` (or takes `OwnedFd`); the FFI entry
       point documents the ownership transfer. *(Part 1: both. There's a new safe
       `device::from_owned_fd`, and `from_fd(RawFd)` is `unsafe fn` with a
