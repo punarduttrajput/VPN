@@ -536,7 +536,7 @@ async fn masque_mesh_node_reaches_udp_peer() {
     let jm = tokio::spawn(async move {
         run_mesh(
             tun_m,
-            MasqueMeshTransport::new(proxy_addr, "ferrum", vec![proxy_pin]),
+            MasqueMeshTransport::new(proxy_addr, "127.0.0.1", vec![proxy_pin]),
             m_peers,
             um_rx,
             async {

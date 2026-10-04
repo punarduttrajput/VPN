@@ -42,8 +42,6 @@ const TUN_MTU: u16 = 1420;
 /// Smaller inner TUN MTU for QUIC/MASQUE — the extra QUIC + TLS (and, for MASQUE,
 /// HTTP/3 CONNECT-UDP) framing eats into the path budget (mirrors the CLI).
 const QUIC_TUN_MTU: u16 = 1100;
-/// Default TLS / HTTP-3 `:authority` for QUIC/MASQUE when the form leaves it blank.
-const DEFAULT_SERVER_NAME: &str = "ferrum";
 
 /// Wraps whichever concrete `TunDevice` [`open_tun`] picked (the helper-backed
 /// device or a direct open) behind one type. Manual delegation rather than
@@ -235,13 +233,14 @@ where
     // Resolve the transport selection up front so a bad mode / missing-or-malformed
     // MASQUE proxy fails *now* with a clean error rather than inside the supervisor.
     let mode = parse_mode(&cfg.transport_mode)?;
-    let server_name = cfg
+    // TLS name for QUIC/MASQUE dials. Blank means none: dial by IP, so the
+    // ClientHello carries no SNI (SEC-020).
+    let server_name: Option<String> = cfg
         .server_name
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .unwrap_or(DEFAULT_SERVER_NAME)
-        .to_string();
+        .map(str::to_string);
     let masque_proxy: Option<SocketAddr> = match mode {
         TransportMode::Masque => Some(
             cfg.masque_proxy
@@ -392,9 +391,11 @@ where
         TransportMode::Quic => {
             let make_transport = move || {
                 let id = tls_identity.clone();
+                let server_name = server_name.clone();
                 async move {
                     QuicMeshTransport::bind(bind_addr, &id)
                         .await
+                        .map(|t| t.with_server_name(server_name))
                         .map_err(|e| ferrum_client_core::Error::DataPlane(e.to_string()))
                 }
             };
@@ -414,7 +415,7 @@ where
         TransportMode::Masque => {
             let proxy = masque_proxy.expect("masque proxy resolved above");
             let make_transport = move || {
-                let authority = server_name.clone();
+                let authority = ferrum_transport::tls::dial_name(server_name.as_deref(), proxy);
                 let pins = cert_pins.clone();
                 async move {
                     Ok::<_, ferrum_client_core::Error>(MasqueMeshTransport::new(

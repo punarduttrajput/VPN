@@ -79,12 +79,19 @@ The `[transport]` block selects how the encrypted tunnel is carried:
 [transport]
 mode = "quic"        # "udp" (default) or "quic"
 role = "client"      # quic only: one peer "server" (accepts), one "client"
-server_name = "ferrum"  # quic only: TLS SNI (peer identity is via WireGuard)
+# server_name = "cdn.example.net"  # optional TLS SNI; unset sends none (SEC-020)
 ```
 
 QUIC requires building with the feature: `cargo build --features ferrum-cli/quic`.
 See [config.quic.example.toml](config.quic.example.toml). Omitting `[transport]`
 keeps plain UDP (Phase 1 behavior).
+
+**TLS server name (SEC-020):** the TLS ClientHello is sent in the clear, so by
+default Ferrum dials QUIC peers and MASQUE proxies by IP address, which sends no
+SNI at all, and its certificates carry no name either. Set `server_name` only
+to a hostname you control and want on-path observers to see. A third-party
+MASQUE proxy usually needs its real hostname here to pick its certificate.
+Identity never depends on the name; the outer layer is pinned by key.
 
 **Certificate pinning (SEC-004):** QUIC and MASQUE run inside TLS, and the
 client checks the server's certificate against `cert_pins` in `[transport]`.

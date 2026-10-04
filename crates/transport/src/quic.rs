@@ -182,6 +182,40 @@ mod tests {
         (ep, addr, id.fingerprint())
     }
 
+    /// The SNI the server saw for one client connection dialed with `name`.
+    async fn sni_seen_by_server(name: Option<&str>) -> Option<String> {
+        let (endpoint, server_addr, pin) = pinned_server(4);
+        let server = tokio::spawn(async move {
+            let t = QuicTransport::accept(endpoint).await.unwrap();
+            let data = t.connection.handshake_data().expect("handshake done");
+            let data = data
+                .downcast::<quinn::crypto::rustls::HandshakeData>()
+                .expect("rustls handshake data");
+            t.connection.close(0u32.into(), b"done");
+            data.server_name
+        });
+        let _client = QuicTransport::connect(
+            "127.0.0.1:0".parse().unwrap(),
+            server_addr,
+            &tls::dial_name(name, server_addr),
+            vec![pin],
+        )
+        .await
+        .unwrap();
+        server.await.unwrap()
+    }
+
+    /// SEC-020: by default the ClientHello carries no SNI at all, so nothing
+    /// on the path reads a product name; a configured name is sent verbatim.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sni_is_absent_by_default_and_configurable() {
+        assert_eq!(sni_seen_by_server(None).await, None);
+        assert_eq!(
+            sni_seen_by_server(Some("cdn.example.net")).await.as_deref(),
+            Some("cdn.example.net")
+        );
+    }
+
     /// A WireGuard-sized packet survives a QUIC datagram round trip (FR2).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn quic_datagram_roundtrip() {

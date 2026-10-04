@@ -280,7 +280,6 @@ allowed_ips = ["$TUN2/32"]
 [transport]
 mode = "quic"
 role = "client"
-server_name = "ferrum"
 EOF
 
   cat > "$WORK/b-quic.toml" <<EOF
@@ -296,7 +295,6 @@ allowed_ips = ["$TUN1/32"]
 [transport]
 mode = "quic"
 role = "server"
-server_name = "ferrum"
 EOF
 
   # Start the server first so it is accepting before the client connects.
@@ -354,7 +352,6 @@ allowed_ips = ["10.8.0.0/24"]
 [transport]
 mode = "quic"
 role = "client"
-server_name = "ferrum"
 CFG
     done
   fi

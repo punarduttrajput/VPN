@@ -17,7 +17,8 @@ allowed_ips = ["10.8.0.2/32"]
 [transport]
 mode = "quic"
 role = "client"        # the other peer uses role = "server"
-server_name = "ferrum"    # TLS SNI presented/expected (peer identity is via WireGuard)
+# server_name = "cdn.example.net"  # optional TLS SNI. Unset (recommended unless
+#                                  # you control a plausible hostname) sends none.
 # Pin the QUIC server's certificate (SEC-004) so an on-path box can't intercept
 # the outer QUIC layer. On the SERVER peer run:
 #   ferrum tls-fingerprint --config <server-config.toml>

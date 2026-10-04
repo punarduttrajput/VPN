@@ -28,18 +28,39 @@ is WireGuard, and the outer layer is pinned (SEC-004).
 
 ## Acceptance criteria
 
-- [ ] The QUIC mesh's SNI is configurable, and its default doesn't name the
+- [x] The QUIC mesh's SNI is configurable, and its default doesn't name the
       product. Options: no SNI at all (an IP-literal dial; check this is
       common enough for QUIC to blend in), or an operator-chosen plausible
-      hostname.
-- [ ] The point-to-point QUIC and MASQUE defaults change the same way. The
-      README and `config*.example.toml` stop recommending `ferrum`.
-- [ ] Verification doesn't depend on the name. `PinnedVerifier` already ignores
+      hostname. *(Both: no SNI by default via `tls::dial_name`, which dials by
+      the peer's IP literal so rustls omits the extension, and
+      `QuicMeshTransport::with_server_name` for an operator hostname, wired from
+      `[transport] server_name` in the CLI and desktop. No-SNI was chosen as the
+      default because it names nothing; a fixed "plausible" hostname shipped by
+      default would just be a new constant to match. A ClientHello without
+      SNI is less common than one with it, which the threat model records.)*
+- [x] The point-to-point QUIC and MASQUE defaults change the same way. The
+      README and `config*.example.toml` stop recommending `ferrum`. *(MASQUE
+      also brackets an IPv6 literal in the HTTP/3 `:authority` while dialing
+      the bare address. README has a "TLS server name" note, including that a
+      third-party MASQUE proxy usually needs its real hostname;
+      `verify-linux.sh` now exercises the default.)*
+- [x] Verification doesn't depend on the name. `PinnedVerifier` already ignores
       `server_name` (it pins the key), so add a test that a non-`ferrum` SNI
-      still connects.
-- [ ] The certificate SAN no longer names the product (or this is justified as
+      still connects. *(`quic::sni_is_absent_by_default_and_configurable`
+      reads the SNI the server actually received: `None` by default,
+      `cdn.example.net` when configured. Mutation-checked: restoring the old
+      default makes it fail with `Some("ferrum")`. The MASQUE tests now dial
+      with an IPv4 literal, an IPv6 literal and a hostname.)*
+- [x] The certificate SAN no longer names the product (or this is justified as
       only visible to active probers that already know to dial the node).
-- [ ] Threat model §5 updated.
+      *(Both cert builders now use an empty subject and no SAN. That also drops
+      rcgen's default `CN=rcgen self signed cert`, a scanner-matchable string
+      the ticket didn't mention. Pins hash only the public key, so existing
+      pins are unchanged; `tls::certs_name_nothing` checks the DER.)*
+- [x] Threat model §5 updated. *(Also records what's still distinguishable:
+      plain/mesh QUIC offers no ALPN, unlike web QUIC's `h3`. Matching it
+      would need the in-mesh server to behave plausibly to an `h3` prober too,
+      so it's a follow-up, not part of this ticket.)*
 
 ## Implementation notes
 

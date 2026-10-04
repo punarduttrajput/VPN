@@ -41,7 +41,7 @@ use quinn::{ClientConfig, Connection, Endpoint, ServerConfig};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, warn};
 
-use crate::tls::{self, Fingerprint, TlsIdentity, SERVER_NAME};
+use crate::tls::{self, Fingerprint, TlsIdentity};
 use crate::{MeshTransport, TransportError};
 
 /// Max bytes read for a peer's hello (an `ip:port` string is far smaller).
@@ -66,6 +66,8 @@ pub struct QuicMeshTransport {
     fingerprint: Fingerprint,
     /// Expected cert pins per dialable peer address (SEC-004).
     pins: std::sync::Mutex<HashMap<SocketAddr, Vec<Fingerprint>>>,
+    /// TLS name to dial peers with; `None` sends no SNI (SEC-020).
+    server_name: Option<String>,
     /// Connections we dialed, keyed by the peer's advertised address (used to send).
     dialed: Mutex<HashMap<SocketAddr, Connection>>,
     /// Destinations whose last dial failed, and when to try again.
@@ -99,12 +101,21 @@ impl QuicMeshTransport {
             local_addr,
             fingerprint: identity.fingerprint(),
             pins: std::sync::Mutex::new(HashMap::new()),
+            server_name: None,
             dialed: Mutex::new(HashMap::new()),
             backoff: std::sync::Mutex::new(DialBackoff::default()),
             inbound_tx,
             inbound_rx: Mutex::new(inbound_rx),
             accept_task,
         })
+    }
+
+    /// Dial peers presenting `name` as the TLS server name (SNI) instead of
+    /// the default of none (SEC-020). For operators who want the ClientHello to
+    /// carry a hostname they control; pins still decide whom we accept.
+    pub fn with_server_name(mut self, name: Option<String>) -> Self {
+        self.server_name = name;
+        self
     }
 
     /// The local (advertised) address this endpoint is bound to.
@@ -138,9 +149,10 @@ impl QuicMeshTransport {
         if let Some(conn) = dialed.get(&dst) {
             return Ok(conn.clone());
         }
+        let name = tls::dial_name(self.server_name.as_deref(), dst);
         let conn = self
             .endpoint
-            .connect_with(self.client_config_for(dst)?, dst, SERVER_NAME)
+            .connect_with(self.client_config_for(dst)?, dst, &name)
             .map_err(|e| conn_err(format!("connect {dst}: {e}")))?
             .await
             .map_err(|e| conn_err(format!("handshake {dst}: {e}")))?;
