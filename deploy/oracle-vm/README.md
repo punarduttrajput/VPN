@@ -193,6 +193,11 @@ If clients use the QUIC or MASQUE transports, their outer TLS layer is pinned
 (SEC-004). Roll those keys with the advertise-next → roll → drop-old runbook in
 [`../transport-cert-rotation.md`](../transport-cert-rotation.md), so no pinned
 client ever sees an unlisted key.
+This VM holds the coordinator database and runs the relay, the two components
+that see the most metadata. Read the [threat model](../../docs/security/threat-model.md)
+(§3 coordinator, §4 relay) for what they can observe, and work through the
+operator checklist in [SECURITY.md](../../SECURITY.md) before real users join.
+
 
 ## Also want metrics/dashboards?
 
