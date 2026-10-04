@@ -6,7 +6,10 @@
 # ticket that removes it. Adding one without those three is a review blocker.
 
 [graph]
-all-features = false
+# Every optional feature too (SEC-022): the QUIC/MASQUE transports, OIDC,
+# admin API, uniffi bindings and the rest are optional, and checking only the
+# default set let RUSTSEC-2026-0185 (quinn-proto) through unnoticed.
+all-features = true
 
 [advisories]
 # Unmaintained crates and unsound code fail the check too, not just CVEs.
@@ -32,8 +35,44 @@ allow = [
     "Unicode-3.0",
     "Unlicense",
     "WTFPL",
+    "Zlib",
 ]
 confidence-threshold = 0.9
+
+# MPL-2.0 is weak, file-level copyleft: using these crates unmodified puts no
+# obligation on Ferrum's own code. Scoped to the uniffi crates that generate
+# the Android/iOS bindings (client-core `uniffi` feature), not allowed globally.
+[[licenses.exceptions]]
+crate = "uniffi"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "uniffi_bindgen"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "uniffi_core"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "uniffi_internal_macros"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "uniffi_macros"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "uniffi_meta"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "uniffi_pipeline"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "uniffi_udl"
+allow = ["MPL-2.0"]
 
 [bans]
 # Duplicate versions are common transitively (windows-sys, socket2, ...) and not

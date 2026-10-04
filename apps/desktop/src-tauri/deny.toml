@@ -1,0 +1,32 @@
+# cargo-deny configuration for the desktop app (SEC-022). The desktop is its
+# own workspace, so the root `deny.toml` gate never saw its dependency tree:
+# it had drifted onto vulnerable h2, rustls and quick-xml releases. CI
+# (`.github/workflows/supply-chain.yml`) now runs `cargo deny check advisories`
+# here too.
+#
+# Advisories only for now. Tauri's tree also brings MPL-2.0 crates (cssparser,
+# option-ext, ...) and duplicate/wildcard questions; licences and bans for the
+# desktop are a follow-up that needs its own policy decisions.
+#
+# Every `ignore` names the advisory, why it can't be fixed here, and where it
+# comes from. Adding one without those is a review blocker.
+
+[graph]
+all-features = true
+
+[advisories]
+unmaintained = "all"
+yanked = "deny"
+ignore = [
+    # Unmaintained, not vulnerable. All arrive through Tauri itself
+    # (tauri-utils -> urlpattern -> unic-ucd-ident) and go away when Tauri
+    # moves off urlpattern 0.3; nothing to replace on our side.
+    { id = "RUSTSEC-2025-0075", reason = "unic-char-range, unmaintained; via tauri-utils/urlpattern" },
+    { id = "RUSTSEC-2025-0080", reason = "unic-common, unmaintained; via tauri-utils/urlpattern" },
+    { id = "RUSTSEC-2025-0081", reason = "unic-char-property, unmaintained; via tauri-utils/urlpattern" },
+    { id = "RUSTSEC-2025-0098", reason = "unic-ucd-version, unmaintained; via tauri-utils/urlpattern" },
+    { id = "RUSTSEC-2025-0100", reason = "unic-ucd-ident, unmaintained; via tauri-utils/urlpattern" },
+    # Unmaintained proc-macro helper, compile-time only. Via gtk-rs 0.18
+    # (glib-macros), the Linux webview stack Tauri depends on.
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error, unmaintained, build-time only; via gtk/glib-macros 0.18" },
+]
