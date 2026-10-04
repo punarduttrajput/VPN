@@ -37,6 +37,7 @@
 //! der | openssl dgst -sha256`; hex with or without `:` separators, any case.
 
 use std::collections::HashSet;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use zeroize::{Zeroize, Zeroizing};
@@ -51,9 +52,32 @@ use tracing::warn;
 pub use crate::fingerprint::{fingerprint_hex, parse_fingerprint, parse_fingerprints, Fingerprint};
 use crate::TransportError;
 
-/// TLS name every Ferrum QUIC/MASQUE endpoint presents and dials. Identity is
-/// the pinned cert (and, underneath, WireGuard), never the name.
-pub const SERVER_NAME: &str = "ferrum";
+/// The TLS server name to dial `addr` with (SEC-020). Identity is the pinned
+/// key (and, underneath, WireGuard), never the name, so the name only decides
+/// what an on-path observer reads in the cleartext ClientHello:
+///
+/// - an operator-configured `name` (a hostname they control) is used as-is;
+/// - otherwise `addr`'s IP literal, for which rustls sends **no SNI at all**
+///   (RFC 6066 §3 allows only DNS names there), so the ClientHello names
+///   nothing. Never a fixed product name, which one DPI rule could match.
+pub fn dial_name(name: Option<&str>, addr: SocketAddr) -> String {
+    match name.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(n) => n.to_string(),
+        None => addr.ip().to_string(),
+    }
+}
+
+/// A self-signed cert for `key_pair` that names nothing (SEC-020): empty
+/// subject, no SAN. rcgen's defaults would put `CN=rcgen self signed cert` in
+/// it, which a scanner that completes a handshake could match on. Nothing
+/// verifies the name; peers pin the public key.
+fn anonymous_cert(key_pair: &rcgen::KeyPair) -> Result<rcgen::Certificate, TransportError> {
+    let mut params = rcgen::CertificateParams::default();
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params
+        .self_signed(key_pair)
+        .map_err(|e| setup(format!("TLS identity cert: {e}")))
+}
 
 /// HKDF salt/label for deriving the TLS key from the WireGuard key.
 const IDENTITY_SALT: &[u8] = b"ferrum-quic-tls-identity-v1";
@@ -212,9 +236,7 @@ impl TlsIdentity {
         let key_pair = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(&key, &rcgen::PKCS_ED25519)
             .map_err(|e| setup(format!("TLS identity key: {e}")))?;
         let fingerprint = sha256(&key_pair.public_key_der());
-        let cert = rcgen::CertificateParams::new(vec![SERVER_NAME.to_string()])
-            .and_then(|p| p.self_signed(&key_pair))
-            .map_err(|e| setup(format!("TLS identity cert: {e}")))?;
+        let cert = anonymous_cert(&key_pair)?;
         Ok(Self {
             cert: cert.der().clone(),
             key,
@@ -225,12 +247,13 @@ impl TlsIdentity {
     /// A fresh random identity (a different key every call) — for tests and
     /// for servers nobody pins.
     pub fn ephemeral() -> Result<Self, TransportError> {
-        let c = rcgen::generate_simple_self_signed(vec![SERVER_NAME.to_string()])
-            .map_err(|e| setup(format!("self-signed cert: {e}")))?;
-        let fingerprint = sha256(&c.key_pair.public_key_der());
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)
+            .map_err(|e| setup(format!("self-signed key: {e}")))?;
+        let cert = anonymous_cert(&key_pair)?;
+        let fingerprint = sha256(&key_pair.public_key_der());
         Ok(Self {
-            cert: CertificateDer::from(c.cert),
-            key: PrivatePkcs8KeyDer::from(c.key_pair.serialize_der()),
+            cert: cert.der().clone(),
+            key: PrivatePkcs8KeyDer::from(key_pair.serialize_der()),
             fingerprint,
         })
     }
@@ -412,6 +435,43 @@ mod tests {
             c.fingerprint(),
             "different key, different pin"
         );
+    }
+
+    /// SEC-020: with no configured name, dial by IP literal (no SNI); a
+    /// configured name is used trimmed; blank counts as unset.
+    #[test]
+    fn dial_name_defaults_to_the_ip_literal() {
+        let v4: SocketAddr = "203.0.113.7:443".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        assert_eq!(dial_name(None, v4), "203.0.113.7");
+        assert_eq!(dial_name(None, v6), "2001:db8::1");
+        assert_eq!(dial_name(Some("  "), v4), "203.0.113.7");
+        assert_eq!(dial_name(Some(" cdn.example.net "), v4), "cdn.example.net");
+        // An IP-literal name is what makes rustls omit the SNI extension.
+        assert!(matches!(
+            ServerName::try_from(dial_name(None, v6)).unwrap(),
+            ServerName::IpAddress(_)
+        ));
+    }
+
+    /// SEC-020: neither kind of cert names the product or the generator; a
+    /// prober that completes a handshake learns only an anonymous key.
+    #[test]
+    fn certs_name_nothing() {
+        for id in [
+            TlsIdentity::from_wireguard_key(&[9; 32]).unwrap(),
+            TlsIdentity::ephemeral().unwrap(),
+        ] {
+            let der = id.cert.as_ref();
+            for needle in [&b"ferrum"[..], b"rcgen", b"self signed"] {
+                assert!(
+                    !der.windows(needle.len())
+                        .any(|w| w.eq_ignore_ascii_case(needle)),
+                    "cert contains {:?}",
+                    String::from_utf8_lossy(needle)
+                );
+            }
+        }
     }
 
     #[test]

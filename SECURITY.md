@@ -29,8 +29,9 @@ for why each one matters.
   `--insecure-no-auth`, which is for local testing only).
 - Protect the control channel with mTLS, or run it only on a trusted network.
 - Pin TLS for QUIC/MASQUE (automatic in the coordinator-managed mesh; set
-  `cert_pins` for point-to-point and MASQUE), and set a neutral `server_name`
-  where it's configurable (SEC-020).
+  `cert_pins` for point-to-point and MASQUE). Leave `server_name` unset (no
+  SNI) unless it's a hostname you control, or a third-party MASQUE proxy needs
+  its real one (SEC-020).
 - Keep coordinator and relay logs at the default `info` level in production.
   `debug` logs client addresses.
 - Treat the coordinator database, its backups and admin tokens as sensitive.

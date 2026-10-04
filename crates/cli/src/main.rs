@@ -619,12 +619,6 @@ async fn up(config_path: &str, iface: &str, mtu: u16) -> Result<()> {
             {
                 use ferrum_core::config::TransportRole;
                 use ferrum_transport::QuicTransport;
-                let server_name = config
-                    .transport
-                    .server_name
-                    .as_deref()
-                    .unwrap_or("ferrum")
-                    .to_string();
                 match config.transport.role {
                     Some(TransportRole::Server) => {
                         info!("transport: quic (server), listening on {bind_addr}");
@@ -651,6 +645,11 @@ async fn up(config_path: &str, iface: &str, mtu: u16) -> Result<()> {
                     }
                     Some(TransportRole::Client) => {
                         info!("transport: quic (client), connecting to {peer}");
+                        // SEC-020: the peer's IP (no SNI) unless one is configured.
+                        let server_name = ferrum_transport::tls::dial_name(
+                            config.transport.server_name.as_deref(),
+                            peer,
+                        );
                         let transport = QuicTransport::connect(
                             bind_addr,
                             peer,
@@ -696,12 +695,11 @@ async fn up(config_path: &str, iface: &str, mtu: u16) -> Result<()> {
                     })?
                     .parse()
                     .context("parsing transport.masque_proxy")?;
-                let authority = config
-                    .transport
-                    .server_name
-                    .as_deref()
-                    .unwrap_or("ferrum")
-                    .to_string();
+                // SEC-020: the proxy's IP (no SNI) unless a name is configured.
+                let authority = ferrum_transport::tls::dial_name(
+                    config.transport.server_name.as_deref(),
+                    proxy_addr,
+                );
                 info!("transport: masque, proxy={proxy_addr}");
                 let pins = cert_pins(&config)?;
                 let transport =
@@ -960,11 +958,14 @@ async fn up_mesh(
                     cert_sha256 = %ferrum_transport::tls::fingerprint_hex(&id.fingerprint()),
                     "mesh transport: quic"
                 );
+                let server_name = config.transport.server_name.clone();
                 let make_transport = move || {
                     let id = id.clone();
+                    let server_name = server_name.clone();
                     async move {
                         ferrum_transport::QuicMeshTransport::bind(bind_addr, &id)
                             .await
+                            .map(|t| t.with_server_name(server_name))
                             .map_err(|e| ferrum_client_core::Error::DataPlane(e.to_string()))
                     }
                 };
@@ -1004,12 +1005,11 @@ async fn up_mesh(
                     })?
                     .parse()
                     .context("parsing transport.masque_proxy")?;
-                let authority = config
-                    .transport
-                    .server_name
-                    .as_deref()
-                    .unwrap_or("ferrum")
-                    .to_string();
+                // SEC-020: the proxy's IP (no SNI) unless a name is configured.
+                let authority = ferrum_transport::tls::dial_name(
+                    config.transport.server_name.as_deref(),
+                    proxy_addr,
+                );
                 info!(proxy = %proxy_addr, "mesh transport: masque");
                 let pins = cert_pins(&config)?;
                 let make_transport = move || {

@@ -101,7 +101,9 @@ pub struct MasqueTransport {
 impl MasqueTransport {
     /// Open a CONNECT-UDP session to a MASQUE `proxy` that will relay to `target`,
     /// accepting only a proxy cert whose SHA-256 is in `pins` (empty: connect
-    /// with a warning).
+    /// with a warning). `authority` is the TLS name and HTTP/3 `:authority`;
+    /// an IP literal (from [`tls::dial_name`](crate::tls::dial_name)) sends no
+    /// SNI (SEC-020).
     pub async fn connect(
         local: SocketAddr,
         proxy: SocketAddr,
@@ -127,8 +129,11 @@ impl MasqueTransport {
         endpoint
             .set_default_client_config(ClientConfig::new(Arc::new(h3_client_crypto(pins, proxy)?)));
 
+        // An IP-literal authority (the SEC-020 default) dials with no SNI; the
+        // URI needs IPv6 literals bracketed, the TLS name doesn't.
+        let tls_name = authority.trim_start_matches('[').trim_end_matches(']');
         let conn = endpoint
-            .connect(proxy, authority)
+            .connect(proxy, tls_name)
             .map_err(conn_err)?
             .await
             .map_err(conn_err)?;
@@ -145,7 +150,11 @@ impl MasqueTransport {
         // `capsule-protocol: ?1` header (RFC 9297 §3.4) signals capsule-protocol
         // support on the request stream — third-party proxies expect it.
         let path = format!("/.well-known/masque/udp/{}/{}/", target.ip(), target.port());
-        let uri: http::Uri = format!("https://{authority}{path}")
+        let uri_authority = match tls_name.parse::<std::net::Ipv6Addr>() {
+            Ok(v6) => format!("[{v6}]"),
+            Err(_) => tls_name.to_string(),
+        };
+        let uri: http::Uri = format!("https://{uri_authority}{path}")
             .parse()
             .map_err(setup)?;
         let mut builder = http::Request::builder()
@@ -511,7 +520,9 @@ pub struct MasqueMeshTransport {
 impl MasqueMeshTransport {
     /// Create a mesh transport that tunnels every peer through `proxy`,
     /// presenting `authority` as the HTTP/3 `:authority` (also the TLS name) and
-    /// pinning the proxy's cert to `pins` (empty: every session warns).
+    /// pinning the proxy's cert to `pins` (empty: every session warns). Pass
+    /// [`tls::dial_name`](crate::tls::dial_name)`(configured, proxy)`: an IP
+    /// literal there sends no SNI (SEC-020).
     pub fn new(proxy: SocketAddr, authority: impl Into<String>, pins: Vec<Fingerprint>) -> Self {
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
         Self {
@@ -659,7 +670,7 @@ mod tests {
         let err = MasqueTransport::connect(
             "127.0.0.1:0".parse().unwrap(),
             proxy_addr,
-            "ferrum",
+            "127.0.0.1",
             target,
             vec![pin],
         )
@@ -688,7 +699,7 @@ mod tests {
             let err = MasqueTransport::connect_with_token(
                 local,
                 proxy_addr,
-                "ferrum",
+                "127.0.0.1",
                 target,
                 vec![pin],
                 bad,
@@ -701,7 +712,7 @@ mod tests {
         let ok = MasqueTransport::connect_with_token(
             local,
             proxy_addr,
-            "ferrum",
+            "127.0.0.1",
             target,
             vec![pin],
             Some("s3cret"),
@@ -756,7 +767,7 @@ mod tests {
         let client = MasqueTransport::connect(
             "127.0.0.1:0".parse().unwrap(),
             proxy_addr,
-            "ferrum",
+            "127.0.0.1",
             target,
             vec![pin],
         )
@@ -840,11 +851,13 @@ mod tests {
         });
 
         // Two clients through the *same* proxy, each targeting a different peer.
+        // SEC-020: a configured hostname, and a bare IPv6 literal (no SNI; the
+        // URI must bracket it) both reach the in-tree proxy.
         let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let c1 = MasqueTransport::connect(local, proxy_addr, "ferrum", t1, vec![pin])
+        let c1 = MasqueTransport::connect(local, proxy_addr, "cdn.example.net", t1, vec![pin])
             .await
             .unwrap();
-        let c2 = MasqueTransport::connect(local, proxy_addr, "ferrum", t2, vec![pin])
+        let c2 = MasqueTransport::connect(local, proxy_addr, "::1", t2, vec![pin])
             .await
             .unwrap();
 
@@ -897,7 +910,7 @@ mod tests {
             let _ = proxy.serve().await;
         });
 
-        let mesh = MasqueMeshTransport::new(proxy_addr, "ferrum", vec![pin]);
+        let mesh = MasqueMeshTransport::new(proxy_addr, "127.0.0.1", vec![pin]);
         mesh.send_to(p1, b"hi-1").await.unwrap();
         mesh.send_to(p2, b"hi-2").await.unwrap();
 
@@ -937,7 +950,7 @@ mod tests {
         let res = MasqueTransport::connect(
             "127.0.0.1:0".parse().unwrap(),
             impostor_addr,
-            "ferrum",
+            "127.0.0.1",
             "127.0.0.1:9".parse().unwrap(),
             vec![expected.fingerprint()],
         )
