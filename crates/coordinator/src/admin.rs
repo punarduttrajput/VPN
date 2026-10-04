@@ -51,6 +51,10 @@ pub fn router(
     Router::new()
         .route("/api/devices", get(list_devices))
         .route("/api/devices/revoke", axum::routing::post(revoke_device))
+        .route(
+            "/api/devices/unrevoke",
+            axum::routing::post(unrevoke_device),
+        )
         .route("/api/policy", get(get_policy).put(put_policy))
         // Anything that isn't an /api/* route falls through to here — the
         // embedded Angular build, with an index.html fallback for its
@@ -119,7 +123,9 @@ async fn revoke_device(
         .registry
         .lock()
         .expect("registry mutex poisoned")
-        .remove(&body.public_key);
+        // Durable (SEC-013): the key and its bound identity stay refused until
+        // an explicit unrevoke, so the same token can't simply re-register.
+        .revoke(&body.public_key);
     match result {
         Ok(()) => {
             // A revoked device must vanish from every connected peer's map now,
@@ -130,6 +136,28 @@ async fn revoke_device(
         Err(RegistryError::UnknownDevice) => {
             (StatusCode::NOT_FOUND, "unknown device").into_response()
         }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// Lift a revocation (SEC-013): the key, and any identity revoked with it, may
+/// register again. `404` if the key isn't revoked.
+async fn unrevoke_device(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Json(body): Json<RevokeRequest>,
+) -> Response {
+    if let Err(resp) = authorize(&headers, &state) {
+        return resp;
+    }
+    let result = state
+        .registry
+        .lock()
+        .expect("registry mutex poisoned")
+        .unrevoke(&body.public_key);
+    match result {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "key is not revoked").into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -358,6 +386,57 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// SEC-013: an admin revoke is durable (the key can't re-register) until
+    /// `/api/devices/unrevoke` lifts it; unrevoking a key that isn't revoked
+    /// is a 404.
+    #[tokio::test]
+    async fn revoke_is_durable_until_unrevoked() {
+        let signer = TestSigner::new("k1");
+        let (registry, router) =
+            state_and_router(signer.verifier("https://idp.example", "ferrum-admin"));
+        registry
+            .lock()
+            .unwrap()
+            .register("AAA", "laptop", "1.1.1.1:51820", &[])
+            .unwrap();
+        let token = admin_token(&signer, 3600);
+        let post = |uri: &str| {
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"public_key":"AAA"}"#))
+                .unwrap()
+        };
+
+        let resp = router
+            .clone()
+            .oneshot(post("/api/devices/revoke"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            registry.lock().unwrap().register("AAA", "laptop", "", &[]),
+            Err(RegistryError::Revoked)
+        );
+
+        let resp = router
+            .clone()
+            .oneshot(post("/api/devices/unrevoke"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        registry
+            .lock()
+            .unwrap()
+            .register("AAA", "laptop", "", &[])
+            .unwrap();
+
+        let resp = router.oneshot(post("/api/devices/unrevoke")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 

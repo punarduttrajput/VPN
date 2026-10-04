@@ -26,18 +26,28 @@ other RPCs trust the `public_key` in the request:
 
 ## Acceptance criteria
 
-- [ ] When the caller is authenticated, `PublishCandidates`, `GetNetworkMap`
+- [x] When the caller is authenticated, `PublishCandidates`, `GetNetworkMap`
       and `WatchNetworkMap` require `public_key` to be the key bound to the
       caller's identity (`permission_denied` otherwise). Open mode is
-      unchanged.
-- [ ] `RelayHeartbeat` requires a relay role (a verified `relay` tag/claim, or
+      unchanged. *(`authorize_key`. A revoked key is refused in open mode too.)*
+- [x] `RelayHeartbeat` requires a relay role (a verified `relay` tag/claim, or
       a dedicated relay mTLS identity). Ordinary device tokens are refused.
-- [ ] Revocation is durable: revoke removes the identity binding and records
+      *(`RELAY_TAG`, or an identity in `--relay-identity mtls:<fp>,oidc:<sub>`.)*
+- [x] Revocation is durable: revoke removes the identity binding and records
       the key (and optionally the identity) in a persisted denylist that
-      `RegisterDevice`/`RotateKey` consult.
-- [ ] Tests for each: a second authenticated device cannot publish/read/watch
+      `RegisterDevice`/`RotateKey` consult. *(`Registry::revoke`: key **and**
+      bound identity denylisted, persisted in SQLite; `unrevoke` /
+      `POST /api/devices/unrevoke` lifts both. Also closes the revoked device's
+      open watch stream: before this, an unregistered key's map fell back to
+      empty tags, i.e. the full mesh under allow-all.)*
+- [x] Tests for each: a second authenticated device cannot publish/read/watch
       as the first; a device token cannot heartbeat; a revoked device cannot
       re-register with the same token.
+
+**Operator-visible change:** with auth on, a self-announcing relay
+(`ferrum relay --coordinator … --token-file …`) needs a token tagged `relay`
+(`mint-token.py mint --tags relay …`) or an allowlisted identity. A static
+`--relay`, as in `deploy/oracle-vm`, is unaffected.
 
 ## Implementation notes
 

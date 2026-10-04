@@ -75,8 +75,10 @@ enum Command {
         advertise: Option<String>,
         /// Path to a file holding an OIDC bearer token (JWT) for the
         /// coordinator's RelayHeartbeat RPC — needed only when the coordinator
-        /// runs with OIDC auth. Read from a file to keep it out of the process
-        /// list.
+        /// runs with OIDC auth. The token must carry the `relay` tag (or its
+        /// subject be listed in the coordinator's `--relay-identity`): an
+        /// ordinary device token is refused (SEC-013). Read from a file to
+        /// keep it out of the process list.
         #[arg(long)]
         token_file: Option<String>,
         /// Optional OTLP collector endpoint to export tracing spans to, e.g.
