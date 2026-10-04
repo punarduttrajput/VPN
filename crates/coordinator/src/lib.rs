@@ -79,6 +79,51 @@ pub fn resolve_auth_mode(
     }
 }
 
+/// The audience admin-API tokens must carry (SEC-014): `--admin-audience` when
+/// given, else `<device audience>-admin`. It must differ from the device
+/// audience, so a device's token can never double as an admin token; passing
+/// the same value is rejected as a misconfiguration rather than accepted.
+pub fn resolve_admin_audience(
+    device_audience: &str,
+    admin_audience: Option<&str>,
+) -> Result<String, String> {
+    let admin = match admin_audience.map(str::trim) {
+        Some("") => return Err("--admin-audience must not be empty".into()),
+        Some(a) => a.to_string(),
+        None => format!("{device_audience}-admin"),
+    };
+    if admin == device_audience {
+        return Err(format!(
+            "--admin-audience must differ from --oidc-audience ('{device_audience}'): with one \
+             audience, any device token carrying an `admin` tag would unlock the admin API"
+        ));
+    }
+    Ok(admin)
+}
+
+#[cfg(test)]
+mod admin_audience_tests {
+    use super::resolve_admin_audience;
+
+    #[test]
+    fn defaults_to_a_distinct_audience() {
+        assert_eq!(
+            resolve_admin_audience("ferrum-coordinator", None).unwrap(),
+            "ferrum-coordinator-admin"
+        );
+    }
+
+    #[test]
+    fn explicit_audience_is_used_but_must_differ() {
+        assert_eq!(
+            resolve_admin_audience("ferrum", Some("ferrum-panel")).unwrap(),
+            "ferrum-panel"
+        );
+        assert!(resolve_admin_audience("ferrum", Some("ferrum")).is_err());
+        assert!(resolve_admin_audience("ferrum", Some("  ")).is_err());
+    }
+}
+
 #[cfg(test)]
 mod auth_mode_tests {
     use super::*;

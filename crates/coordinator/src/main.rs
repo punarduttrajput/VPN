@@ -324,11 +324,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
             }
         };
+        // SEC-014: admin tokens are for their own audience, never the device
+        // audience (`--admin-audience`, default `<audience>-admin`).
+        let admin_audience = ferrum_coordinator::resolve_admin_audience(
+            &audience,
+            arg_value("--admin-audience").as_deref(),
+        )?;
         let jwks_doc = std::fs::read_to_string(&jwks_path)?;
         let jwks = ferrum_coordinator::Jwks::from_json(&jwks_doc)?;
         let verifier = Arc::new(ferrum_coordinator::OidcVerifier::new(
-            &issuer, &audience, jwks,
+            &issuer,
+            &admin_audience,
+            jwks,
         ));
+        info!(audience = %admin_audience, "admin API accepts tokens for its own audience only");
         let router = ferrum_coordinator::admin::router(admin_registry, admin_changes, verifier);
         info!(%addr, "admin API + panel listening");
         tokio::spawn(async move {
