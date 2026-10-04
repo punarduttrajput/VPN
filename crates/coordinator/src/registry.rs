@@ -59,6 +59,49 @@ pub struct Device {
     /// SHA-256 pin (64 lowercase hex) of the TLS cert this device presents to
     /// QUIC dialers (SEC-004), or empty. Distributed to permitted peers.
     pub tls_cert_sha256: String,
+    /// Pins this device has pre-announced for an upcoming key rotation
+    /// (SEC-007), normalized. Peers accept these as well as the current pin.
+    pub tls_next_pins: Vec<String>,
+}
+
+/// Most next pins a device may pre-announce (SEC-007). A roll needs one; a
+/// small allowance covers overlapping or aborted rolls without letting a
+/// device bloat every peer's network map.
+pub const MAX_TLS_NEXT_PINS: usize = 4;
+
+/// A device's TLS pin set, already normalized (see [`TlsPins::normalize`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TlsPins {
+    /// The pin the device presents now, or empty for none.
+    pub current: String,
+    /// Pins it may present soon (SEC-007): distinct, never equal to `current`.
+    pub next: Vec<String>,
+}
+
+impl TlsPins {
+    /// Validate and normalize a pin set from the wire: the current pin may be
+    /// empty; every next pin must be a real pin. Duplicates and a next pin
+    /// equal to the current one are dropped. More than
+    /// [`MAX_TLS_NEXT_PINS`] distinct next pins is an error.
+    pub fn normalize(current: &str, next: &[String]) -> Result<Self, String> {
+        let current = normalize_tls_pin(current)
+            .ok_or_else(|| "TLS pin must be 64 hex digits or empty".to_string())?;
+        let mut out: Vec<String> = Vec::new();
+        for pin in next {
+            let pin = normalize_tls_pin(pin)
+                .filter(|p| !p.is_empty())
+                .ok_or_else(|| format!("next TLS pin '{pin}' is not 64 hex digits"))?;
+            if pin != current && !out.contains(&pin) {
+                out.push(pin);
+            }
+        }
+        if out.len() > MAX_TLS_NEXT_PINS {
+            return Err(format!(
+                "at most {MAX_TLS_NEXT_PINS} next TLS pins may be announced"
+            ));
+        }
+        Ok(Self { current, next: out })
+    }
 }
 
 /// Normalize a TLS pin (SHA-256 of the device's TLS public key) to 64 lowercase
@@ -214,7 +257,7 @@ impl Registry {
 
     /// Register or re-register a device. Re-registering the same public key is
     /// idempotent: the name/endpoint/tags are refreshed and the existing IP kept
-    /// (and any existing TLS pin left as is — see [`register_with_pin`](Self::register_with_pin)).
+    /// (and any existing TLS pins left as is — see [`register_with_pins`](Self::register_with_pins)).
     pub fn register(
         &mut self,
         public_key: &str,
@@ -222,19 +265,19 @@ impl Registry {
         endpoint: &str,
         tags: &[String],
     ) -> Result<Ipv4Addr, RegistryError> {
-        self.register_with_pin(public_key, name, endpoint, tags, None)
+        self.register_with_pins(public_key, name, endpoint, tags, None)
     }
 
-    /// [`register`](Self::register), also setting the device's TLS pin
-    /// (SEC-004) in the same single store write when `pin` is `Some` (already
-    /// normalized — see [`normalize_tls_pin`]; `Some("")` clears it).
-    pub fn register_with_pin(
+    /// [`register`](Self::register), also replacing the device's TLS pin set
+    /// (SEC-004 current pin + SEC-007 next pins) in the same single store write
+    /// when `pins` is `Some`. The default (empty) set clears them.
+    pub fn register_with_pins(
         &mut self,
         public_key: &str,
         name: &str,
         endpoint: &str,
         tags: &[String],
-        pin: Option<&str>,
+        pins: Option<&TlsPins>,
     ) -> Result<Ipv4Addr, RegistryError> {
         if public_key.trim().is_empty() {
             return Err(RegistryError::InvalidKey);
@@ -246,8 +289,9 @@ impl Registry {
             existing.name = name.to_string();
             existing.endpoint = endpoint.to_string();
             existing.tags = tags.to_vec();
-            if let Some(pin) = pin {
-                existing.tls_cert_sha256 = pin.to_string();
+            if let Some(pins) = pins {
+                existing.tls_cert_sha256 = pins.current.clone();
+                existing.tls_next_pins = pins.next.clone();
             }
             existing.clone()
         } else {
@@ -261,7 +305,8 @@ impl Registry {
                 // Candidates are published separately (after STUN), via
                 // `set_candidates`; a fresh registration starts with none.
                 candidates: Vec::new(),
-                tls_cert_sha256: pin.unwrap_or_default().to_string(),
+                tls_cert_sha256: pins.map(|p| p.current.clone()).unwrap_or_default(),
+                tls_next_pins: pins.map(|p| p.next.clone()).unwrap_or_default(),
             };
             self.by_key.insert(public_key.to_string(), device.clone());
             device
@@ -297,18 +342,19 @@ impl Registry {
         Ok(())
     }
 
-    /// Record the TLS cert pin a registered device presents (SEC-004); `pin`
-    /// must already be normalized ([`normalize_tls_pin`]) — empty clears it.
-    pub fn set_tls_pin(&mut self, public_key: &str, pin: &str) -> Result<(), RegistryError> {
+    /// Replace a registered device's TLS pin set (SEC-004 / SEC-007). The
+    /// default (empty) set clears it.
+    pub fn set_tls_pins(&mut self, public_key: &str, pins: &TlsPins) -> Result<(), RegistryError> {
         let device = {
             let device = self
                 .by_key
                 .get_mut(public_key)
                 .ok_or(RegistryError::UnknownDevice)?;
-            if device.tls_cert_sha256 == pin {
+            if device.tls_cert_sha256 == pins.current && device.tls_next_pins == pins.next {
                 return Ok(()); // unchanged: skip the write
             }
-            device.tls_cert_sha256 = pin.to_string();
+            device.tls_cert_sha256 = pins.current.clone();
+            device.tls_next_pins = pins.next.clone();
             device.clone()
         };
         self.store
@@ -444,6 +490,34 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tls_pins_normalize_dedupes_and_bounds_next_pins() {
+        let (a, b) = ("aa".repeat(32), "bb".repeat(32));
+        let upper_b = vec!["BB"; 32].join(":");
+        let pins = TlsPins::normalize(&a, &[upper_b, b.clone(), a.clone()]).unwrap();
+        assert_eq!(
+            pins,
+            TlsPins {
+                current: a.clone(),
+                next: vec![b.clone()]
+            }
+        );
+        // A next pin with no current pin is fine (a first TLS rollout).
+        assert_eq!(
+            TlsPins::normalize("", std::slice::from_ref(&b))
+                .unwrap()
+                .next,
+            vec![b]
+        );
+        assert!(TlsPins::normalize("junk", &[]).is_err());
+        assert!(TlsPins::normalize(&a, &[String::new()]).is_err());
+        let too_many: Vec<String> = (1..=MAX_TLS_NEXT_PINS + 1)
+            .map(|i| format!("{i:02}").repeat(32))
+            .collect();
+        assert!(TlsPins::normalize(&a, &too_many).is_err());
+        assert!(TlsPins::normalize(&a, &too_many[..MAX_TLS_NEXT_PINS]).is_ok());
+    }
 
     fn registry() -> Registry {
         Registry::new(Ipv4Addr::new(10, 8, 0, 0), 24)

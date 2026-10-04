@@ -112,6 +112,14 @@ pub struct TransportConfig {
     /// value with `ferrum tls-fingerprint --config <its config>`.
     #[serde(default)]
     pub cert_pins: Vec<String>,
+    /// Pins this node will present *after* its next key rotation (SEC-007):
+    /// `ferrum up-mesh` pre-announces them to the coordinator, which hands them
+    /// to peers alongside the current pin, so peers accept the new key the
+    /// moment it goes live. Get the value with `ferrum tls-fingerprint` on a
+    /// config holding the next key. Remove it once the roll is complete. Same
+    /// format as `cert_pins`; at most 4.
+    #[serde(default)]
+    pub announce_next_pins: Vec<String>,
 }
 
 /// Whether `s` looks like a SHA-256 fingerprint: 64 hex digits, optionally
@@ -322,6 +330,20 @@ impl Config {
                     "transport.cert_pins '{pin}' is not a SHA-256 fingerprint (64 hex digits)"
                 )));
             }
+        }
+        for pin in &self.transport.announce_next_pins {
+            if !is_sha256_fingerprint(pin) {
+                return Err(Error::ConfigInvalid(format!(
+                    "transport.announce_next_pins '{pin}' is not a SHA-256 fingerprint (64 hex digits)"
+                )));
+            }
+        }
+        // Mirrors the coordinator's MAX_TLS_NEXT_PINS, so a bad config fails at
+        // load rather than at registration.
+        if self.transport.announce_next_pins.len() > 4 {
+            return Err(Error::ConfigInvalid(
+                "transport.announce_next_pins: at most 4 pins".into(),
+            ));
         }
 
         // DNS servers are bare IPs (DNS uses its standard ports), not ip:port.
@@ -560,6 +582,23 @@ mod tests {
         let cfg: Config = toml::from_str(&toml_str).unwrap();
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("cert_pins"), "{err}");
+    }
+
+    #[test]
+    fn announce_next_pins_are_validated() {
+        let with = |pins: &str| {
+            let toml_str = format!(
+                "{}\n[transport]\nmode = \"udp\"\nannounce_next_pins = [{pins}]\n",
+                valid_toml()
+            );
+            toml::from_str::<Config>(&toml_str).unwrap().validate()
+        };
+        let pin = format!("\"{}\"", "cd".repeat(32));
+        with(&pin).unwrap();
+        let err = with("\"nope\"").unwrap_err().to_string();
+        assert!(err.contains("announce_next_pins"), "{err}");
+        let five = vec![pin; 5].join(", ");
+        assert!(with(&five).is_err(), "more than 4 is refused");
     }
 
     #[test]

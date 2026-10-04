@@ -2,7 +2,7 @@
 
 **Ticket:** [SEC-009](../../tickets/security-hardening/SEC-009-third-party-audit-plan.md) ·
 **PRD:** [security-hardening.md](../../PRD/security-hardening.md) FR9 / AC8 ·
-**Status:** draft, 2026-09-29 · **Companion:** threat model (SEC-010, pending)
+**Status:** draft, 2026-09-29 · **Companion:** [threat model](threat-model.md) (SEC-010)
 
 Ferrum has never had an independent audit, and it ships a number of
 security-relevant pieces it wrote itself rather than taking from vetted crates.
