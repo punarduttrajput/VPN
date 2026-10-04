@@ -783,6 +783,16 @@ async fn up_mesh(
     if let Some(pin) = &tls_pin {
         control = control.with_tls_fingerprint(pin.clone());
     }
+    // SEC-007: pre-announce the pins of this node's next key (rotation runbook
+    // step 1), so peers already accept that key when it goes live.
+    let next_pins = config.transport.announce_next_pins.clone();
+    if !next_pins.is_empty() {
+        info!(
+            count = next_pins.len(),
+            "announcing next TLS pins for a planned key rotation"
+        );
+        control = control.with_tls_next_fingerprints(next_pins.clone());
+    }
     let address = control
         .register(&public_key, name, endpoint, tags)
         .await
@@ -849,7 +859,9 @@ async fn up_mesh(
     let client = FerrumClient::new();
     client.set_token(token);
     // (The session publishes its transport's own TLS pin at each registration
-    // — `run_mesh_session` — so it can't drift from the key in use.)
+    // — `run_mesh_session` — so it can't drift from the key in use. The next
+    // pins are operator-supplied, so they're set here.)
+    client.set_tls_next_fingerprints(next_pins);
     let identity = ClientIdentity {
         public_key: public_key.clone(),
         name: name.to_string(),

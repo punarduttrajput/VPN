@@ -177,6 +177,9 @@ struct Inner {
     /// [`FerrumClient::set_tls_fingerprint`]; SEC-004). `None` without a TLS
     /// transport.
     tls_fingerprint: Option<String>,
+    /// Pins pre-announced for this device's next key rotation (via
+    /// [`FerrumClient::set_tls_next_fingerprints`]; SEC-007).
+    tls_next_fingerprints: Vec<String>,
 }
 
 /// The shared client core: connection state machine + control-plane sync.
@@ -250,13 +253,31 @@ impl FerrumClient {
             .tls_fingerprint = pin;
     }
 
+    /// Pre-announce the pins this device will present after its next key
+    /// rotation (SEC-007): the TLS key is derived from the WireGuard key, so
+    /// this is the pin of the *next* WireGuard key (`TlsIdentity::
+    /// from_wireguard_key(next).fingerprint()`). Sent with every registration
+    /// from now on; complete the roll with
+    /// [`rotate_key_with_pins`](Self::rotate_key_with_pins). An empty list
+    /// withdraws the announcement.
+    pub fn set_tls_next_fingerprints(&self, pins: Vec<String>) {
+        self.inner
+            .lock()
+            .expect("client mutex poisoned")
+            .tls_next_fingerprints = pins;
+    }
+
     /// A control channel to `coordinator` carrying this client's bearer token
-    /// and TLS pin (crate-internal: every channel the facade and the data-plane
-    /// runner open goes through here).
+    /// and TLS pins (crate-internal: every channel the facade and the
+    /// data-plane runner open goes through here).
     pub(crate) async fn control(&self, coordinator: String) -> Result<ControlClient, Error> {
-        let (token, pin) = {
+        let (token, pin, next) = {
             let inner = self.inner.lock().expect("client mutex poisoned");
-            (inner.token.clone(), inner.tls_fingerprint.clone())
+            (
+                inner.token.clone(),
+                inner.tls_fingerprint.clone(),
+                inner.tls_next_fingerprints.clone(),
+            )
         };
         let mut control = ControlClient::connect(coordinator).await?;
         if let Some(token) = token {
@@ -264,6 +285,9 @@ impl FerrumClient {
         }
         if let Some(pin) = pin {
             control = control.with_tls_fingerprint(pin);
+        }
+        if !next.is_empty() {
+            control = control.with_tls_next_fingerprints(next);
         }
         Ok(control)
     }
@@ -467,6 +491,30 @@ impl FerrumClient {
     ) -> Result<String, Error> {
         let mut control = self.control(coordinator.into()).await?;
         control.rotate_key(old_public_key, new_public_key).await
+    }
+
+    /// [`rotate_key`](Self::rotate_key) for a node with a TLS transport
+    /// (SEC-007): installs `new_pin` (the new key's TLS pin) and `new_next_pins`
+    /// in the same RPC, and records them as this client's pins so every later
+    /// registration publishes them too. After a
+    /// [`set_tls_next_fingerprints`](Self::set_tls_next_fingerprints)
+    /// pre-announcement of `new_pin`, this completes a zero-downtime roll.
+    pub async fn rotate_key_with_pins(
+        &self,
+        coordinator: impl Into<String>,
+        old_public_key: &str,
+        new_public_key: &str,
+        new_pin: &str,
+        new_next_pins: Vec<String>,
+    ) -> Result<String, Error> {
+        let mut control = self.control(coordinator.into()).await?;
+        let cidr = control
+            .rotate_key_with_pins(old_public_key, new_public_key, new_pin, &new_next_pins)
+            .await?;
+        let mut inner = self.inner.lock().expect("client mutex poisoned");
+        inner.tls_fingerprint = Some(new_pin.to_string()).filter(|p| !p.is_empty());
+        inner.tls_next_fingerprints = new_next_pins;
+        Ok(cidr)
     }
 
     /// Disconnect: tear down the session view and return to `Disconnected`.
