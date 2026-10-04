@@ -17,6 +17,8 @@ to reproduce.
   user-facing version.
 - **[Audit plan](docs/security/audit-plan.md)**: the inventory of
   security-sensitive code and the plan for an independent audit.
+- **[Audit build and test setup](docs/security/audit-test-setup.md)**: how to
+  build every component from the audit tag and run each test bed.
 - **Hardening work**: [PRD](PRD/security-hardening.md) and
   [tickets](tickets/security-hardening/README.md).
 

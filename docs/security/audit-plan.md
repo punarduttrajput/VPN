@@ -327,7 +327,8 @@ the market-facing point of the exercise.
 4. SEC-010 threat model published, since the auditors need it as input.
 5. A tagged audit commit, a reproducible build recipe, and the Linux/Windows
    test beds (`scripts/verify-linux.sh`, the netns relay harness) documented
-   for the vendor.
+   for the vendor. *(Done: tag `audit-2026-10`; see
+   [audit-test-setup.md](audit-test-setup.md).)*
 
 ### 4.3 Owners, dates, budget
 
