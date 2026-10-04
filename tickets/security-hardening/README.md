@@ -39,3 +39,4 @@ Follow-ups from the SEC-010 threat model
 | ID | Title | Severity | Milestone |
 |----|-------|----------|-----------|
 | [SEC-020](SEC-020-default-sni-fingerprint.md) | Default TLS SNI `ferrum` names the product to on-path DPI | Low | M4 |
+| [SEC-021](SEC-021-quic-alpn.md) | Plain and mesh QUIC offer no ALPN | Low | M4 |

@@ -93,6 +93,10 @@ to a hostname you control and want on-path observers to see. A third-party
 MASQUE proxy usually needs its real hostname here to pick its certificate.
 Identity never depends on the name; the outer layer is pinned by key.
 
+**QUIC ALPN (SEC-021):** QUIC connections offer ALPN `h3`, like web QUIC. This is
+**wire-incompatible** with QUIC nodes from before SEC-021: upgrade every QUIC
+peer together. UDP and MASQUE are unaffected.
+
 **Certificate pinning (SEC-004):** QUIC and MASQUE run inside TLS, and the
 client checks the server's certificate against `cert_pins` in `[transport]`.
 A pin is the SHA-256 of the certificate's **public key**, so it survives the

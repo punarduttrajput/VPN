@@ -82,13 +82,13 @@ fn h3_client_crypto(
     pins: Vec<Fingerprint>,
     proxy: SocketAddr,
 ) -> Result<QuicClientConfig, TransportError> {
-    let crypto = tls::client_crypto(pins, format!("MASQUE proxy {proxy}"), &[b"h3"]);
+    let crypto = tls::client_crypto(pins, format!("MASQUE proxy {proxy}"), tls::QUIC_ALPN);
     QuicClientConfig::try_from(crypto).map_err(setup)
 }
 
 /// ALPN-`h3` rustls server config presenting `identity`.
 fn h3_server_crypto(identity: &TlsIdentity) -> Result<QuicServerConfig, TransportError> {
-    QuicServerConfig::try_from(identity.server_crypto(&[b"h3"])?).map_err(setup)
+    QuicServerConfig::try_from(identity.server_crypto(tls::QUIC_ALPN)?).map_err(setup)
 }
 
 /// Client side of a MASQUE CONNECT-UDP tunnel.
