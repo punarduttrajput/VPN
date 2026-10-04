@@ -52,7 +52,7 @@ const ATTEMPT_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_ATTEMPTS: usize = 3;
 
 /// A 96-bit STUN transaction ID, used to match a response to its request.
-type TransactionId = [u8; 12];
+pub(crate) type TransactionId = [u8; 12];
 
 /// Discover this host's server-reflexive address by querying `stun_server` from
 /// a socket bound to `local`.
@@ -193,7 +193,7 @@ fn build_binding_request(txid: &TransactionId) -> [u8; HEADER_LEN] {
 /// Validates the message type, magic cookie, and transaction ID, then scans
 /// attributes for `XOR-MAPPED-ADDRESS` (preferred) or `MAPPED-ADDRESS`. Returns
 /// `None` if the buffer is not a matching, well-formed success response.
-fn parse_binding_response(buf: &[u8], txid: &TransactionId) -> Option<SocketAddr> {
+pub(crate) fn parse_binding_response(buf: &[u8], txid: &TransactionId) -> Option<SocketAddr> {
     if buf.len() < HEADER_LEN {
         return None;
     }

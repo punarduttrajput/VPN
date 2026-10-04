@@ -30,7 +30,7 @@ fn frame(payload: &[u8], pad_to: usize) -> Vec<u8> {
 }
 
 /// Recover the original payload slice from a padded frame.
-fn deframe(buf: &[u8]) -> Result<&[u8], TransportError> {
+pub(crate) fn deframe(buf: &[u8]) -> Result<&[u8], TransportError> {
     if buf.len() < 2 {
         return Err(TransportError::Connection("padded frame too short".into()));
     }

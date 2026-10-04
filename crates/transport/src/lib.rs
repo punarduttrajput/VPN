@@ -170,3 +170,37 @@ pub trait MeshTransport: Send + Sync {
         None
     }
 }
+
+/// Entry points for the fuzz targets in `fuzz/` (SEC-017): thin wrappers over
+/// crate-private parsers of untrusted input. Only built with the `fuzzing`
+/// feature, which no shipping build enables; not a stable API.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing {
+    use std::net::SocketAddr;
+
+    /// A STUN Binding response (the first 12 bytes are taken as the expected
+    /// transaction id, the rest as the datagram).
+    pub fn stun_binding_response(data: &[u8]) -> Option<SocketAddr> {
+        let (txid, datagram) = data.split_at_checked(12)?;
+        let txid: [u8; 12] = txid.try_into().ok()?;
+        crate::stun::parse_binding_response(datagram, &txid)
+    }
+
+    /// A padded frame from `PaddedTransport` (`[len][payload][zeros]`).
+    pub fn pad_deframe(data: &[u8]) -> Option<usize> {
+        crate::pad::deframe(data).ok().map(<[u8]>::len)
+    }
+
+    /// A relay Challenge frame, as a client answers it.
+    pub fn relay_answer_challenge(data: &[u8]) -> Option<Vec<u8>> {
+        let secret = x25519_dalek::StaticSecret::from([7u8; 32]);
+        crate::relay::answer_challenge(&secret, data)
+    }
+
+    /// A MASQUE CONNECT-UDP request path.
+    #[cfg(feature = "masque")]
+    pub fn masque_target(path: &str) -> Option<SocketAddr> {
+        crate::masque::parse_connect_udp_target(path)
+    }
+}

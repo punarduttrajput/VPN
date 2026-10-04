@@ -1,0 +1,57 @@
+name: Fuzz
+
+# SEC-017: libFuzzer targets for the parsers of untrusted input (see
+# fuzz/src/lib.rs). A short run on every push/PR, a longer one nightly. A crash
+# fails the job and uploads the reproducer.
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 3 * * *" # nightly, off the hour
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: fuzz (${{ github.event_name == 'schedule' && 'nightly, 10 min/target' || '30 s/target' }})
+    runs-on: ubuntu-latest
+    env:
+      FUZZ_SECONDS: ${{ github.event_name == 'schedule' && '600' || '30' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # cargo-fuzz needs nightly (-Zsanitizer=address).
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      # The same target bodies, run over the corpus + pseudo-random input
+      # without libFuzzer: fast, and catches a broken target before fuzzing.
+      - name: Smoke-run the targets
+        run: cargo test --manifest-path fuzz/Cargo.toml --no-default-features
+
+      - name: Fuzz each target
+        working-directory: fuzz
+        run: |
+          for target in $(cargo fuzz list); do
+            echo "::group::$target (${FUZZ_SECONDS}s)"
+            cargo fuzz run "$target" -- -max_total_time="$FUZZ_SECONDS" -rss_limit_mb=2048
+            echo "::endgroup::"
+          done
+
+      - name: Upload crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/

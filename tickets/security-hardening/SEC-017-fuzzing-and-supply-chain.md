@@ -20,12 +20,28 @@ a disallowed licence) would go unnoticed.
       the STUN response parser, relay frame decoding (server and client sides),
       `spki_of`/`fingerprint_of`, the JWT verifier (or its replacement's
       wrapper, SEC-014), `helper_proto::recv_request`, the pad deframer, and
-      the MASQUE path parser.
-- [ ] A CI job runs each target for a short, bounded time on every PR, and
+      the MASQUE path parser. *(Eight targets, plus `pin_parse`. **Not yet:**
+      the relay *server* side, whose dispatch is inline in its async serve loop
+      and needs extracting into a pure function first. Everything else is
+      covered, with the client side of the relay as `relay_challenge`.)*
+- [x] A CI job runs each target for a short, bounded time on every PR, and
       longer on a schedule; crashes fail the job. Corpus committed.
-- [ ] `cargo-deny` (advisories, licences, bans, sources) in CI with a committed
+      *(`.github/workflows/fuzz.yml`: 30 s/target per push/PR, 10 min nightly;
+      reproducers uploaded on failure. Seeds in `fuzz/corpus/`.)*
+- [x] `cargo-deny` (advisories, licences, bans, sources) in CI with a committed
       `deny.toml`; `cargo audit` equivalent covered.
-- [ ] Any findings from the first runs triaged into tickets.
+      *(`.github/workflows/supply-chain.yml`, daily and per push/PR; the
+      advisories check is the `cargo audit` equivalent, and also denies
+      unmaintained and yanked crates. The action is pinned to a commit SHA.)*
+- [x] Any findings from the first runs triaged into tickets. *(The first
+      `cargo deny` run found **seven advisories**. Three were fixed here by
+      semver-compatible updates: `rustls` 0.23.45 (RUSTSEC-2026-0285, TLS 1.3
+      handshake messages across encryption levels), `h2` 0.4.19
+      (RUSTSEC-2026-0258, empty-DATA-frame DoS) and `anyhow` 1.0.104
+      (RUSTSEC-2026-0190). Three are pinned by boringtun 0.6 and filed as
+      **SEC-019**. `rustls-pemfile` (unmaintained, via tonic) is ignored with a
+      reason. For fuzzing, `helper_request` should immediately hit the
+      unbounded allocation in `recv_request`, which SEC-005 already fixes.)*
 
 ## Implementation notes
 
