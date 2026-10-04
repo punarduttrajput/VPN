@@ -6,7 +6,9 @@
 //!   * **outbound** TUN packets by destination IP against each peer's `allowed_ips`,
 //!   * **inbound** datagrams by *crypto-demux* — the peer whose WireGuard session
 //!     decrypts the packet — so routing is independent of the source address and
-//!     survives relays (MASQUE) and NAT rewriting.
+//!     survives relays (MASQUE) and NAT rewriting. The decrypted packet is then
+//!     delivered only if its inner source is inside that peer's `allowed_ips`
+//!     (WireGuard's inbound crypto-routing rule, SEC-011).
 //!
 //! This is the shape a [`TunnelPlan`](../../ferrum_client_core) becomes: each plan
 //! peer (public key, endpoint, allowed IPs) maps to one [`MeshPeer`].
@@ -21,6 +23,7 @@
 //! (`verify-linux.sh TEST_MESH=1`, `MESH_QUIC=1` for QUIC).
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use ferrum_core::config::Cidr;
@@ -128,6 +131,30 @@ fn dest_ip(packet: &[u8]) -> Option<IpAddr> {
         }
         _ => None,
     }
+}
+
+/// Decrypted packets dropped because their inner source wasn't within the
+/// decrypting peer's `allowed_ips` (SEC-011). Process-wide and aggregate only:
+/// no peer or address is recorded (NFR5).
+static SPOOFED_SOURCE_DROPS: AtomicU64 = AtomicU64::new(0);
+
+/// How many decrypted packets this process has dropped for carrying a source
+/// address outside their sender's `allowed_ips` (SEC-011).
+pub fn spoofed_source_drops() -> u64 {
+    SPOOFED_SOURCE_DROPS.load(Ordering::Relaxed)
+}
+
+/// WireGuard crypto-routing's inbound rule (SEC-011): a packet that decrypted
+/// under a peer's session is accepted only if its inner source address is
+/// inside that peer's `allowed_ips`. Otherwise any authenticated peer could
+/// inject packets claiming another peer's tunnel IP. A refusal is counted in
+/// [`spoofed_source_drops`].
+pub(crate) fn accept_inbound_source(allowed_ips: &[Cidr], src: IpAddr) -> bool {
+    if allowed_ips.iter().any(|c| c.contains(src)) {
+        return true;
+    }
+    SPOOFED_SOURCE_DROPS.fetch_add(1, Ordering::Relaxed);
+    false
 }
 
 /// Index of the peer whose `allowed_ips` contains `ip`.
@@ -325,7 +352,20 @@ async fn handle_inbound<D: TunDevice, M: MeshTransport>(
             peers[i].endpoint = src;
         }
         match action {
-            Action::WriteToTun(pkt, _ip) => device.write_packet(pkt).await?,
+            // boringtun reports the inner packet's source address; enforce
+            // crypto-routing before the packet reaches the OS (SEC-011). The
+            // path/roaming updates above still stand: the datagram genuinely
+            // came from this peer, it just claimed an address it doesn't own.
+            Action::WriteToTun(pkt, src) => {
+                if accept_inbound_source(&peers[i].allowed_ips, src) {
+                    device.write_packet(pkt).await?;
+                } else {
+                    debug!(
+                        peer = i,
+                        "dropped decrypted packet whose source is outside the peer's allowed_ips"
+                    );
+                }
+            }
             // Handshake response / cookie: reply along the underlay it arrived on.
             Action::SendToPeer(pkt) => match underlay {
                 Underlay::Direct => direct.send_to(peers[i].endpoint, pkt).await?,
