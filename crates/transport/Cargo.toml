@@ -39,6 +39,9 @@ rcgen = { workspace = true, optional = true }
 # SEC-004: SHA-256 cert pins + HKDF for the stable TLS identity. Already in the
 # tree as rustls/rcgen's crypto backend (the same pin the coordinator uses).
 ring = { version = "0.17", optional = true }
+# Constant-time comparison of the relay register challenge's MACs (SEC-016;
+# already in the tree).
+subtle = "2.6"
 # Wipes the derived TLS private key from memory (already in the tree).
 zeroize = { version = "1", optional = true }
 bytes ={ workspace = true, optional = true }
@@ -53,7 +56,9 @@ anyhow = { workspace = true, optional = true }
 ferrum-relay-xdp-common = { path = "../relay-xdp-common", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-libc.workspace = true
+# SEC-016: UDP GSO/GRO for `UdpTransport` (already in the tree under quinn),
+# replacing hand-rolled sendmsg/recvmsg/sendmmsg + cmsg FFI.
+quinn-udp = "0.5"
 # `optional = true` + gated by the `xdp` feature above (`dep:aya`/
 # `dep:aya-log`) — so these are only actually fetched/compiled on a Linux
 # host that explicitly builds with `--features xdp`. On any other host,

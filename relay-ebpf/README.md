@@ -111,18 +111,32 @@ worth knowing about for any future map or rewrite change:
 
 ```sh
 rustup toolchain install nightly --component rust-src
-cargo install bpf-linker   # OR: grab the prebuilt static musl binary — see below
+bash ../scripts/install-bpf-linker.sh   # pinned prebuilt, digest-verified — see below
 cd relay-ebpf
 cargo +nightly build --release
 # -> target/bpfel-unknown-none/release/ferrum-relay-ebpf
 ```
 
-`cargo install bpf-linker` builds against `llvm-sys` and needs a matching
-LLVM dev install; the path of least resistance (used for the first real
-build, 2026-07-09) is the **prebuilt static binary** from
-`https://github.com/aya-rs/bpf-linker/releases`
-(`bpf-linker-x86_64-unknown-linux-musl.tar.zst` — statically linked, no
-LLVM version matching), dropped into `~/.cargo/bin/` and `chmod +x`ed.
+`bpf-linker` produces the kernel XDP object, so it is **pinned** (SEC-008).
+[`scripts/install-bpf-linker.sh`](../scripts/install-bpf-linker.sh) downloads
+the prebuilt static musl binary from the aya-rs release and checks its SHA-256
+*before* extracting it into `~/.cargo/bin/` (`--dest DIR` to override). It is
+statically linked, so no LLVM version matching is needed; this is the path used
+for the first real build, 2026-07-09.
+
+| Field | Value |
+|-------|-------|
+| Version | `v0.10.4` |
+| Source | <https://github.com/aya-rs/bpf-linker/releases/tag/v0.10.4> |
+| `bpf-linker-x86_64-unknown-linux-musl.tar.zst` SHA-256 | `4dda77daab6c5f120a468e6d3ede2498f5bd47ece712172cfb7290176d93d015` |
+| `bpf-linker-aarch64-unknown-linux-musl.tar.zst` SHA-256 | `c3638cd3cb735ff85705905a07e0df61c0f9426480334c8e2efe5cb92fd9d3de` |
+| Upstream signature | none published (no signature or GitHub build attestation), so the digest is the trust anchor |
+
+The digests come from GitHub's release-asset metadata. The x86_64 one was
+confirmed against an independent download on 2026-09-29, and CI re-checks it on
+every run. `cargo install bpf-linker` (built from source against `llvm-sys`,
+which needs a matching LLVM dev install) still works if you'd rather not use a
+prebuilt binary.
 
 (`.cargo/config.toml` already pins the target and `build-std`;
 `rust-toolchain.toml` pins nightly, so a plain `cargo build --release` from

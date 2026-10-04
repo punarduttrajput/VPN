@@ -376,6 +376,48 @@ mod tests {
         assert_eq!(&buf[..n], b"hello");
     }
 
+    /// SEC-007 AC: mid-rotation, the dialer's map still lists the peer's old
+    /// pin as current and the new one as *next*. A peer that has already
+    /// rolled (it presents the next key) connects; a peer presenting a key in
+    /// neither slot is refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quic_mesh_accepts_a_peer_that_rolled_to_its_announced_next_key() {
+        let a = node(21).await;
+        let old = TlsIdentity::from_wireguard_key(&[22; 32]).unwrap();
+        let next = TlsIdentity::from_wireguard_key(&[23; 32]).unwrap();
+        let (current_pin, next_pin) = (old.fingerprint(), next.fingerprint());
+        let mut buf = [0u8; 16];
+
+        // Rolled peer: already presenting its next key.
+        let rolled = QuicMeshTransport::bind("127.0.0.1:0".parse().unwrap(), &next)
+            .await
+            .unwrap();
+        a.set_peer_pins(&[(rolled.local_addr(), vec![current_pin, next_pin])]);
+        a.send_to(rolled.local_addr(), b"rolled").await.unwrap();
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            rolled.recv_from(&mut buf),
+        )
+        .await
+        .expect("a peer on its announced next key must still connect")
+        .unwrap();
+        assert_eq!(&buf[..n], b"rolled");
+
+        // Unlisted key under the same (current, next) pins: refused.
+        let stranger = node(24).await;
+        a.set_peer_pins(&[(stranger.local_addr(), vec![current_pin, next_pin])]);
+        a.send_to(stranger.local_addr(), b"x").await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                stranger.recv_from(&mut buf)
+            )
+            .await
+            .is_err(),
+            "a key in neither pin slot must be refused"
+        );
+    }
+
     /// Review fix: re-applying the *same* pins (every network-map update does)
     /// keeps a refused peer's backoff; changing its pin clears it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

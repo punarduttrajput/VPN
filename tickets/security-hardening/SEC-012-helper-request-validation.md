@@ -26,17 +26,23 @@
 
 ## Acceptance criteria
 
-- [ ] One validator for interface names (1–15 bytes, i.e. IFNAMSIZ − 1, charset
+- [x] One validator for interface names (1–15 bytes, i.e. IFNAMSIZ − 1, charset
       `[A-Za-z0-9_.-]`), applied in the helper to every request field that
       names an interface, **and** in `firewall`/`leakguard` script generation
       (defence in depth: the generators refuse a bad name even if called
-      directly).
-- [ ] MTU range-checked (e.g. 576–9000); address parsed as today.
-- [ ] The daemon closes its TUN fd after sending it (wrap in `OwnedFd` so every
-      path drops it, including send failures).
-- [ ] Tests: a hostile name (`x" ; flush ruleset`, newline, over-long) is
+      directly). *(`ferrum_tunnel::ifname::validate`, which also refuses a
+      leading `-` (option injection into `resolvectl`) and `.`/`..`. Applied in
+      `validate_request` (helper), both `engage_script`s (now `io::Result`),
+      the Linux `dns::set_dns`/`restore_dns`, and `device::open_raw`.)*
+- [x] MTU range-checked (e.g. 576–9000); address parsed as today.
+- [x] The daemon closes its TUN fd after sending it (wrap in `OwnedFd` so every
+      path drops it, including send failures). *(`device::open_raw` now returns
+      `OwnedFd`; the helper sends only its raw number.)*
+- [x] Tests: a hostile name (`x" ; flush ruleset`, newline, over-long) is
       refused by the helper and by both generators; `open_tun` leaves no fd
       open in the daemon (count `/proc/self/fd` before/after on Linux).
+      *(The fd test needs root to create a TUN, so it skips in unprivileged CI.
+      Run with `sudo -E cargo test -p ferrum-helper`.)*
 
 ## Implementation notes
 

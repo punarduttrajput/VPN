@@ -32,7 +32,8 @@ impl SqliteStore {
                  tunnel_ip  TEXT NOT NULL,
                  tags       TEXT NOT NULL,
                  candidates TEXT NOT NULL DEFAULT '[]',
-                 tls_cert_sha256 TEXT NOT NULL DEFAULT ''
+                 tls_cert_sha256 TEXT NOT NULL DEFAULT '',
+                 tls_next_pins TEXT NOT NULL DEFAULT '[]'
              );
              CREATE TABLE IF NOT EXISTS identity_bindings (
                  identity   TEXT PRIMARY KEY,
@@ -45,12 +46,13 @@ impl SqliteStore {
              );",
         )
         .map_err(backend)?;
-        // Migrate databases created before the candidates / TLS-pin (SEC-004)
-        // columns existed. A duplicate-column error just means the schema is
-        // already current.
+        // Migrate databases created before the candidates / TLS-pin (SEC-004) /
+        // next-pins (SEC-007) columns existed. A duplicate-column error just
+        // means the schema is already current.
         for migration in [
             "ALTER TABLE devices ADD COLUMN candidates TEXT NOT NULL DEFAULT '[]'",
             "ALTER TABLE devices ADD COLUMN tls_cert_sha256 TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE devices ADD COLUMN tls_next_pins TEXT NOT NULL DEFAULT '[]'",
         ] {
             if let Err(e) = conn.execute(migration, []) {
                 if !e.to_string().contains("duplicate column name") {
@@ -75,34 +77,43 @@ impl Store for SqliteStore {
         let conn = self.conn.lock().expect("sqlite mutex poisoned");
         let mut stmt = conn
             .prepare(
-                "SELECT public_key, name, endpoint, tunnel_ip, tags, candidates, tls_cert_sha256 \
-                 FROM devices",
+                "SELECT public_key, name, endpoint, tunnel_ip, tags, candidates, tls_cert_sha256, \
+                 tls_next_pins FROM devices",
             )
             .map_err(backend)?;
         let rows = stmt
             .query_map([], |row| {
                 Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
+                    (
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ),
+                    (
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                    ),
                 ))
             })
             .map_err(backend)?;
 
         let mut devices = Vec::new();
         for row in rows {
-            let (public_key, name, endpoint, ip_str, tags_json, candidates_json, tls_cert_sha256) =
-                row.map_err(backend)?;
+            let (
+                (public_key, name, endpoint, ip_str),
+                (tags_json, candidates_json, tls_cert_sha256, next_pins_json),
+            ) = row.map_err(backend)?;
             let tunnel_ip: Ipv4Addr = ip_str
                 .parse()
                 .map_err(|e| StoreError::Backend(format!("bad tunnel_ip '{ip_str}': {e}")))?;
             let tags: Vec<String> = serde_json::from_str(&tags_json).map_err(backend)?;
             let candidates: Vec<String> =
                 serde_json::from_str(&candidates_json).map_err(backend)?;
+            let tls_next_pins: Vec<String> =
+                serde_json::from_str(&next_pins_json).map_err(backend)?;
             devices.push(Device {
                 public_key,
                 name,
@@ -111,6 +122,7 @@ impl Store for SqliteStore {
                 tags,
                 candidates,
                 tls_cert_sha256,
+                tls_next_pins,
             });
         }
         Ok(devices)
@@ -119,14 +131,16 @@ impl Store for SqliteStore {
     fn upsert(&self, device: &Device) -> Result<(), StoreError> {
         let tags = serde_json::to_string(&device.tags).map_err(backend)?;
         let candidates = serde_json::to_string(&device.candidates).map_err(backend)?;
+        let next_pins = serde_json::to_string(&device.tls_next_pins).map_err(backend)?;
         let conn = self.conn.lock().expect("sqlite mutex poisoned");
         conn.execute(
             "INSERT INTO devices
-                 (public_key, name, endpoint, tunnel_ip, tags, candidates, tls_cert_sha256)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 (public_key, name, endpoint, tunnel_ip, tags, candidates, tls_cert_sha256,
+                  tls_next_pins)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(public_key) DO UPDATE SET
                  name = ?2, endpoint = ?3, tunnel_ip = ?4, tags = ?5, candidates = ?6,
-                 tls_cert_sha256 = ?7",
+                 tls_cert_sha256 = ?7, tls_next_pins = ?8",
             params![
                 device.public_key,
                 device.name,
@@ -134,7 +148,8 @@ impl Store for SqliteStore {
                 device.tunnel_ip.to_string(),
                 tags,
                 candidates,
-                device.tls_cert_sha256
+                device.tls_cert_sha256,
+                next_pins
             ],
         )
         .map_err(backend)?;
@@ -233,6 +248,7 @@ mod tests {
             tags: tags.iter().map(|t| t.to_string()).collect(),
             candidates: Vec::new(),
             tls_cert_sha256: String::new(),
+            tls_next_pins: Vec::new(),
         }
     }
 
@@ -327,6 +343,39 @@ mod tests {
             reg.register("AAA", "a", "", &[]).unwrap();
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// SEC-007: pre-announced next pins survive a restart too, and a database
+    /// from before the column existed migrates in with none.
+    #[test]
+    fn next_pins_roundtrip_and_old_databases_migrate() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut d = device("AAA", [10, 8, 0, 2], &[]);
+        d.tls_cert_sha256 = "ab".repeat(32);
+        d.tls_next_pins = vec!["cd".repeat(32), "ef".repeat(32)];
+        store.upsert(&d).unwrap();
+        assert_eq!(store.load_all().unwrap()[0].tls_next_pins, d.tls_next_pins);
+
+        let dir = std::env::temp_dir().join(format!("ferrum-sec007-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&dir);
+        {
+            // A pre-SEC-007 schema with one device in it.
+            let conn = Connection::open(&dir).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE devices (public_key TEXT PRIMARY KEY, name TEXT NOT NULL,
+                     endpoint TEXT NOT NULL, tunnel_ip TEXT NOT NULL, tags TEXT NOT NULL,
+                     candidates TEXT NOT NULL DEFAULT '[]',
+                     tls_cert_sha256 TEXT NOT NULL DEFAULT '');
+                 INSERT INTO devices VALUES ('OLD', 'n', '', '10.8.0.9', '[]', '[]', '');",
+            )
+            .unwrap();
+        }
+        let migrated = SqliteStore::open(dir.to_str().unwrap()).unwrap();
+        let loaded = migrated.load_all().unwrap();
+        assert_eq!(loaded[0].public_key, "OLD");
+        assert!(loaded[0].tls_next_pins.is_empty());
+        drop(migrated);
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]

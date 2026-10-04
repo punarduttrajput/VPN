@@ -38,7 +38,10 @@ pub const TABLE: &str = "ferrum_leakguard";
 /// name resolution, not protect it); `block_ipv6` adds the IPv6 drop rules.
 ///
 /// Pure (no I/O) so the rule logic is unit-testable without root or a live `nft`.
-pub fn engage_script(iface: &str, dns_servers: &[IpAddr], block_ipv6: bool) -> String {
+/// Fails (`InvalidInput`) on an unsafe interface name rather than interpolate
+/// it into a script that runs as root (SEC-012).
+pub fn engage_script(iface: &str, dns_servers: &[IpAddr], block_ipv6: bool) -> io::Result<String> {
+    crate::ifname::validate(iface)?;
     let mut rules = String::new();
     if !dns_servers.is_empty() {
         for ip in dns_servers {
@@ -62,7 +65,7 @@ pub fn engage_script(iface: &str, dns_servers: &[IpAddr], block_ipv6: bool) -> S
     }
     // Flush first so re-engaging is idempotent (a prior table is replaced, not
     // duplicated). Policy `accept`: only the listed leak classes are dropped.
-    format!(
+    Ok(format!(
         "add table inet {TABLE}
 delete table inet {TABLE}
 table inet {TABLE} {{
@@ -73,7 +76,7 @@ table inet {TABLE} {{
 {rules}  }}
 }}
 "
-    )
+    ))
 }
 
 /// Arguments to `nft` that remove the leak-guard table (disengage / teardown).
@@ -83,7 +86,7 @@ pub fn disengage_args() -> [&'static str; 4] {
 
 /// Engage the leak guard on `iface`: build and run the `nft` script in one call.
 pub fn engage(iface: &str, dns_servers: &[IpAddr], block_ipv6: bool) -> io::Result<()> {
-    run_nft_script(&engage_script(iface, dns_servers, block_ipv6))
+    run_nft_script(&engage_script(iface, dns_servers, block_ipv6)?)
 }
 
 /// Disengage the leak guard: remove our dedicated table in one call.
@@ -97,7 +100,7 @@ mod tests {
 
     #[test]
     fn engage_script_keeps_ordinary_traffic_flowing() {
-        let s = engage_script("ferrum0", &[], true);
+        let s = engage_script("ferrum0", &[], true).unwrap();
         assert!(s.contains("policy accept"), "leak guard must not block-all");
         assert!(s.contains("oifname \"lo\" accept"));
         assert!(s.contains("oifname \"ferrum0\" accept"));
@@ -110,7 +113,7 @@ mod tests {
     fn dns_lock_allows_configured_resolvers_then_drops_the_rest() {
         let v4: IpAddr = "10.99.0.53".parse().unwrap();
         let v6: IpAddr = "fd00::53".parse().unwrap();
-        let s = engage_script("ferrum0", &[v4, v6], false);
+        let s = engage_script("ferrum0", &[v4, v6], false).unwrap();
         assert!(
             s.contains("ip daddr 10.99.0.53 meta l4proto { tcp, udp } th dport { 53, 853 } accept")
         );
@@ -128,19 +131,33 @@ mod tests {
     #[test]
     fn no_dns_lock_without_approved_resolvers() {
         // Locking DNS with no approved resolver would break resolution outright.
-        let s = engage_script("ferrum0", &[], true);
+        let s = engage_script("ferrum0", &[], true).unwrap();
         assert!(!s.contains("th dport { 53, 853 } drop"));
     }
 
     #[test]
     fn ipv6_block_exempts_link_local_and_neighbor_discovery() {
-        let s = engage_script("ferrum0", &[], true);
+        let s = engage_script("ferrum0", &[], true).unwrap();
         assert!(s.contains("ip6 daddr fe80::/10 accept"));
         assert!(s.contains("nd-neighbor-solicit"));
         let v6_drop = "meta nfproto ipv6 drop";
         assert!(s.contains(v6_drop));
         // Exemptions must precede the drop.
         assert!(s.find("fe80::/10").unwrap() < s.find(v6_drop).unwrap());
+    }
+
+    /// SEC-012: the interface name can't inject nft statements.
+    #[test]
+    fn engage_script_refuses_an_injecting_interface_name() {
+        for bad in [
+            "x\" accept; flush ruleset",
+            "ferrum0
+flush ruleset",
+            "",
+        ] {
+            let err = engage_script(bad, &[], true).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{bad:?}");
+        }
     }
 
     #[test]

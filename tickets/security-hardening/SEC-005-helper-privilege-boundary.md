@@ -22,15 +22,43 @@ removes the trust boundary the daemon exists to enforce.
 
 ## Acceptance criteria
 
-- [ ] The daemon verifies the connecting peer via `SO_PEERCRED`
+- [x] The daemon verifies the connecting peer via `SO_PEERCRED`
       (uid/gid/pid) and rejects callers outside an allow-list.
-- [ ] **Fail closed:** if the configured group does not exist, the daemon
+      *(root, `--group` members, `--allow-uid`; see `AccessPolicy`.)*
+- [x] **Fail closed:** if the configured group does not exist, the daemon
       refuses to start (or binds owner-only 0600) — the 0666 fallback is
-      removed.
-- [ ] Per-connection request quota to bound abuse of a compromised allowed
-      caller.
-- [ ] Test: a disallowed uid/gid connection is refused; the missing-group case
+      removed. *(Refuses to start; `chown`/`chmod` failure is fatal too.)*
+- [x] Per-connection request quota to bound abuse of a compromised allowed
+      caller. *(One request per connection + per-uid token bucket, in-flight
+      cap, I/O timeouts, 64 KiB request cap.)*
+- [x] Test: a disallowed uid/gid connection is refused; the missing-group case
       does not produce a 0666 socket.
+
+**Windows counterpart (follow-up, done 2026-09-29):** the named-pipe service
+(`apps/desktop/src-tauri/src/service.rs`) used the default pipe security
+descriptor with no client identity check. Now:
+
+- [x] The pipe is created with an explicit DACL (SDDL → `create_with_security_attributes_raw`):
+      SYSTEM / Administrators / owner full control, interactive users read/write
+      **without** `FILE_CREATE_PIPE_INSTANCE`, network logons denied, medium
+      mandatory label. *(`pipe_security::PIPE_SDDL`.)*
+- [x] Remote clients rejected (`reject_remote_clients(true)`).
+- [x] Every connected client is verified before it's served: impersonate →
+      open its token → `CheckTokenMembership` against an allow/deny SID policy
+      (SYSTEM / Administrators / INTERACTIVE; not NETWORK). Refused clients get
+      "not authorized" + a log line with their pid. *(`pipe_security::verify_client`.)*
+- [x] Squatting protection kept *and* extended: `first_pipe_instance` on the
+      first instance, and the next instance is created before the current
+      connection is handled, so the name is never released between sessions
+      (previously it was, after every session).
+- [x] 10 s timeout for a client's opening request (connections are served one
+      at a time).
+- [x] Tests over real pipes: DACL denies an ungranted caller
+      (`ERROR_ACCESS_DENIED`), a DACL-admitted but policy-refused caller gets
+      "not authorized" (and the loop keeps serving), deny beats allow, the
+      production DACL + policy admit a non-elevated interactive user using the
+      GUI's own `ClientOptions`, the pipe name stays claimed after a session,
+      and SDDL parse/mask checks.
 
 ## Implementation notes
 
