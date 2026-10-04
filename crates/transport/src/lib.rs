@@ -25,6 +25,7 @@ pub use pad::PaddedTransport;
 pub mod udp;
 pub use udp::{UdpMeshTransport, UdpTransport};
 
+pub mod http_probe;
 pub mod stun;
 
 pub mod relay;

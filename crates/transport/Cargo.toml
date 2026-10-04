@@ -75,4 +75,5 @@ aya = { version = "0.14", optional = true }
 aya-log = { version = "0.3", optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }
+# `test-util` pauses the clock in the http_probe timeout test (SEC-018).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "test-util"] }

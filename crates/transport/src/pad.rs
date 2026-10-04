@@ -90,6 +90,13 @@ impl<T: Transport> Transport for PaddedTransport<T> {
     }
 
     async fn send_batch(&self, datagrams: &[Vec<u8>]) -> Result<(), TransportError> {
+        // Same limit as `send` (SEC-018): the frame's u16 length prefix can't
+        // describe a longer datagram, and would silently truncate it.
+        if datagrams.iter().any(|d| d.len() > u16::MAX as usize) {
+            return Err(TransportError::Connection(
+                "datagram too large to pad-frame".into(),
+            ));
+        }
         let framed: Vec<Vec<u8>> = datagrams.iter().map(|d| frame(d, self.pad_to)).collect();
         self.inner.send_batch(&framed).await
     }
@@ -100,6 +107,22 @@ mod tests {
     use super::*;
     use crate::UdpTransport;
     use tokio::net::UdpSocket;
+
+    /// SEC-018: `send_batch` enforces the same length limit as `send`, before
+    /// anything is sent (a u16 length prefix can't describe a longer frame).
+    #[tokio::test]
+    async fn send_batch_refuses_an_oversized_datagram() {
+        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let t = PaddedTransport::new(UdpTransport::from_socket(a, b.local_addr().unwrap()), 64);
+        let batch = vec![b"ok".to_vec(), vec![0u8; u16::MAX as usize + 1]];
+        assert!(t.send_batch(&batch).await.is_err());
+        let mut buf = [0u8; 16];
+        assert!(
+            b.try_recv_from(&mut buf).is_err(),
+            "nothing may be sent from a refused batch"
+        );
+    }
 
     #[test]
     fn frames_pad_small_payloads_to_target() {
