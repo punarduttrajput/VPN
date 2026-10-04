@@ -20,6 +20,15 @@
 //!   **no** pins it still connects but logs a loud "outer transport
 //!   unauthenticated" warning (once per destination); it never silently accepts.
 //!
+//! **One parser decides (SEC-016).** The pinned key and the key that checks
+//! the TLS handshake signature are the *same bytes*: the verifier extracts the
+//! SPKI with [`spki_of`], compares its hash against the pins, and then verifies
+//! the handshake signature against exactly that SPKI
+//! (`verify_tls13_signature_with_raw_key`). Previously the signature was checked
+//! by webpki's own parse of the certificate, so any disagreement between the
+//! two parsers about which key a certificate carries would have been a pin
+//! bypass. QUIC is TLS 1.3-only, so TLS 1.2 signatures are refused outright.
+//!
 //! Pins cover the public key, not the whole certificate (HPKP-style): the key
 //! is stable by construction, whereas the certificate's exact bytes depend on
 //! the cert generator's encoding choices, so a dependency upgrade could
@@ -33,7 +42,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use zeroize::{Zeroize, Zeroizing};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+use rustls::pki_types::{
+    CertificateDer, PrivatePkcs8KeyDer, ServerName, SubjectPublicKeyInfoDer, UnixTime,
+};
 use rustls::{CertificateError, DigitallySignedStruct, SignatureScheme};
 use tracing::warn;
 
@@ -70,9 +81,14 @@ fn sha256(bytes: &[u8]) -> Fingerprint {
 type Tlv<'a> = (u8, &'a [u8], &'a [u8], &'a [u8]);
 
 /// One DER TLV at the start of `input`.
-/// Definite lengths only (DER never uses indefinite), up to 4 length bytes.
+/// Strict DER (SEC-016): single-byte tags only (no high-tag-number form),
+/// definite lengths only, and **minimal** length encodings, so one byte string
+/// has exactly one parse. Up to 4 length bytes.
 fn der_tlv(input: &[u8]) -> Option<Tlv<'_>> {
     let (&tag, after_tag) = input.split_first()?;
+    if tag & 0x1f == 0x1f {
+        return None; // high-tag-number form: never used in X.509's structure
+    }
     let (&first, after_len0) = after_tag.split_first()?;
     let (len, after_len) = if first < 0x80 {
         (usize::from(first), after_len0)
@@ -81,9 +97,15 @@ fn der_tlv(input: &[u8]) -> Option<Tlv<'_>> {
         if n == 0 || n > 4 || after_len0.len() < n {
             return None;
         }
-        let len = after_len0[..n]
+        let bytes = &after_len0[..n];
+        let len = bytes
             .iter()
             .fold(0usize, |acc, &b| (acc << 8) | usize::from(b));
+        // DER: the long form is only for lengths >= 128, with no leading zero
+        // byte. Anything else is a non-canonical encoding of the same length.
+        if len < 0x80 || bytes[0] == 0 {
+            return None;
+        }
         (len, &after_len0[n..])
     };
     if after_len.len() < len {
@@ -318,29 +340,35 @@ impl ServerCertVerifier for PinnedVerifier {
         }
     }
 
+    /// QUIC (and so MASQUE) is TLS 1.3-only; a TLS 1.2 handshake never
+    /// legitimately reaches this verifier, so refuse rather than verify with a
+    /// second parser.
     fn verify_tls12_signature(
         &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
+        Err(rustls::Error::General(
+            "TLS 1.2 is not supported on the QUIC/MASQUE outer transport".into(),
+        ))
     }
 
+    /// Verify the handshake signature against the SPKI that
+    /// [`verify_server_cert`](Self::verify_server_cert) pinned, extracted by
+    /// the same [`spki_of`], never a second parse of the certificate (SEC-016).
     fn verify_tls13_signature(
         &self,
         message: &[u8],
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
+        let spki = spki_of(cert).ok_or(rustls::Error::InvalidCertificate(
+            CertificateError::BadEncoding,
+        ))?;
+        rustls::crypto::verify_tls13_signature_with_raw_key(
             message,
-            cert,
+            &SubjectPublicKeyInfoDer::from(spki),
             dss,
             &self.provider.signature_verification_algorithms,
         )
@@ -426,6 +454,33 @@ mod tests {
             spki_of(&id.cert[..id.cert.len() / 2]).is_none(),
             "cut in half"
         );
+    }
+
+    /// SEC-016: only canonical DER parses, so a certificate has one reading.
+    #[test]
+    fn der_parsing_is_strict() {
+        // 5 bytes of content, minimally encoded: accepted.
+        assert!(der_tlv(&[0x04, 0x05, 1, 2, 3, 4, 5]).is_some());
+        // The same length in long form (0x81 0x05): non-minimal, refused.
+        assert!(der_tlv(&[0x04, 0x81, 0x05, 1, 2, 3, 4, 5]).is_none());
+        // A long-form length with a leading zero byte: refused.
+        let mut padded = vec![0x04, 0x82, 0x00, 0x80];
+        padded.extend(std::iter::repeat_n(0u8, 0x80));
+        assert!(der_tlv(&padded).is_none());
+        // The minimal long form for 128 bytes (0x81 0x80): accepted.
+        let mut ok = vec![0x04, 0x81, 0x80];
+        ok.extend(std::iter::repeat_n(0u8, 0x80));
+        assert!(der_tlv(&ok).is_some());
+        // Indefinite length (0x80) and a high-tag-number tag: refused.
+        assert!(der_tlv(&[0x30, 0x80, 0x00, 0x00]).is_none());
+        assert!(der_tlv(&[0x1f, 0x01, 0x00]).is_none());
+        // Real certificates, from both generators, still parse.
+        for id in [
+            TlsIdentity::from_wireguard_key(&[6; 32]).unwrap(),
+            TlsIdentity::ephemeral().unwrap(),
+        ] {
+            assert_eq!(fingerprint_of(&id.cert), Some(id.fingerprint()));
+        }
     }
 
     #[test]

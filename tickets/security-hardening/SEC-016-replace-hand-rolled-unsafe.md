@@ -42,9 +42,18 @@ Several pieces reimplement what vetted, widely used crates already provide
       `device::from_owned_fd`, and `from_fd(RawFd)` is `unsafe fn` with a
       `# Safety` contract. The uniffi `run` call site documents Android's
       `detachFd()` hand-over. `FdTun` I/O is now `rustix::io`, not `unsafe`.)*
-- [ ] The pinned SPKI comes from the same parser as the signature check
+- [x] The pinned SPKI comes from the same parser as the signature check
       (webpki's end-entity cert, if it exposes the SPKI; otherwise
       `x509-cert`/`der`), with a test that the two agree on crafted input.
+      *(Part 2, done by removing the second parser rather than adding a third.
+      `rustls-webpki` 0.103 exposes no SPKI getter, so `PinnedVerifier` now
+      verifies the TLS 1.3 handshake signature with
+      `rustls::crypto::verify_tls13_signature_with_raw_key` against exactly the
+      SPKI bytes `spki_of` extracted and pinned. The pinned key and the signing
+      key can't disagree. TLS 1.2 is refused (QUIC is 1.3-only), and `der_tlv`
+      is now strict DER: minimal lengths, no high-tag-number form. A mutation
+      check confirmed handshakes depend on it: feeding the check the wrong SPKI
+      fails the MASQUE handshake with `BadEncoding`.)*
 - [x] `ct_eq` replaced with `subtle::ConstantTimeEq`. *(Part 1.)*
 - [x] Remaining `unsafe` inventory re-checked; `ferrum-tunnel` gains
       `#![deny(unsafe_code)]` with local allows, like `ferrum-transport`.
