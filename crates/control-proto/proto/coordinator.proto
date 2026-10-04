@@ -48,6 +48,11 @@ message RegisterDeviceRequest {
   // network map so they can pin it. Replaced on every registration. (The
   // field name predates the switch to key pins; the wire name is kept.)
   string tls_cert_sha256 = 5;
+  // Pins this device will present *soon* (SEC-007): announced ahead of a
+  // planned key rotation so dialers accept either the current or the next key
+  // while the roll propagates. Same format as `tls_cert_sha256`, at most 4.
+  // Replaced (with the current pin) on every registration.
+  repeated string tls_next_pins = 6;
 }
 
 message RegisterDeviceResponse {
@@ -64,8 +69,13 @@ message PeerInfo {
   repeated string allowed_ips = 3; // CIDRs routed to this peer
   repeated string candidates = 4;  // ICE candidates (host + reflexive "ip:port")
   // The peer's registered TLS pin (public-key hash; see RegisterDeviceRequest),
-  // or empty. A dialer over QUIC accepts only a certificate with this key.
+  // or empty. A dialer over QUIC accepts only a certificate with this key —
+  // or with one of `tls_next_pins`.
   string tls_cert_sha256 = 5;
+  // The peer's pre-announced next pins (SEC-007; see RegisterDeviceRequest).
+  // A dialer accepts `tls_cert_sha256` or any of these, so a peer that has
+  // already rolled to its next key still authenticates.
+  repeated string tls_next_pins = 6;
 }
 
 message NetworkMapResponse {
@@ -105,6 +115,10 @@ message RotateKeyRequest {
   // The TLS pin that goes with the new key (a device's TLS key is derived
   // from its WireGuard key, so it changes too), or empty to clear the pin.
   string new_tls_cert_sha256 = 3;
+  // Next pins to announce after the rotation (SEC-007), usually empty: the
+  // rotation *completes* a pre-announced roll, so the old next pin is now
+  // current. Replaces the device's previous next pins.
+  repeated string new_tls_next_pins = 4;
 }
 
 message RotateKeyResponse {

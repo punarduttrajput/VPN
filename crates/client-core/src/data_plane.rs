@@ -72,19 +72,21 @@ pub fn build_mesh_peers(private_key_b64: &str, peers: &[PeerSpec]) -> Result<Vec
             // Local session indices must be distinct per peer; +1 keeps them non-zero.
             let session = Session::from_bytes(priv_bytes, pub_bytes, (i as u32) + 1)
                 .map_err(|e| Error::DataPlane(format!("session for '{}': {e}", p.public_key)))?;
-            // The peer's registered TLS cert pin (SEC-004), for a QUIC dial. A
-            // malformed pin is dropped (that peer is dialed unpinned, with the
-            // transport's warning) rather than failing the whole mesh.
-            let tls_pins = match p.tls_cert_sha256.as_str() {
-                "" => Vec::new(),
-                pin => match parse_fingerprint(pin) {
-                    Ok(fp) => vec![fp],
-                    Err(e) => {
-                        warn!(peer = %p.public_key, "ignoring peer's TLS pin: {e}");
-                        Vec::new()
-                    }
-                },
-            };
+            // The peer's accepted TLS pins for a QUIC dial: its current pin
+            // (SEC-004) plus any it pre-announced for a rotation (SEC-007), so
+            // a peer that has already rolled to its next key still
+            // authenticates. A malformed pin is dropped on its own (if none
+            // survive, that peer is dialed unpinned, with the transport's
+            // warning) rather than failing the whole mesh.
+            let mut tls_pins = Vec::new();
+            let listed = std::iter::once(&p.tls_cert_sha256).chain(&p.tls_next_pins);
+            for pin in listed.filter(|pin| !pin.is_empty()) {
+                match parse_fingerprint(pin) {
+                    Ok(fp) if !tls_pins.contains(&fp) => tls_pins.push(fp),
+                    Ok(_) => {}
+                    Err(e) => warn!(peer = %p.public_key, "ignoring peer's TLS pin: {e}"),
+                }
+            }
             Ok(
                 MeshPeer::with_candidates(session, endpoint, allowed_ips, candidates)
                     .with_tls_pins(tls_pins),
@@ -494,6 +496,7 @@ mod tests {
             allowed_ips: vec!["10.8.0.3/32".into()],
             candidates: vec![],
             tls_cert_sha256: String::new(),
+            tls_next_pins: vec![],
         }];
         let result = build_mesh_peers(&me.private_base64(), &specs);
         assert!(matches!(result, Err(Error::DataPlane(_))));
@@ -511,6 +514,7 @@ mod tests {
                 allowed_ips: vec!["10.8.0.3/32".into()],
                 candidates: vec![],
                 tls_cert_sha256: String::new(),
+                tls_next_pins: vec![],
             },
             PeerSpec {
                 public_key: p2.public_base64(),
@@ -518,6 +522,7 @@ mod tests {
                 allowed_ips: vec!["10.8.0.4/32".into()],
                 candidates: vec![],
                 tls_cert_sha256: String::new(),
+                tls_next_pins: vec![],
             },
         ];
         let peers = build_mesh_peers(&me.private_base64(), &specs).unwrap();
@@ -535,12 +540,85 @@ mod tests {
             allowed_ips: vec!["10.8.0.3/32".into()],
             candidates: vec![],
             tls_cert_sha256: pin.into(),
+            tls_next_pins: vec![],
         };
         let specs = [spec(&"ab".repeat(32)), spec("garbage"), spec("")];
         let peers = build_mesh_peers(&me.private_base64(), &specs).unwrap();
         assert_eq!(peers[0].tls_pins, vec![[0xab; 32]]);
         assert!(peers[1].tls_pins.is_empty(), "malformed pin dropped");
         assert!(peers[2].tls_pins.is_empty());
+    }
+
+    /// SEC-007: a peer's accepted pins are its current pin plus its
+    /// pre-announced next pins (deduplicated); a malformed entry is dropped
+    /// alone, keeping the rest.
+    #[test]
+    fn build_mesh_peers_accepts_current_and_next_pins() {
+        let me = ferrum_core::keys::KeyPair::generate();
+        let spec = |current: &str, next: &[&str]| PeerSpec {
+            public_key: ferrum_core::keys::KeyPair::generate().public_base64(),
+            endpoint: "127.0.0.1:51820".into(),
+            allowed_ips: vec!["10.8.0.3/32".into()],
+            candidates: vec![],
+            tls_cert_sha256: current.into(),
+            tls_next_pins: next.iter().map(|s| s.to_string()).collect(),
+        };
+        let (a, b) = ("aa".repeat(32), "bb".repeat(32));
+        let specs = [
+            spec(&a, &[&b, &a]),
+            spec("", &[&b]),
+            spec("garbage", &["junk", &b]),
+        ];
+        let peers = build_mesh_peers(&me.private_base64(), &specs).unwrap();
+        assert_eq!(peers[0].tls_pins, vec![[0xaa; 32], [0xbb; 32]]);
+        assert_eq!(peers[1].tls_pins, vec![[0xbb; 32]], "next pin alone");
+        assert_eq!(peers[2].tls_pins, vec![[0xbb; 32]], "bad entries dropped");
+    }
+
+    /// SEC-007 through the facade: a pre-announced next pin reaches another
+    /// device's peer view, and `rotate_key_with_pins` completes the roll (new
+    /// key, next pin now current, announcement cleared) and is remembered for
+    /// later registrations.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn next_pins_are_announced_and_rotation_completes_the_roll() {
+        let url = start_coordinator().await;
+        let (p1, p2) = ("12".repeat(32), "34".repeat(32));
+        let a = crate::FerrumClient::new();
+        a.set_tls_fingerprint(Some(p1.clone()));
+        a.set_tls_next_fingerprints(vec![p2.clone()]);
+        let mut a_id = crate::ClientIdentity {
+            public_key: ferrum_core::keys::KeyPair::generate().public_base64(),
+            name: "a".into(),
+            endpoint: "127.0.0.1:51820".into(),
+            tags: vec![],
+        };
+        a.connect(url.clone(), &a_id).await.unwrap();
+
+        let mut b = ControlClient::connect(url.clone()).await.unwrap();
+        let b_key = ferrum_core::keys::KeyPair::generate().public_base64();
+        b.register(&b_key, "b", "127.0.0.1:51821", &[])
+            .await
+            .unwrap();
+        let seen = |peers: Vec<PeerSpec>, pk: &str| {
+            let p = peers.into_iter().find(|p| p.public_key == pk).unwrap();
+            (p.tls_cert_sha256, p.tls_next_pins)
+        };
+        let peers = b.network_map(&b_key).await.unwrap();
+        assert_eq!(seen(peers, &a_id.public_key), (p1, vec![p2.clone()]));
+
+        let new_key = ferrum_core::keys::KeyPair::generate().public_base64();
+        a.rotate_key_with_pins(url.clone(), &a_id.public_key, &new_key, &p2, vec![])
+            .await
+            .unwrap();
+        let peers = b.network_map(&b_key).await.unwrap();
+        assert_eq!(seen(peers, &new_key), (p2.clone(), vec![]));
+
+        // The facade remembers the rolled pins: re-registering under the new
+        // key keeps publishing p2 and no stale next pin.
+        a_id.public_key = new_key.clone();
+        a.connect(url, &a_id).await.unwrap();
+        let peers = b.network_map(&b_key).await.unwrap();
+        assert_eq!(seen(peers, &new_key), (p2, vec![]));
     }
 
     /// SEC-004: a pin set on the facade is published at registration and

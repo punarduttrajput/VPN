@@ -28,16 +28,53 @@ Several pieces reimplement what vetted, widely used crates already provide
 
 ## Acceptance criteria
 
-- [ ] `fdpass` on `rustix::net` (or `nix::sys::socket`) with
-      `MSG_CMSG_CLOEXEC` and truncation checks; existing tests pass.
-- [ ] UDP batch I/O on `quinn-udp` (GSO/GRO/`sendmmsg`), keeping the current
+- [x] `fdpass` on `rustix::net` (or `nix::sys::socket`) with
+      `MSG_CMSG_CLOEXEC` and truncation checks; existing tests pass. *(Part 1.
+      `send_with_fd` takes a `BorrowedFd`; `recv_with_fd` returns an `OwnedFd`,
+      refuses `MSG_CTRUNC` and surplus fds (closing them), and sets `FD_CLOEXEC`
+      manually on Apple, which lacks the flag. `helper_proto` now carries
+      `BorrowedFd`/`OwnedFd` instead of raw integers.)*
+- [x] UDP batch I/O on `quinn-udp` (GSO/GRO/`sendmmsg`), keeping the current
       `UdpTransport` API and the GSO/GRO tests. Or, if a gap blocks that, fix
       the alignment with properly aligned cmsg buffers and record why.
-- [ ] `FdTun::from_fd` becomes `unsafe fn` (or takes `OwnedFd`); the FFI entry
-      point documents the ownership transfer.
-- [ ] The pinned SPKI comes from the same parser as the signature check
+      *(Part 3. GSO sends one `quinn_udp::Transmit` per equal-size run, and GRO
+      goes through `UdpSocketState::recv` into the existing `GroBuffer`. All
+      ~270 lines of `sendmsg`/`recvmsg`/`sendmmsg`/sockaddr FFI and the
+      hard-coded `UDP_SEGMENT`/`UDP_GRO` numbers are gone, and
+      `ferrum-transport` is now `forbid(unsafe_code)`. **Gap, recorded:**
+      `quinn-udp` has no `sendmmsg`, so on a kernel without GSO (< 4.18) a
+      batch costs one `sendmsg` per datagram. When a kernel refuses GSO at
+      runtime (quinn-udp disables it and drops that run), the run is resent
+      datagram by datagram.)*
+- [x] `FdTun::from_fd` becomes `unsafe fn` (or takes `OwnedFd`); the FFI entry
+      point documents the ownership transfer. *(Part 1: both. There's a new safe
+      `device::from_owned_fd`, and `from_fd(RawFd)` is `unsafe fn` with a
+      `# Safety` contract. The uniffi `run` call site documents Android's
+      `detachFd()` hand-over. `FdTun` I/O is now `rustix::io`, not `unsafe`.)*
+- [x] The pinned SPKI comes from the same parser as the signature check
       (webpki's end-entity cert, if it exposes the SPKI; otherwise
       `x509-cert`/`der`), with a test that the two agree on crafted input.
-- [ ] `ct_eq` replaced with `subtle::ConstantTimeEq`.
-- [ ] Remaining `unsafe` inventory re-checked; `ferrum-tunnel` gains
+      *(Part 2, done by removing the second parser rather than adding a third.
+      `rustls-webpki` 0.103 exposes no SPKI getter, so `PinnedVerifier` now
+      verifies the TLS 1.3 handshake signature with
+      `rustls::crypto::verify_tls13_signature_with_raw_key` against exactly the
+      SPKI bytes `spki_of` extracted and pinned. The pinned key and the signing
+      key can't disagree. TLS 1.2 is refused (QUIC is 1.3-only), and `der_tlv`
+      is now strict DER: minimal lengths, no high-tag-number form. A mutation
+      check confirmed handshakes depend on it: feeding the check the wrong SPKI
+      fails the MASQUE handshake with `BadEncoding`.)*
+- [x] `ct_eq` replaced with `subtle::ConstantTimeEq`. *(Part 1.)*
+- [x] Remaining `unsafe` inventory re-checked; `ferrum-tunnel` gains
       `#![deny(unsafe_code)]` with local allows, like `ferrum-transport`.
+      *(Part 1: `ferrum-tunnel` went from 27 `unsafe` mentions to two
+      `OwnedFd::from_raw_fd` conversions (the `tun` crate's `IntoRawFd` in
+      `open_raw`, and `from_fd`), each allowed locally, and no longer depends
+      on `libc`.)*
+
+**Split into parts.** Part 1 (above, branch `sec-016-vetted-fd-passing`,
+stacked on SEC-012) covers fd passing, the fd-TUN, `ct_eq` and the tunnel lint.
+**Part 2:** the pinned SPKI. `rustls-webpki` 0.103 exposes no SPKI getter, so the
+fix is to verify the handshake signature against the *pinned SPKI bytes
+themselves* (rustls's raw-public-key verification), which leaves no second
+parser to disagree with. **Part 3:** UDP GSO/GRO on `quinn-udp`, the biggest
+rework of the data path.

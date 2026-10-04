@@ -23,14 +23,22 @@ per-device intent of the coordinator's ACL.
 
 ## Acceptance criteria
 
-- [ ] `handle_inbound` drops (and debug-logs, without addresses — NFR5) a
+- [x] `handle_inbound` drops (and debug-logs, without addresses — NFR5) a
       decrypted packet whose source is not within the decrypting peer's
-      `allowed_ips`. IPv4 and IPv6 are both covered.
-- [ ] The point-to-point runner applies the same check against its configured
-      peer's allowed IPs.
-- [ ] Aggregate counter for dropped spoofed packets.
+      `allowed_ips`. IPv4 and IPv6 are both covered. *(`Cidr::contains` handles
+      both families; a mixed-family source never matches.)*
+- [x] The point-to-point runner applies the same check against its configured
+      peer's allowed IPs. *(`run` now takes `allowed_ips`; `ferrum up` passes
+      `peer.allowed_ips`, which it had previously validated and then ignored.)*
+- [x] Aggregate counter for dropped spoofed packets.
+      *(`ferrum_tunnel::spoofed_source_drops()`: process-wide, no labels. Not
+      yet exported by any metrics endpoint, since the client has none.)*
 - [ ] Tests: peer A sending an inner packet with peer B's source is dropped;
       its own source is delivered; relay and direct underlays both covered.
+      *(Direct underlay covered: `mesh_drops_packets_spoofing_another_peers_address`
+      and point-to-point `packet_with_a_source_outside_allowed_ips_is_dropped`,
+      both confirmed to fail with the check disabled. The relay underlay uses
+      the same `handle_inbound` code path but has no dedicated test yet.)*
 
 ## Implementation notes
 
