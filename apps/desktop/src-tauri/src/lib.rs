@@ -35,6 +35,8 @@ mod leakguard;
 #[cfg(windows)]
 mod helper_client;
 #[cfg(windows)]
+pub mod pipe_security;
+#[cfg(windows)]
 pub mod service;
 
 use std::sync::Mutex;

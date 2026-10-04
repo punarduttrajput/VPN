@@ -52,6 +52,7 @@ fn peer_spec_from_info(p: PeerInfo) -> PeerSpec {
         allowed_ips: p.allowed_ips,
         candidates: p.candidates,
         tls_cert_sha256: p.tls_cert_sha256,
+        tls_next_pins: p.tls_next_pins,
     }
 }
 
@@ -90,6 +91,9 @@ pub struct PeerSpec {
     /// SHA-256 pin (hex) of the TLS cert the peer presents to QUIC dialers
     /// (SEC-004), or empty if it registered none.
     pub tls_cert_sha256: String,
+    /// Pins the peer pre-announced for an upcoming key rotation (SEC-007). A
+    /// QUIC dialer accepts `tls_cert_sha256` or any of these.
+    pub tls_next_pins: Vec<String>,
 }
 
 /// The tunnel configuration derived from the control plane for this device.
@@ -108,6 +112,8 @@ pub struct ControlClient {
     token: Option<String>,
     /// This device's TLS cert pin (SEC-004), published on every registration.
     tls_cert_sha256: String,
+    /// Pins it pre-announces for an upcoming rotation (SEC-007), likewise.
+    tls_next_pins: Vec<String>,
 }
 
 impl ControlClient {
@@ -118,6 +124,7 @@ impl ControlClient {
             inner,
             token: None,
             tls_cert_sha256: String::new(),
+            tls_next_pins: Vec::new(),
         })
     }
 
@@ -133,6 +140,16 @@ impl ControlClient {
     /// coordinator can hand it to peers. Unset means "no TLS transport".
     pub fn with_tls_fingerprint(mut self, pin: impl Into<String>) -> Self {
         self.tls_cert_sha256 = pin.into();
+        self
+    }
+
+    /// Pre-announce `pins` (hex SHA-256s this device will present after its
+    /// next key rotation — SEC-007) with every [`register`](Self::register),
+    /// so peers accept the new key the moment it goes live. Step one of the
+    /// rotation runbook; [`rotate_key_with_pins`](Self::rotate_key_with_pins)
+    /// completes it.
+    pub fn with_tls_next_fingerprints(mut self, pins: Vec<String>) -> Self {
+        self.tls_next_pins = pins;
         self
     }
 
@@ -177,6 +194,7 @@ impl ControlClient {
             inner: CoordinatorClient::new(channel),
             token: None,
             tls_cert_sha256: String::new(),
+            tls_next_pins: Vec::new(),
         })
     }
 
@@ -194,6 +212,7 @@ impl ControlClient {
             endpoint: endpoint.to_string(),
             tags: tags.to_vec(),
             tls_cert_sha256: self.tls_cert_sha256.clone(),
+            tls_next_pins: self.tls_next_pins.clone(),
         });
         let resp = self.inner.register_device(req).await?.into_inner();
         Ok(resp.assigned_cidr)
@@ -255,18 +274,38 @@ impl ControlClient {
     /// candidates. Returns the (unchanged) assigned CIDR. The caller generates the
     /// new keypair locally and rebuilds its data plane with the new private key;
     /// peers learn the new key over their watch stream and re-handshake to it.
+    ///
+    /// This form carries no TLS pin: the TLS cert is derived from the WireGuard
+    /// key, so the old pin is now wrong and is cleared (peers dial unpinned,
+    /// with a warning) until the device re-registers with its new pin. A QUIC
+    /// node should use [`rotate_key_with_pins`](Self::rotate_key_with_pins).
     pub async fn rotate_key(
         &mut self,
         old_public_key: &str,
         new_public_key: &str,
     ) -> Result<String, Error> {
+        self.rotate_key_with_pins(old_public_key, new_public_key, "", &[])
+            .await
+    }
+
+    /// [`rotate_key`](Self::rotate_key), atomically installing the new key's
+    /// TLS pin `new_pin` (and any `new_next_pins` to announce next) so the
+    /// device is never unpinned (SEC-007). With the new pin pre-announced via
+    /// [`with_tls_next_fingerprints`](Self::with_tls_next_fingerprints), peers
+    /// holding a slightly stale map still accept it: the roll has no window in
+    /// which a dial fails on its pin.
+    pub async fn rotate_key_with_pins(
+        &mut self,
+        old_public_key: &str,
+        new_public_key: &str,
+        new_pin: &str,
+        new_next_pins: &[String],
+    ) -> Result<String, Error> {
         let req = self.request(RotateKeyRequest {
             old_public_key: old_public_key.to_string(),
             new_public_key: new_public_key.to_string(),
-            // The TLS cert is derived from the WireGuard key, so the old pin is
-            // now wrong; clear it (peers dial unpinned, with a warning) until the
-            // device re-registers under the new key with its new pin (SEC-004).
-            new_tls_cert_sha256: String::new(),
+            new_tls_cert_sha256: new_pin.to_string(),
+            new_tls_next_pins: new_next_pins.to_vec(),
         });
         let resp = self.inner.rotate_key(req).await?.into_inner();
         Ok(resp.assigned_cidr)

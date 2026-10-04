@@ -40,6 +40,7 @@ tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",
     "signal",
+    "time",
 ] }
 # The shared client core (Phase 5 facade) with the `data-plane` runner enabled:
 # `connect` opens a TUN and drives `run_mesh_session`, so the GUI moves packets.
@@ -76,6 +77,11 @@ ferrum-tunnel = { path = "../../../crates/tunnel", features = ["real-tun"] }
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
+    # Helper pipe access control (src/pipe_security.rs, SEC-005): SDDL → DACL,
+    # client impersonation + pid.
+    "Win32_Security_Authorization",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
     "Win32_System_Rpc",
     "Win32_NetworkManagement_Ndis",
     "Win32_NetworkManagement_IpHelper",
