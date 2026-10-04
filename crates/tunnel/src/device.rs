@@ -109,14 +109,26 @@ mod imp {
     /// unprivileged GUI process via [`crate::fdpass`], instead of driving the
     /// device's I/O itself. (Unix always sets the address in-crate, so the
     /// out-of-band flag from `build_tun_config` is never true here.)
+    ///
+    /// Returns an [`OwnedFd`](std::os::fd::OwnedFd): the caller owns the
+    /// descriptor and dropping it closes it. The helper sends a *duplicate* to
+    /// its client and must close its own copy, or every request leaks one and
+    /// keeps the interface alive after the client exits (SEC-012). The name
+    /// is validated first ([`crate::ifname::validate`]): it may come from an
+    /// unprivileged helper client.
     #[cfg(unix)]
-    pub fn open_raw(cfg: &TunConfig) -> Result<std::os::unix::io::RawFd> {
+    pub fn open_raw(cfg: &TunConfig) -> Result<std::os::fd::OwnedFd> {
+        use std::os::fd::{FromRawFd, OwnedFd};
         use std::os::unix::io::IntoRawFd;
 
+        crate::ifname::validate(&cfg.name)?;
         let (tcfg, _) = build_tun_config(cfg);
         let dev = tun::create(&tcfg)
             .map_err(|e| crate::TunnelError::Io(std::io::Error::other(e.to_string())))?;
-        Ok(dev.into_raw_fd())
+        let raw = dev.into_raw_fd();
+        // SAFETY: `into_raw_fd` just released this fd from the device we
+        // exclusively owned; nothing else holds or will close it.
+        Ok(unsafe { OwnedFd::from_raw_fd(raw) })
     }
 
     /// Assign an IPv6 address (with its on-link prefix) and MTU to the named
@@ -283,7 +295,7 @@ pub fn open(cfg: &TunConfig) -> Result<impl TunDevice> {
 /// (Unix only). See [`imp::open_raw`] — used by the privileged helper daemon
 /// (Phase 5) to create the interface and hand its fd to an unprivileged caller.
 #[cfg(all(unix, feature = "real-tun"))]
-pub fn open_raw(cfg: &TunConfig) -> Result<std::os::unix::io::RawFd> {
+pub fn open_raw(cfg: &TunConfig) -> Result<std::os::fd::OwnedFd> {
     imp::open_raw(cfg)
 }
 

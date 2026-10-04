@@ -4,6 +4,7 @@
 
 pub mod device;
 pub mod ice;
+pub mod ifname;
 pub mod mesh;
 pub mod path;
 pub mod session;
