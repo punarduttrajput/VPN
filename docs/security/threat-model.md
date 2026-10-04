@@ -8,8 +8,8 @@
 This is the published statement of what Ferrum's coordinator, relays,
 transports and clients **can observe**, what they keep and for how long, where
 the trust boundaries are, and what Ferrum does *not* try to protect against.
-It describes the code, not intentions. Where a property depends on a security
-fix that is still in review, the ticket is named next to it (see §8).
+It describes the code, not intentions. Where a property comes from a specific
+security fix, the ticket is named next to it (see §8).
 
 ## 1. System in one picture
 
@@ -294,9 +294,8 @@ Ferrum for them.
 | Local `ferrum` group member | tunnel control | tunnel and kill-switch on/off | root code execution (SEC-005/012) |
 | Admin token holder | operations | everything the coordinator knows; revoke; policy | read traffic |
 
-**Status of fixes referenced here.** SEC-001 to SEC-004 are on `main`. SEC-005
-to SEC-008 and SEC-011 to SEC-018 are implemented and in review. The claims
-that rely on them (marked inline) hold once those branches merge. SEC-019 (the
+**Status of fixes referenced here.** SEC-001 to SEC-018 are on `main`, except
+SEC-018's eBPF/XDP parser checks, which need a Linux host. SEC-019 (the
 boringtun upgrade) and SEC-020 (the SNI default) are open.
 
 ## 9. Keeping this document true
