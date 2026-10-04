@@ -75,6 +75,11 @@ fn empty(status: &str) -> String {
 /// Accept connections on `listener` forever, answering each with
 /// `handler(path)` (or 404/405/400).
 pub async fn serve(listener: TcpListener, handler: Handler) {
+    serve_with_timeout(listener, handler, REQUEST_TIMEOUT).await
+}
+
+/// [`serve`] with a custom request timeout (tests use a short one).
+async fn serve_with_timeout(listener: TcpListener, handler: Handler, request_timeout: Duration) {
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
         let Ok((mut stream, _)) = listener.accept().await else {
@@ -88,7 +93,7 @@ pub async fn serve(listener: TcpListener, handler: Handler) {
         tokio::spawn(async move {
             let _permit = permit;
             let mut head = Vec::with_capacity(128);
-            let read = tokio::time::timeout(REQUEST_TIMEOUT, async {
+            let read = tokio::time::timeout(request_timeout, async {
                 let mut chunk = [0u8; 256];
                 while head.len() < MAX_REQUEST && !head.windows(2).any(|w| w == b"\r\n") {
                     match stream.read(&mut chunk).await {
@@ -189,15 +194,18 @@ mod tests {
     }
 
     /// A client that connects and sends nothing is dropped after the timeout
-    /// rather than holding its task forever.
-    #[tokio::test(start_paused = true)]
+    /// rather than holding its task forever. Real time with a short timeout:
+    /// a paused clock can jump past the client's deadline before the server
+    /// has even accepted the (real) socket.
+    #[tokio::test]
     async fn silent_clients_are_dropped_after_the_timeout() {
+        let timeout = Duration::from_millis(200);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(serve(listener, Arc::new(|_| None)));
+        tokio::spawn(serve_with_timeout(listener, Arc::new(|_| None), timeout));
         let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut buf = [0u8; 16];
-        let n = tokio::time::timeout(REQUEST_TIMEOUT * 2, s.read(&mut buf))
+        let n = tokio::time::timeout(timeout * 25, s.read(&mut buf))
             .await
             .expect("server must close a silent connection")
             .unwrap_or(0);
