@@ -40,3 +40,4 @@ Follow-ups from the SEC-010 threat model
 |----|-------|----------|-----------|
 | [SEC-020](SEC-020-default-sni-fingerprint.md) | Default TLS SNI `ferrum` names the product to on-path DPI | Low | M4 |
 | [SEC-021](SEC-021-quic-alpn.md) | Plain and mesh QUIC offer no ALPN | Low | M4 |
+| [SEC-022](SEC-022-quinn-proto-and-deny-coverage.md) | quinn-proto memory exhaustion; supply-chain gate gaps | Medium | M4 |
