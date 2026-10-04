@@ -1,6 +1,9 @@
 //! The Phase 1 data plane: a WireGuard session ([`session`]) bridging a TUN
 //! device ([`device`]) and a UDP socket via an async event loop ([`run`]).
 #![cfg_attr(not(unix), allow(dead_code))]
+// SEC-016: fd passing and the fd-TUN's I/O go through `rustix`, leaving two
+// `OwnedFd::from_raw_fd` conversions (in `device`), each explicitly allowed.
+#![deny(unsafe_code)]
 
 pub mod device;
 pub mod ice;

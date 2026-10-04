@@ -15,10 +15,8 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::io;
 use std::net::IpAddr;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
-#[cfg(test)]
-use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -213,7 +211,7 @@ fn handle_connection(
     // Send a duplicate of the TUN fd (if any); our copy is closed when `fd`
     // drops at the end of this function, on success and failure alike, so
     // the daemon never accumulates descriptors (SEC-012).
-    send_response(&stream, &resp, fd.as_ref().map(AsRawFd::as_raw_fd))
+    send_response(&stream, &resp, fd.as_ref().map(AsFd::as_fd))
 }
 
 /// Lowest / highest TUN MTU the helper will configure. 576 is the IPv4
@@ -564,13 +562,13 @@ mod tests {
     async fn round_trip(
         socket_path: &std::path::Path,
         req: &HelperRequest,
-    ) -> (HelperResponse, Option<RawFd>) {
+    ) -> (HelperResponse, Option<OwnedFd>) {
         let mut last_err = None;
         for attempt in 0..20 {
             if attempt > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
-            let attempted: io::Result<(HelperResponse, Option<RawFd>)> = (|| {
+            let attempted: io::Result<(HelperResponse, Option<OwnedFd>)> = (|| {
                 let mut stream = StdUnixStream::connect(socket_path)?;
                 send_request(&mut stream, req)?;
                 recv_response(&stream)
@@ -907,8 +905,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread")]
     async fn open_tun_does_not_leak_the_daemons_fd() {
-        use std::os::fd::FromRawFd;
-
         // SAFETY: `geteuid` has no preconditions.
         if unsafe { libc::geteuid() } != 0 {
             eprintln!("skipping: needs root to create a TUN device");
@@ -923,15 +919,13 @@ mod tests {
         };
         // Warm up (runtime threads, the first connection) before measuring.
         let (_, fd) = round_trip(&socket_path, &req).await;
-        // SAFETY: as below — a freshly received fd owned by nothing else.
-        drop(fd.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }));
+        drop(fd);
         let before = open_fds();
         for _ in 0..5 {
             let (resp, fd) = round_trip(&socket_path, &req).await;
             assert!(matches!(resp, HelperResponse::TunOpened), "{resp:?}");
             // Close the client's copy; only the daemon's copy could remain.
-            // SAFETY: the fd was just received and is owned by nothing else.
-            drop(fd.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }));
+            drop(fd);
         }
         assert_eq!(open_fds(), before, "the daemon kept TUN fds open");
         let _ = std::fs::remove_file(&socket_path);

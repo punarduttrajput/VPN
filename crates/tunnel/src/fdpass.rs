@@ -3,171 +3,162 @@
 //! This is the primitive the privileged helper daemon (Phase 5) uses to hand a
 //! freshly-opened TUN fd to the unprivileged GUI process: the fd travels as
 //! ancillary data alongside a small payload on an ordinary [`UnixStream`].
-//! Hand-rolled on `libc::sendmsg`/`recvmsg` (no fd-passing crate) to keep this
-//! small and auditable, mirroring the project's existing bias for hand-rolling
-//! small security-adjacent primitives (see `ferrum-transport::stun`, the OIDC
-//! verifier).
+//!
+//! Built on `rustix`'s typed `sendmsg`/`recvmsg` (SEC-016). This module used to
+//! hand-roll them on `libc`, with a control buffer that wasn't guaranteed to be
+//! `cmsghdr`-aligned, no `MSG_CMSG_CLOEXEC` (so the TUN fd leaked into child
+//! processes such as `nft`), and no check for truncated control data. It is now
+//! free of `unsafe`.
 
-use std::io;
-use std::mem::{size_of, MaybeUninit};
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::io::{self, IoSlice, IoSliceMut};
+use std::mem::MaybeUninit;
+use std::os::fd::{BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
+
+use rustix::net::{
+    recvmsg, sendmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags,
+    SendAncillaryBuffer, SendAncillaryMessage, SendFlags,
+};
 
 /// Send `payload` on `stream`, carrying `fd` as ancillary `SCM_RIGHTS` data.
 ///
-/// The peer must call [`recv_with_fd`] to receive both. `fd` is borrowed here
-/// (not consumed) — the kernel duplicates it into the receiver; the caller
-/// still owns and must close (or let it stay owned via `OwnedFd`/`Drop`) its
-/// original descriptor.
-pub fn send_with_fd(stream: &UnixStream, payload: &[u8], fd: RawFd) -> io::Result<()> {
-    let iov = libc::iovec {
-        iov_base: payload.as_ptr() as *mut _,
-        iov_len: payload.len(),
-    };
-
-    let space = unsafe { libc::CMSG_SPACE(size_of::<RawFd>() as u32) } as usize;
-    let mut cmsg_buf = vec![0u8; space];
-
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &iov as *const _ as *mut _;
-    msg.msg_iovlen = 1;
-    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut _;
-    msg.msg_controllen = cmsg_buf.len() as _;
-
-    // SAFETY: `msg` points at a zero-initialized `msghdr` with valid `iov` and
-    // `control` buffers sized for exactly one fd; `CMSG_FIRSTHDR` on a
-    // non-null `msg_control` of that size always returns a valid pointer
-    // within `cmsg_buf`.
-    unsafe {
-        let cmsg = libc::CMSG_FIRSTHDR(&msg);
-        (*cmsg).cmsg_level = libc::SOL_SOCKET;
-        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-        (*cmsg).cmsg_len = libc::CMSG_LEN(size_of::<RawFd>() as u32) as _;
-        std::ptr::write(libc::CMSG_DATA(cmsg) as *mut RawFd, fd);
+/// The peer must call [`recv_with_fd`] to receive both. `fd` is borrowed: the
+/// kernel duplicates it into the receiver, and the caller still owns (and must
+/// eventually close) its own copy.
+pub fn send_with_fd(stream: &UnixStream, payload: &[u8], fd: BorrowedFd<'_>) -> io::Result<()> {
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut control = SendAncillaryBuffer::new(&mut space);
+    let fds = [fd];
+    if !control.push(SendAncillaryMessage::ScmRights(&fds)) {
+        return Err(io::Error::other("SCM_RIGHTS control buffer too small"));
     }
-
-    // SAFETY: `stream`'s fd is valid for the duration of this call; `msg` is
-    // fully initialized above.
-    let n = unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, 0) };
-    if n < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    sendmsg(
+        stream,
+        &[IoSlice::new(payload)],
+        &mut control,
+        SendFlags::empty(),
+    )?;
     Ok(())
 }
 
 /// Receive a payload (into `buf`) and an optional fd sent by [`send_with_fd`].
 ///
 /// Returns the number of payload bytes read and, if the sender attached one,
-/// the received fd (owned by the caller — closes on drop if not otherwise
-/// used).
+/// the received fd, owned by the caller and closed on drop. The fd is received
+/// close-on-exec, so it never leaks into a process the caller spawns. Truncated
+/// ancillary data (the sender attached more than we accept) is an error, and
+/// any surplus fds the kernel did deliver are closed rather than leaked.
 pub fn recv_with_fd(stream: &UnixStream, buf: &mut [u8]) -> io::Result<(usize, Option<OwnedFd>)> {
-    let mut iov = libc::iovec {
-        iov_base: buf.as_mut_ptr() as *mut _,
-        iov_len: buf.len(),
-    };
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut control = RecvAncillaryBuffer::new(&mut space);
+    let msg = recvmsg(
+        stream,
+        &mut [IoSliceMut::new(buf)],
+        &mut control,
+        recv_flags(),
+    )?;
 
-    let space = unsafe { libc::CMSG_SPACE(size_of::<RawFd>() as u32) } as usize;
-    let mut cmsg_buf: Vec<MaybeUninit<u8>> = vec![MaybeUninit::uninit(); space];
-
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut _;
-    msg.msg_controllen = cmsg_buf.len() as _;
-
-    // SAFETY: `stream`'s fd is valid; `msg` describes a single-element iovec
-    // over `buf` and a control buffer sized for at most one fd.
-    let n = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, 0) };
-    if n < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    // `msg_controllen`'s type varies by Unix flavor (e.g. `usize` on Linux,
-    // `socklen_t` on macOS); the cast is a no-op on this host but needed for
-    // portability, hence the explicit allow.
-    #[allow(clippy::unnecessary_cast)]
-    let controllen = msg.msg_controllen as usize;
-    let fd = if controllen >= size_of::<libc::cmsghdr>() {
-        // SAFETY: `msg_controllen` indicates the kernel wrote at least one
-        // cmsghdr into `cmsg_buf`; `CMSG_FIRSTHDR` returns a pointer into it.
-        unsafe {
-            let cmsg = libc::CMSG_FIRSTHDR(&msg);
-            if cmsg.is_null()
-                || (*cmsg).cmsg_level != libc::SOL_SOCKET
-                || (*cmsg).cmsg_type != libc::SCM_RIGHTS
-            {
-                None
-            } else {
-                let raw = std::ptr::read(libc::CMSG_DATA(cmsg) as *const RawFd);
-                Some(OwnedFd::from_raw_fd(raw))
-            }
+    // Collect every delivered fd (as OwnedFd, so any we don't keep are closed).
+    let mut fds: Vec<OwnedFd> = Vec::new();
+    for message in control.drain() {
+        if let RecvAncillaryMessage::ScmRights(received) = message {
+            fds.extend(received);
         }
-    } else {
-        None
-    };
+    }
+    if msg.flags.contains(ReturnFlags::CTRUNC) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "truncated SCM_RIGHTS control data (sender attached more than one fd)",
+        ));
+    }
+    if fds.len() > 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "expected at most one fd, received several",
+        ));
+    }
+    let fd = fds.pop();
+    #[cfg(target_vendor = "apple")]
+    if let Some(fd) = &fd {
+        // No MSG_CMSG_CLOEXEC on Apple platforms: set it right after receipt.
+        rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::CLOEXEC)?;
+    }
+    Ok((msg.bytes, fd))
+}
 
-    Ok((n as usize, fd))
+/// `MSG_CMSG_CLOEXEC` where the platform has it (everywhere but Apple's).
+fn recv_flags() -> RecvFlags {
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        RecvFlags::CMSG_CLOEXEC
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        RecvFlags::empty()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::io::IntoRawFd;
+    use std::io::{Read, Write};
+    use std::os::fd::AsFd;
 
     /// A `UnixStream::pair()` gives two connected, unprivileged sockets —
     /// enough to exercise real `SCM_RIGHTS` fd-passing without root or a real
     /// TUN device. The passed fd is a pipe end, verified usable on the
-    /// receiving side (distinct fd number, same underlying file).
+    /// receiving side (the same underlying pipe) and close-on-exec.
     #[test]
     fn fd_travels_across_the_socket_and_is_usable() {
         let (a, b) = UnixStream::pair().unwrap();
+        let (reader, mut writer) = std::io::pipe().unwrap();
 
-        let mut pipe_fds = [0i32; 2];
-        // SAFETY: fills `pipe_fds` with a valid, connected pipe pair.
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-        let (read_end, write_end) = (pipe_fds[0], pipe_fds[1]);
-
-        send_with_fd(&a, b"hello", read_end).unwrap();
+        send_with_fd(&a, b"hello", reader.as_fd()).unwrap();
+        // The kernel duplicated the fd, so closing ours doesn't affect theirs.
+        drop(reader);
 
         let mut buf = [0u8; 16];
         let (n, fd) = recv_with_fd(&b, &mut buf).unwrap();
         assert_eq!(&buf[..n], b"hello");
-        let received = fd.expect("a fd should have been received").into_raw_fd();
-        // The kernel duplicates the fd rather than transferring the original
-        // number, so both are simultaneously open and distinct file
-        // descriptions — closing ours here must not affect `received`.
-        // SAFETY: closes our copy now that it's been sent; the receiver holds
-        // its own duplicate from the kernel.
-        unsafe { libc::close(read_end) };
+        let received = fd.expect("a fd should have been received");
+        let flags = rustix::io::fcntl_getfd(&received).unwrap();
+        assert!(
+            flags.contains(rustix::io::FdFlags::CLOEXEC),
+            "received fd must be close-on-exec"
+        );
 
-        // Write through the original pipe's write end; read back through the
-        // *received* fd to prove it's the same underlying pipe.
-        let payload = b"through-the-pipe";
-        // SAFETY: `write_end` is a valid, open pipe write fd.
-        let w = unsafe { libc::write(write_end, payload.as_ptr().cast(), payload.len()) };
-        assert_eq!(w, payload.len() as isize);
-
-        let mut rbuf = [0u8; 32];
-        // SAFETY: `received` is the fd handed back by `recv_with_fd`.
-        let r = unsafe { libc::read(received, rbuf.as_mut_ptr().cast(), rbuf.len()) };
-        assert_eq!(r, payload.len() as isize);
-        assert_eq!(&rbuf[..r as usize], payload);
-
-        // SAFETY: close the fds we still own.
-        unsafe {
-            libc::close(write_end);
-            libc::close(received);
-        }
+        writer.write_all(b"through-the-pipe").unwrap();
+        drop(writer);
+        let mut got = Vec::new();
+        std::fs::File::from(received).read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"through-the-pipe");
     }
 
     #[test]
     fn no_fd_attached_is_reported_as_none() {
         let (a, b) = UnixStream::pair().unwrap();
-        use std::io::Write;
         (&a).write_all(b"plain").unwrap();
         let mut buf = [0u8; 16];
         let (n, fd) = recv_with_fd(&b, &mut buf).unwrap();
         assert_eq!(&buf[..n], b"plain");
         assert!(fd.is_none());
+    }
+
+    /// A sender that attaches more fds than we accept gets an error, not a
+    /// silently dropped (leaked) descriptor.
+    #[test]
+    fn surplus_fds_are_refused() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let (r1, _w1) = std::io::pipe().unwrap();
+        let (r2, _w2) = std::io::pipe().unwrap();
+        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2))];
+        let mut control = SendAncillaryBuffer::new(&mut space);
+        let two = [r1.as_fd(), r2.as_fd()];
+        assert!(control.push(SendAncillaryMessage::ScmRights(&two)));
+        sendmsg(&a, &[IoSlice::new(b"x")], &mut control, SendFlags::empty()).unwrap();
+
+        let mut buf = [0u8; 4];
+        let err = recv_with_fd(&b, &mut buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }
