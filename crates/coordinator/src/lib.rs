@@ -7,6 +7,7 @@
 //! admin HTTP API + panel for device/ACL management (`admin-api`).
 #![forbid(unsafe_code)]
 
+pub mod limits;
 pub mod metrics;
 pub mod policy;
 pub mod registry;
@@ -26,6 +27,7 @@ pub mod auth;
 #[cfg(feature = "admin-api")]
 pub mod admin;
 
+pub use limits::{LimitsConfig, RateSpec};
 pub use metrics::Metrics;
 pub use policy::{AclRule, Policy};
 pub use registry::{Device, Registry, RegistryError};
