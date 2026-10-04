@@ -73,6 +73,11 @@ pub enum HelperResponse {
 /// implement reassembly for a response split across multiple reads.
 const MAX_RESPONSE: usize = 4096;
 
+/// Largest request payload [`recv_request`] accepts. Requests are tiny JSON
+/// messages; without a cap the length prefix alone would let any caller make
+/// the (root) helper allocate up to 4 GiB (SEC-005).
+pub const MAX_REQUEST: usize = 64 * 1024;
+
 /// Write a length-prefixed JSON `HelperRequest` to `stream`. Uses ordinary
 /// `Write`/`read_exact` framing (robust to partial reads/writes) since a
 /// request never carries an fd.
@@ -88,6 +93,12 @@ pub fn recv_request(stream: &mut UnixStream) -> io::Result<HelperRequest> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf)?;
     let len = u32::from_le_bytes(len_buf) as usize;
+    if len > MAX_REQUEST {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("helper request of {len} bytes exceeds the {MAX_REQUEST}-byte limit"),
+        ));
+    }
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf)?;
     serde_json::from_slice(&buf).map_err(io::Error::other)
@@ -147,6 +158,16 @@ mod tests {
             }
             other => panic!("unexpected request: {other:?}"),
         }
+    }
+
+    #[test]
+    fn oversized_request_is_rejected_before_allocating() {
+        let (mut a, mut b) = UnixStream::pair().unwrap();
+        // Only the length prefix is sent: the receiver must refuse on the
+        // prefix alone rather than allocate and wait for a 4 GiB body.
+        a.write_all(&u32::MAX.to_le_bytes()).unwrap();
+        let err = recv_request(&mut b).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
