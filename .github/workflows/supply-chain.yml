@@ -1,7 +1,9 @@
 name: Supply chain
 
-# SEC-017: cargo-deny over the root workspace (deny.toml): RustSec advisories
-# (vulnerable, unsound, unmaintained, yanked), licences, bans and sources. Runs
+# SEC-017: cargo-deny over the root workspace (deny.toml, all features since
+# SEC-022): RustSec advisories (vulnerable, unsound, unmaintained, yanked),
+# licences, bans and sources. SEC-022 adds the desktop app, a separate
+# workspace (apps/desktop/src-tauri/deny.toml, advisories only for now). Runs
 # on every push/PR, and daily, so a newly published advisory against a
 # dependency we already ship is caught without waiting for a code change.
 
@@ -25,3 +27,9 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check all
+
+      - name: cargo deny check (desktop app, advisories)
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          manifest-path: apps/desktop/src-tauri/Cargo.toml
+          command: check advisories
