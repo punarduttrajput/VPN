@@ -16,3 +16,18 @@ severity, then market/process. Milestones map to the PRD §5 table.
 | [SEC-008](SEC-008-vendored-binary-provenance.md) | Vendored/prebuilt binaries lack checksum provenance | Medium | M2 |
 | [SEC-009](SEC-009-third-party-audit-plan.md) | No independent audit; hand-rolled security primitives | Market/Process | M4 |
 | [SEC-010](SEC-010-published-threat-model.md) | No published metadata/privacy threat model | Market/Process | M4 |
+
+Follow-ups from the SEC-009 audit-readiness inventory
+([docs/security/audit-plan.md](../../docs/security/audit-plan.md)). The four
+Highs are gates for the third-party audit.
+
+| ID | Title | Severity | Milestone |
+|----|-------|----------|-----------|
+| [SEC-011](SEC-011-mesh-source-address-check.md) | Decrypted inbound packets aren't checked against `allowed_ips` | High | M4 |
+| [SEC-012](SEC-012-helper-request-validation.md) | Helper requests unvalidated: nft injection as root + TUN fd leak | High | M4 |
+| [SEC-013](SEC-013-coordinator-rpc-authorization.md) | Coordinator RPCs act on any caller-supplied key; revocation isn't durable | High | M4 |
+| [SEC-014](SEC-014-adopt-jsonwebtoken.md) | Replace hand-rolled JWT verification; tighten claim policy and admin audience | High | M4 |
+| [SEC-015](SEC-015-masque-proxy-access-control.md) | MASQUE proxy is an open UDP proxy | Medium | M4 |
+| [SEC-016](SEC-016-replace-hand-rolled-unsafe.md) | Replace hand-rolled `unsafe` FFI and parsers with vetted crates | Medium | M4 |
+| [SEC-017](SEC-017-fuzzing-and-supply-chain.md) | No fuzzing, no dependency-vulnerability gate | Medium | M4 |
+| [SEC-018](SEC-018-low-severity-hardening.md) | Low-severity hardening batch | Low | M4 |

@@ -11,9 +11,11 @@
 //! ferrum-helper --socket /run/ferrum/helper.sock --group ferrum
 //! ```
 //!
-//! The socket is `chown`'d to `--group` and `chmod 0660` (or `0666` with a
-//! warning if the group doesn't exist) — the standard Unix daemon-socket
-//! trust boundary (the same model as `docker.sock`'s `docker` group). See
+//! The socket is `chown`'d to `--group` and `chmod 0660` — the standard Unix
+//! daemon-socket trust boundary (the same model as `docker.sock`'s `docker`
+//! group) — and the daemon **refuses to start** if the group doesn't exist.
+//! Each connection's peer credentials are also checked (root, group members,
+//! or an `--allow-uid`), and allowed callers are rate-limited (SEC-005). See
 //! `packaging/systemd/ferrum-helper.service` for the systemd unit and
 //! `apps/desktop/README.md` for the one-time setup steps.
 //!
@@ -38,11 +40,14 @@ struct Cli {
     /// Unix domain socket path to listen on.
     #[arg(long, default_value = "/run/ferrum/helper.sock")]
     socket: String,
-    /// Group the socket is `chown`'d to (mode 0660), so members can connect.
-    /// Falls back to a world-accessible socket (0666, with a warning) if the
-    /// group doesn't exist.
+    /// Group the socket is `chown`'d to (mode 0660); its members may use the
+    /// helper. Must exist — the daemon refuses to start otherwise.
     #[arg(long, default_value = "ferrum")]
     group: String,
+    /// Additionally allow this uid regardless of group membership
+    /// (repeatable). Root is always allowed.
+    #[arg(long = "allow-uid", value_name = "UID")]
+    allow_uids: Vec<u32>,
 }
 
 #[cfg(unix)]
@@ -57,7 +62,7 @@ fn main() -> anyhow::Result<()> {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?
-            .block_on(unix::run(&cli.socket, &cli.group))
+            .block_on(unix::run(&cli.socket, &cli.group, &cli.allow_uids))
     }
 
     #[cfg(not(unix))]

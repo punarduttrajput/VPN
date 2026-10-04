@@ -36,6 +36,9 @@ pub struct Metrics {
     watch_streams_opened_total: AtomicU64,
     watch_streams_active: AtomicU64,
     unauthenticated_total: AtomicU64,
+    register_throttled_total: AtomicU64,
+    relay_heartbeat_throttled_total: AtomicU64,
+    watch_streams_rejected_total: AtomicU64,
     request_duration: DurationHistogram,
 }
 
@@ -114,6 +117,24 @@ impl Metrics {
         self.unauthenticated_total.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A `RegisterDevice` RPC was refused by a rate limit (SEC-006).
+    pub fn inc_register_throttled(&self) {
+        self.register_throttled_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A `RelayHeartbeat` RPC was refused by a rate limit (SEC-006).
+    pub fn inc_relay_heartbeat_throttled(&self) {
+        self.relay_heartbeat_throttled_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A `WatchNetworkMap` stream was refused by the stream quota (SEC-006).
+    pub fn inc_watch_stream_rejected(&self) {
+        self.watch_streams_rejected_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Start timing an RPC handler, returning a guard that records the elapsed
     /// duration into the latency histogram when it drops (PRD Phase 6 FR4). Drop
     /// covers every return path — including the `?` early-out on an auth failure —
@@ -188,6 +209,24 @@ impl Metrics {
             "ferrum_unauthenticated_total",
             "Total RPCs rejected for failing authentication.",
             self.unauthenticated_total.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "ferrum_register_throttled_total",
+            "Total RegisterDevice RPCs refused by a rate limit.",
+            self.register_throttled_total.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "ferrum_relay_heartbeat_throttled_total",
+            "Total RelayHeartbeat RPCs refused by a rate limit.",
+            self.relay_heartbeat_throttled_total.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "ferrum_watch_streams_rejected_total",
+            "Total WatchNetworkMap streams refused by the concurrent-stream quota.",
+            self.watch_streams_rejected_total.load(Ordering::Relaxed),
         );
         histogram(
             &mut out,
@@ -282,6 +321,20 @@ mod tests {
         assert!(text.contains("ferrum_rotate_key_total 1\n"));
         assert!(text.contains("ferrum_network_map_requests_total 1\n"));
         assert!(text.contains("ferrum_publish_candidates_total 0\n"));
+    }
+
+    #[test]
+    fn throttle_counters_render() {
+        let m = Metrics::new();
+        m.inc_register_throttled();
+        m.inc_register_throttled();
+        m.inc_relay_heartbeat_throttled();
+        m.inc_watch_stream_rejected();
+        let text = m.render(0);
+        assert!(text.contains("# TYPE ferrum_register_throttled_total counter"));
+        assert!(text.contains("ferrum_register_throttled_total 2\n"));
+        assert!(text.contains("ferrum_relay_heartbeat_throttled_total 1\n"));
+        assert!(text.contains("ferrum_watch_streams_rejected_total 1\n"));
     }
 
     #[test]

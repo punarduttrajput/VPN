@@ -16,6 +16,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
+use crate::limits::{source_key, KeyedLimiter, Limits, LimitsConfig};
 use crate::metrics::Metrics;
 use crate::registry::{Registry, RegistryError, TlsPins};
 
@@ -169,6 +170,9 @@ pub struct CoordinatorService {
     dns_servers: Vec<String>,
     /// Aggregate, privacy-preserving control-plane metrics (PRD Phase 6 FR4).
     metrics: Arc<Metrics>,
+    /// Per-source / per-identity rate limits and the watch-stream quota
+    /// (SEC-006). Always on; tune with [`Self::with_limits`].
+    limits: Arc<Limits>,
     /// When set (the `oidc` feature + a configured verifier), every RPC requires
     /// a valid bearer token and registration tags come from the token.
     #[cfg(feature = "oidc")]
@@ -186,9 +190,16 @@ impl CoordinatorService {
             relays: Arc::new(Mutex::new(RelayRegistry::new(DEFAULT_RELAY_TTL))),
             dns_servers: Vec::new(),
             metrics: Metrics::new(),
+            limits: Arc::new(Limits::new(&LimitsConfig::default())),
             #[cfg(feature = "oidc")]
             verifier: None,
         }
+    }
+
+    /// Replace the default rate limits and watch-stream quota (SEC-006).
+    pub fn with_limits(mut self, cfg: &LimitsConfig) -> Self {
+        self.limits = Arc::new(Limits::new(cfg));
+        self
     }
 
     /// A handle to this service's metrics, for the `/metrics` exporter to render.
@@ -285,6 +296,7 @@ impl CoordinatorService {
             relays: Arc::new(Mutex::new(RelayRegistry::new(DEFAULT_RELAY_TTL))),
             dns_servers: Vec::new(),
             metrics: Metrics::new(),
+            limits: Arc::new(Limits::new(&LimitsConfig::default())),
             verifier: Some(verifier),
         }
     }
@@ -384,6 +396,19 @@ fn bearer_token(meta: &tonic::metadata::MetadataMap) -> Result<&str, Status> {
         .ok_or_else(|| Status::unauthenticated("authorization must be a Bearer token"))
 }
 
+/// Charge one request for `key` against `limiter` (SEC-006), mapping a refusal
+/// to `resource_exhausted`. Neither the key nor the caller is logged (NFR5).
+#[allow(clippy::result_large_err)] // tonic::Status is the trait-wide error type
+fn rate_limit(limiter: &KeyedLimiter, key: &str, rpc: &'static str) -> Result<(), Status> {
+    if limiter.check(key, Instant::now()) {
+        return Ok(());
+    }
+    tracing::debug!(rpc, "request rate limited");
+    Err(Status::resource_exhausted(format!(
+        "{rpc} rate limit exceeded; retry later"
+    )))
+}
+
 #[tonic::async_trait]
 impl Coordinator for CoordinatorService {
     // `skip_all`: the request carries the device public key/name/endpoint; none of
@@ -395,8 +420,19 @@ impl Coordinator for CoordinatorService {
         request: Request<RegisterDeviceRequest>,
     ) -> Result<Response<RegisterDeviceResponse>, Status> {
         let _timer = self.metrics.start_request();
+        // SEC-006: the per-source limit runs before authentication so a flood
+        // can't make the coordinator do token verification at an unbounded
+        // rate; the per-identity limit needs the verified identity.
+        let throttled = |_: &Status| self.metrics.inc_register_throttled();
+        let source = source_key(request.remote_addr());
+        rate_limit(&self.limits.register_source, &source, "RegisterDevice")
+            .inspect_err(throttled)?;
         let claims = self.authenticate_metered(&request)?;
         let bound_identity = self.bound_identity(&request, &claims);
+        if let Some(identity) = &bound_identity {
+            rate_limit(&self.limits.register_identity, identity, "RegisterDevice")
+                .inspect_err(throttled)?;
+        }
         self.metrics.inc_register();
         let req = request.into_inner();
         // When authenticated, tags come from the verified token (an authorization
@@ -463,7 +499,22 @@ impl Coordinator for CoordinatorService {
         request: Request<NetworkMapRequest>,
     ) -> Result<Response<Self::WatchNetworkMapStream>, Status> {
         let _timer = self.metrics.start_request();
-        self.authenticate_metered(&request)?;
+        let source = source_key(request.remote_addr());
+        let claims = self.authenticate_metered(&request)?;
+        // SEC-006: cap concurrent streams per source, per identity (when
+        // authenticated) and overall. The permit rides into the serving task
+        // and frees the slot when the stream ends.
+        let mut quota_keys = vec![(source, self.limits.watch_per_source)];
+        if let Some(identity) = self.bound_identity(&request, &claims) {
+            quota_keys.push((identity, self.limits.watch_per_identity));
+        }
+        let Some(permit) = self.limits.watch.try_acquire(quota_keys) else {
+            self.metrics.inc_watch_stream_rejected();
+            tracing::debug!("watch stream refused: concurrent-stream quota");
+            return Err(Status::resource_exhausted(
+                "too many concurrent WatchNetworkMap streams; close one and retry",
+            ));
+        };
         let public_key = request.into_inner().public_key;
         let registry = self.registry.clone();
         let static_relay = self.relay.clone();
@@ -478,6 +529,7 @@ impl Coordinator for CoordinatorService {
 
         tokio::spawn(async move {
             let _guard = guard;
+            let _permit = permit;
             // The advertised relay is recomputed per push (the registry is
             // live state — a heartbeat, goodbye, or sweep can change it
             // between pushes; each such change fires `changes`).
@@ -499,9 +551,18 @@ impl Coordinator for CoordinatorService {
                 return;
             }
             // On each change (or a missed burst) recompute and push; the loop
-            // ends when the broadcast closes (pattern stops matching) or the
-            // client disconnects.
-            while let Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) = changes.recv().await {
+            // ends when the broadcast closes or the client disconnects. The
+            // `closed()` arm notices a disconnect right away rather than at
+            // the next push, so the stream's quota slot (SEC-006) and gauge
+            // entry are released promptly.
+            loop {
+                let changed = tokio::select! {
+                    _ = tx.closed() => break,
+                    changed = changes.recv() => changed,
+                };
+                if let Err(broadcast::error::RecvError::Closed) = changed {
+                    break;
+                }
                 if tx
                     .send(Ok(current_map(
                         &registry,
@@ -549,7 +610,16 @@ impl Coordinator for CoordinatorService {
         request: Request<RelayHeartbeatRequest>,
     ) -> Result<Response<RelayHeartbeatResponse>, Status> {
         let _timer = self.metrics.start_request();
-        self.authenticate_metered(&request)?;
+        // SEC-006: per-source before authentication, per-identity after.
+        let throttled = |_: &Status| self.metrics.inc_relay_heartbeat_throttled();
+        let source = source_key(request.remote_addr());
+        rate_limit(&self.limits.heartbeat_source, &source, "RelayHeartbeat")
+            .inspect_err(throttled)?;
+        let claims = self.authenticate_metered(&request)?;
+        if let Some(identity) = self.bound_identity(&request, &claims) {
+            rate_limit(&self.limits.heartbeat_identity, &identity, "RelayHeartbeat")
+                .inspect_err(throttled)?;
+        }
         let req = request.into_inner();
         req.addr
             .parse::<std::net::SocketAddr>()
@@ -1470,5 +1540,202 @@ mod tests {
             ))
             .await
             .unwrap();
+    }
+
+    /// Serve `svc` on a loopback port and connect a client to it.
+    async fn serve_and_connect(
+        svc: CoordinatorService,
+    ) -> CoordinatorClient<tonic::transport::Channel> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(CoordinatorServer::new(svc))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        CoordinatorClient::connect(format!("http://{addr}"))
+            .await
+            .unwrap()
+    }
+
+    fn test_registry() -> Arc<Mutex<Registry>> {
+        Arc::new(Mutex::new(Registry::new(Ipv4Addr::new(10, 8, 0, 0), 24)))
+    }
+
+    /// A limiter shape that never refills within a test's lifetime.
+    fn no_refill(burst: u32) -> crate::limits::RateSpec {
+        crate::limits::RateSpec::new(burst, 1e-9)
+    }
+
+    fn register_req(key: &str) -> RegisterDeviceRequest {
+        RegisterDeviceRequest {
+            public_key: key.into(),
+            name: "d".into(),
+            endpoint: "1.1.1.1:51820".into(),
+            ..Default::default()
+        }
+    }
+
+    /// SEC-006: a registration flood from one source is throttled with
+    /// `resource_exhausted` once its burst is spent, and counted in the
+    /// aggregate metric; admitted registrations still count as handled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registration_flood_is_throttled_per_source() {
+        let limits = LimitsConfig {
+            register_per_source: no_refill(3),
+            ..LimitsConfig::default()
+        };
+        let svc = CoordinatorService::new(test_registry()).with_limits(&limits);
+        let metrics = svc.metrics();
+        let mut client = serve_and_connect(svc).await;
+
+        for i in 0..3 {
+            client
+                .register_device(register_req(&format!("K{i}")))
+                .await
+                .unwrap();
+        }
+        for i in 3..6 {
+            let err = client
+                .register_device(register_req(&format!("K{i}")))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::ResourceExhausted, "{err:?}");
+        }
+        let text = metrics.render(3);
+        assert!(
+            text.contains("ferrum_register_throttled_total 3\n"),
+            "{text}"
+        );
+        assert!(text.contains("ferrum_register_total 3\n"), "{text}");
+    }
+
+    /// SEC-006: a heartbeat flood is throttled the same way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn relay_heartbeat_flood_is_throttled_per_source() {
+        let limits = LimitsConfig {
+            heartbeat_per_source: no_refill(2),
+            ..LimitsConfig::default()
+        };
+        let svc = CoordinatorService::new(test_registry()).with_limits(&limits);
+        let metrics = svc.metrics();
+        let mut client = serve_and_connect(svc).await;
+        let beat = || RelayHeartbeatRequest {
+            addr: "198.51.100.1:3478".into(),
+            draining: false,
+        };
+
+        client.relay_heartbeat(beat()).await.unwrap();
+        client.relay_heartbeat(beat()).await.unwrap();
+        let err = client.relay_heartbeat(beat()).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted, "{err:?}");
+        assert!(metrics
+            .render(0)
+            .contains("ferrum_relay_heartbeat_throttled_total 1\n"));
+    }
+
+    /// SEC-006: concurrent watch streams past the per-source cap are refused,
+    /// and closing one frees its slot promptly (not only at the next map push).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn excess_watch_streams_are_refused_and_slots_are_released() {
+        let limits = LimitsConfig {
+            watch_streams_per_source: 2,
+            ..LimitsConfig::default()
+        };
+        let svc = CoordinatorService::new(test_registry()).with_limits(&limits);
+        let metrics = svc.metrics();
+        let mut client = serve_and_connect(svc).await;
+        let watch_req = || NetworkMapRequest {
+            public_key: "AAA".into(),
+        };
+
+        let mut first = client
+            .watch_network_map(watch_req())
+            .await
+            .unwrap()
+            .into_inner();
+        first.message().await.unwrap().expect("initial map");
+        let mut second = client
+            .watch_network_map(watch_req())
+            .await
+            .unwrap()
+            .into_inner();
+        second.message().await.unwrap().expect("initial map");
+
+        let err = client.watch_network_map(watch_req()).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted, "{err:?}");
+        assert!(metrics
+            .render(0)
+            .contains("ferrum_watch_streams_rejected_total 1\n"));
+
+        // Close one stream with no registry change afterwards: the slot must
+        // still come back.
+        drop(first);
+        let mut reopened = None;
+        for _ in 0..100 {
+            match client.watch_network_map(watch_req()).await {
+                Ok(s) => {
+                    reopened = Some(s.into_inner());
+                    break;
+                }
+                Err(e) => {
+                    assert_eq!(e.code(), tonic::Code::ResourceExhausted);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+        let mut reopened = reopened.expect("closing a stream must release its slot");
+        reopened.message().await.unwrap().expect("initial map");
+        drop(second);
+    }
+
+    /// SEC-006: with OIDC on, the per-identity limit applies independently of
+    /// the source: one subject's flood doesn't throttle another subject behind
+    /// the same address.
+    #[cfg(feature = "oidc")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registration_limit_is_per_identity_when_authenticated() {
+        use crate::auth::testsign::TestSigner;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let signer = TestSigner::new("k1");
+        let verifier =
+            std::sync::Arc::new(signer.verifier("https://idp.example", "ferrum-coordinator"));
+        let limits = LimitsConfig {
+            register_per_identity: no_refill(2),
+            ..LimitsConfig::default()
+        };
+        let svc = CoordinatorService::with_auth(test_registry(), verifier).with_limits(&limits);
+        let mut client = serve_and_connect(svc).await;
+
+        let exp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let token_for = |sub: &str| {
+            signer.sign(&format!(
+                r#"{{"iss":"https://idp.example","aud":"ferrum-coordinator","sub":"{sub}","exp":{exp}}}"#
+            ))
+        };
+        let authed = |key: &str, token: &str| {
+            let mut r = Request::new(register_req(key));
+            r.metadata_mut()
+                .insert("authorization", format!("Bearer {token}").parse().unwrap());
+            r
+        };
+        let (alice, bob) = (token_for("alice"), token_for("bob"));
+
+        client.register_device(authed("AAA", &alice)).await.unwrap();
+        client.register_device(authed("AAA", &alice)).await.unwrap();
+        let err = client
+            .register_device(authed("AAA", &alice))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted, "{err:?}");
+        // Same source, different identity: unaffected.
+        client.register_device(authed("BBB", &bob)).await.unwrap();
     }
 }
