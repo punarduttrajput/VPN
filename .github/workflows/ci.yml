@@ -188,3 +188,40 @@ jobs:
           docker run --rm --entrypoint amtool \
             -v "$PWD/deploy/observability":/work prom/alertmanager:v0.27.0 \
             check-config /work/alertmanager/alertmanager.yml
+
+  # SEC-008: every vendored/prebuilt binary must match its pinned SHA-256 (and
+  # its upstream signature, where one exists) — a mismatch fails the build.
+  vendored-binaries:
+    name: vendored binaries (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify pinned digests (vendor/SHA256SUMS)
+        shell: bash
+        run: bash scripts/verify-vendored.sh
+
+      - name: Verify wintun Authenticode signatures
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          foreach ($arch in 'amd64', 'arm64') {
+            $sig = Get-AuthenticodeSignature "vendor/wintun/$arch/wintun.dll"
+            $subject = $sig.SignerCertificate.Subject
+            Write-Host "$arch : $($sig.Status) : $subject"
+            if ($sig.Status -ne 'Valid' -or $subject -notlike 'CN=WireGuard LLC, O=WireGuard LLC,*') {
+              throw "vendor/wintun/$arch/wintun.dll is not validly signed by WireGuard LLC"
+            }
+          }
+
+      # Exercises the pinned download + verify-before-extract path and proves
+      # the pin still matches the published release asset.
+      - name: Install bpf-linker via the pinned script
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          bash scripts/install-bpf-linker.sh --dest "$RUNNER_TEMP/bpf-linker"
+          "$RUNNER_TEMP/bpf-linker/bpf-linker" --version

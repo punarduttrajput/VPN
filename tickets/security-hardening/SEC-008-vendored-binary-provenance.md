@@ -18,13 +18,23 @@ produces the kernel XDP object.
 
 ## Acceptance criteria
 
-- [ ] Every vendored/prebuilt binary has a pinned SHA-256 recorded in-tree.
-- [ ] CI verifies the checksum before the binary is used; a mismatch fails the
-      build.
-- [ ] Each binary's provenance (source URL + expected digest + version) is
-      documented next to it.
-- [ ] Where upstream publishes signatures/attestations (sigstore/SLSA), verify
-      them too.
+- [x] Every vendored/prebuilt binary has a pinned SHA-256 recorded in-tree.
+      *(`vendor/SHA256SUMS`: both `wintun.dll`s + `gradle-wrapper.jar`;
+      `bpf-linker` digests in `scripts/install-bpf-linker.sh`; the Gradle
+      distribution via `distributionSha256Sum`.)*
+- [x] CI verifies the checksum before the binary is used; a mismatch fails the
+      build. *(CI `vendored-binaries` job runs `scripts/verify-vendored.sh`,
+      which also fails on any committed binary without a pin. The desktop
+      `build.rs` refuses to copy a mismatched `wintun.dll`. `bpf-linker` is
+      verified before extraction.)*
+- [x] Each binary's provenance (source URL + expected digest + version) is
+      documented next to it. *(`vendor/README.md` index →
+      `vendor/wintun/README.md`, `clients/android/gradle/wrapper/README.md`,
+      `relay-ebpf/README.md`.)*
+- [x] Where upstream publishes signatures/attestations (sigstore/SLSA), verify
+      them too. *(wintun: Authenticode, signer WireGuard LLC, checked in CI on
+      Windows. Gradle: the jar matches Gradle's official published checksum.
+      bpf-linker: upstream publishes none (attestations API 404), documented.)*
 
 ## Implementation notes
 
