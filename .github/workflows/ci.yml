@@ -242,7 +242,8 @@ jobs:
         run: |
           docker run --rm --entrypoint promtool \
             -v "$PWD/deploy/observability":/work prom/prometheus:v2.54.1 \
-            check rules /work/prometheus/rules/slo_recording.yml /work/prometheus/rules/slo_alerts.yml \n            /work/prometheus/rules/relay_scaling.yml
+            check rules /work/prometheus/rules/slo_recording.yml /work/prometheus/rules/slo_alerts.yml \
+            /work/prometheus/rules/relay_scaling.yml
 
       - name: Run promtool alert-rule unit tests
         run: |
