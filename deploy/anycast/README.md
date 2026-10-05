@@ -5,6 +5,14 @@ address's prefix over BGP only while its relay is ready. Clients reach the
 nearest ready PoP; a draining or dead PoP drops out of routing. This is FR5 of
 [PRD/phase-6-anycast-autoscaling.md](../../PRD/phase-6-anycast-autoscaling.md).
 
+> **Limitation: one ready PoP at a time, for now.** A relay only forwards
+> between clients registered on that same relay. Two peers that land on
+> different PoPs can't relay to each other until relays forward to each other
+> (the relay mesh, planned next). Until then, use this setup for
+> active/standby: run the gate on every PoP, but keep only one relay ready
+> (the standby's relay stopped or drained), so failover moves everyone
+> together.
+
 | File | What it is |
 |---|---|
 | [`bird.conf`](bird.conf) | bird2: the anycast prefixes as static protocols that start **disabled**, exported only to the BGP upstream. |
