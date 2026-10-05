@@ -7,14 +7,15 @@ Wants=network-online.target
 Type=simple
 # Bind the anycast address itself, not 0.0.0.0: replies must come from the
 # address clients sent to, or their transport drops them (see README.md).
-# No --coordinator/--advertise: with anycast the coordinator advertises the
-# anycast address statically (`ferrum-coordinator --relay 192.0.2.10:51821`).
 # With more than one PoP, mesh the relays so peers on different PoPs can
-# relay to each other (PRD/relay-mesh.md): add, with this PoP's unicast
-# address and one --mesh-peer per other PoP,
+# relay to each other (PRD/relay-mesh.md), and let the coordinator distribute
+# the membership. Add, with this PoP's unicast address:
+#   --coordinator http://coordinator.internal:50051
+#   --advertise 192.0.2.10:51821
 #   --mesh-listen 198.51.100.10:51822 --mesh-key-file /etc/ferrum/mesh.key
-#   --mesh-peer 203.0.113.20:51822
-# and LoadCredential=/ReadOnlyPaths= for the key file as your setup needs.
+# (plus --token-file if the coordinator uses OIDC), and LoadCredential= or
+# ReadOnlyPaths= for the key files as your setup needs. Without a mesh, leave
+# these out and give the coordinator a static --relay 192.0.2.10:51821.
 ExecStart=/usr/local/bin/ferrum relay \
     --listen 192.0.2.10:51821 \
     --metrics-listen 127.0.0.1:9101 \

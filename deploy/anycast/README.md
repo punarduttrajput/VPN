@@ -7,8 +7,9 @@ nearest ready PoP; a draining or dead PoP drops out of routing. This is FR5 of
 
 > **Mesh the PoPs.** Two peers that land on different PoPs can only relay to
 > each other if the PoPs' relays forward to each other. Give every relay the
-> same `--mesh-key-file`, a `--mesh-listen` on a network the other PoPs can
-> reach, and a `--mesh-peer` for each other PoP
+> same `--mesh-key-file` and a `--mesh-listen` on its own unicast address,
+> reachable from the other PoPs; with `--coordinator` they find each other
+> through it, or list them with `--mesh-peer`
 > ([PRD/relay-mesh.md](../../PRD/relay-mesh.md); commented out in
 > [`ferrum-relay.service`](ferrum-relay.service)). Without the mesh, keep only
 > one PoP ready at a time (active/standby).
@@ -72,11 +73,17 @@ Things that matter:
   `0.0.0.0`. A wildcard UDP socket replies from whatever source address
   routing picks, usually the PoP's unicast one, and clients drop frames that
   don't come from the relay address they sent to.
-- **Point the coordinator at the anycast address statically**:
-  `ferrum-coordinator --relay 192.0.2.10:51821`. Don't give anycast relays
-  `--coordinator`/`--advertise`: the coordinator's relay registry is keyed by
-  address, so every PoP would share one entry, and one PoP's drain would
-  withdraw it for all of them. With anycast, BGP does the steering.
+- **Tell the coordinator about the relays**, one of two ways:
+  - **With the mesh** (recommended): give every relay
+    `--coordinator <url> --advertise 192.0.2.10:51821 --mesh-listen <its unicast ip>:51822`.
+    The coordinator keys each relay by its mesh address, so the PoPs share
+    the advertised anycast address without clashing, one PoP's drain doesn't
+    withdraw it, and every relay learns its siblings from the coordinator
+    (no `--mesh-peer` list to keep up to date).
+  - **Without the mesh**: `ferrum-coordinator --relay 192.0.2.10:51821`
+    statically, and no `--coordinator`/`--advertise` on the relays. Without
+    a mesh address the registry keys relays by client-facing address, so
+    PoPs would share one entry and one drain would withdraw it for all.
 - **XDP** (`--xdp-iface`) needs the relay to run as root, which
   `DynamicUser=yes` doesn't allow; adjust the relay unit if you use it.
 

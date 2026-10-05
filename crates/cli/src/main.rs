@@ -445,6 +445,17 @@ async fn relay(
     let addr: SocketAddr = listen
         .parse()
         .with_context(|| format!("parsing --listen '{listen}'"))?;
+    // With a coordinator, siblings learn this relay's mesh address from it and
+    // match datagrams' source against it, so it must be a specific address.
+    if let (Some(mesh), Some(_)) = (&mesh, coordinator) {
+        if mesh.listen.ip().is_unspecified() || mesh.listen.port() == 0 {
+            anyhow::bail!(
+                "--mesh-listen must be this relay's own address and a fixed port (not {})                  when the coordinator distributes mesh membership",
+                mesh.listen
+            );
+        }
+    }
+    let static_mesh_peers = mesh.as_ref().map(|m| m.peers.clone()).unwrap_or_default();
     let server = match mesh {
         Some(mesh) => {
             let (mesh_listen, peers) = (mesh.listen, mesh.peers.len());
@@ -489,10 +500,13 @@ async fn relay(
             .parse::<SocketAddr>()
             .with_context(|| format!("parsing --advertise '{advertise}'"))?;
         info!(%coordinator, %advertise, "announcing relay to coordinator (RelayHeartbeat)");
-        tokio::spawn(relay_heartbeat_loop(
-            coordinator.to_string(),
-            advertise.to_string(),
-            token,
+        tokio::spawn(ferrum_client_core::relay_heartbeat::run(
+            ferrum_client_core::relay_heartbeat::Announce {
+                coordinator: coordinator.to_string(),
+                advertise: advertise.to_string(),
+                token,
+                static_mesh_peers,
+            },
             server.clone(),
             drain_goodbye.clone(),
         ));
@@ -607,69 +621,6 @@ enum XdpModeArg {
     Skb,
     /// Native (driver) XDP: line rate, on drivers with XDP support.
     Native,
-}
-
-/// Keep this relay announced to the coordinator (PRD
-/// `phase-6-anycast-autoscaling.md` FR3): heartbeat `advertise` at whatever
-/// cadence the coordinator directs, reconnecting with a flat backoff on any
-/// control-plane failure. When the relay enters its drain (`drain_goodbye`
-/// fires, or `is_draining()` is observed), send one final `draining: true`
-/// goodbye — the coordinator withdraws the relay immediately — and stop. If
-/// the goodbye can't be delivered (coordinator unreachable), stop anyway: the
-/// coordinator withdraws the relay when its heartbeats lapse.
-async fn relay_heartbeat_loop(
-    coordinator: String,
-    advertise: String,
-    token: Option<String>,
-    server: std::sync::Arc<ferrum_transport::RelayServer>,
-    drain_goodbye: std::sync::Arc<tokio::sync::Notify>,
-) {
-    use std::time::Duration;
-    const RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
-    let mut interval = Duration::from_secs(15); // until the coordinator directs one
-
-    loop {
-        let mut control = match ControlClient::connect(coordinator.clone()).await {
-            Ok(c) => match &token {
-                Some(t) => c.with_token(t.clone()),
-                None => c,
-            },
-            Err(e) => {
-                if server.is_draining() {
-                    tracing::warn!(
-                        "relay heartbeat: coordinator unreachable for the draining goodbye ({e}); \
-                         it will withdraw this relay on missed heartbeats"
-                    );
-                    return;
-                }
-                tracing::warn!("relay heartbeat: coordinator unreachable ({e}); retrying");
-                tokio::time::sleep(RECONNECT_BACKOFF).await;
-                continue;
-            }
-        };
-        loop {
-            let draining = server.is_draining();
-            match control.relay_heartbeat(&advertise, draining).await {
-                Ok(secs) => {
-                    if draining {
-                        info!("relay heartbeat: draining goodbye sent; coordinator withdrew us");
-                        return;
-                    }
-                    if secs > 0 {
-                        interval = Duration::from_secs(u64::from(secs));
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("relay heartbeat failed ({e}); reconnecting");
-                    break; // reconnect via the outer loop
-                }
-            }
-            tokio::select! {
-                _ = tokio::time::sleep(interval) => {}
-                _ = drain_goodbye.notified() => {} // send the goodbye now
-            }
-        }
-    }
 }
 
 /// Serve the relay's privacy-preserving metrics (PRD Phase 6 FR4) at
