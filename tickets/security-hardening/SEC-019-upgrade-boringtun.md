@@ -44,6 +44,7 @@ clarification is needed in `deny.toml`.
       *(Full matrix green on the Windows dev host, including the Linux
       cross-compile clippy. The real-TUN run and the throughput check need a
       Linux host with root and are still to do.)*
+      Commands and pass criteria: [Linux verification runbook](../../docs/linux-verification-runbook.md).
 - [x] Follow-up noted: `jsonwebtoken` 11 (`rust_crypto`) becomes possible.
       *(Noted in `crates/coordinator/Cargo.toml` next to the `jsonwebtoken`
       pin.)*

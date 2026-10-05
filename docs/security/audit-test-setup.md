@@ -207,9 +207,13 @@ how to mint test OIDC tokens (`deploy/oracle-vm/scripts/mint-token.py`).
 
 ## 6. Known gaps at the tag
 
+The Linux-only checks below are scripted, with their pass criteria, in
+[docs/linux-verification-runbook.md](../linux-verification-runbook.md).
+
 - **NFR1 at line rate.** The ≥ 10 Gbps relay figure needs real hardware with
   native (driver) XDP and a multi-queue sender. Only a ~1 Gbps netns comparison
-  exists.
+  exists. The loader also attaches in generic (SKB) mode only, so native mode
+  needs a `--xdp-mode` option first.
 - **SEC-018 eBPF/XDP parser checks** (IPv4 version nibble, fragments, "not for
   us", length fields; `GatewayInfo` padding; `checksum_update` unit tests) are
   implemented and unit-tested (`ferrum-relay-xdp-common`), and the program

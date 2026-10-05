@@ -61,3 +61,4 @@ each is cheaper to fix than to explain to an auditor:
       `bpfel-unknown-none` on nightly and the Linux `xdp` loader passes
       clippy (cross-checked), but neither the kernel verifier nor live traffic
       has seen the new code.)*
+      Commands and pass criteria: [Linux verification runbook](../../docs/linux-verification-runbook.md).
