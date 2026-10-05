@@ -23,11 +23,11 @@ to a genuinely empty coordinator. Every load flashes a false "empty" state.
 
 ## Acceptance criteria
 
-- [ ] A loading indicator (skeleton or spinner) shows while data is in flight,
+- [x] A loading indicator (skeleton or spinner) shows while data is in flight,
       visually distinct from the empty state.
-- [ ] "No devices registered." appears only **after** a successful load returns
+- [x] "No devices registered." appears only **after** a successful load returns
       zero devices — never during loading (AC3).
-- [ ] Stat values show a loading placeholder (not `0`) until data arrives.
+- [x] Stat values show a loading placeholder (not `0`) until data arrives.
 
 ## Implementation notes
 

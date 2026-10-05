@@ -4,9 +4,9 @@
 |---|---|
 | **Product** | Ferrum (Rust) — admin panel Dashboard (`apps/admin-panel/`, Angular 19) |
 | **Phase** | Admin-panel follow-on (post-acceptance; see [admin-panel-angular.md](admin-panel-angular.md)) |
-| **Status** | Proposed |
+| **Status** | M1 (trustworthy states) implemented (2026-10-05); M2 open |
 | **Owner** | punarduttrajput |
-| **Last updated** | 2026-07-19 |
+| **Last updated** | 2026-10-05 |
 | **Depends on** | Coordinator `--admin-listen` API (`/api/devices`, `/api/policy`), the shared `StatusService` banner |
 
 ---
@@ -126,6 +126,30 @@ coverage gaps in the operator's primary screen.
 |---|---|---|
 | **M1 — Trustworthy states** | auto-refresh + freshness, resilient load, loading/empty/error distinction, error-path tests | DASH-001, DASH-002, DASH-003, DASH-008, DASH-009 |
 | **M2 — Honest & accessible** | metric semantics, accessible/self-clearing banner, DOM render test | DASH-004, DASH-005, DASH-006, DASH-007, DASH-010 |
+
+### M1 as built (2026-10-05)
+- `dashboard.component.ts`: devices and policy each settle on their own
+  (`settle()` maps a failure to a value, so `forkJoin` always completes). A
+  failed source keeps showing what it last loaded, its card says "couldn't
+  refresh" (or "couldn't load" if it never did), and the banner is raised only
+  when a source *newly* fails, so a source that stays down doesn't re-raise it
+  on every automatic refresh.
+- `null` means "never loaded": the stat cards show `—` and the recent-devices
+  list shows "Loading devices…" until the first load; "No devices registered."
+  needs a successful empty load. A later refresh keeps the loaded data on
+  screen. A refresh already in flight wins over a second one.
+- Auto-refresh every 15 s (`REFRESH_MS`) while the page is visible, at once
+  when it becomes visible again; leaving the route destroys the component and
+  stops it. The interval is the open question in §7; 15 s is two cheap GETs
+  per tab at admin scale.
+- "Updated just now / N s ago / N min ago" next to Refresh, from the last
+  refresh in which anything loaded, recomputed every 5 s.
+- 17 new specs (58 total, `ng test` green): one source failing either way,
+  both failing, stale data kept on a failed refresh, the banner raised once,
+  loading vs empty in the DOM, data kept during a later refresh, the in-flight
+  guard, the "view all" threshold, the freshness label, the interval, pausing
+  while hidden, and stopping on leave. Mutation check: letting a source's error
+  fail the whole load fails 5 of them.
 
 ## 6. Acceptance Criteria
 

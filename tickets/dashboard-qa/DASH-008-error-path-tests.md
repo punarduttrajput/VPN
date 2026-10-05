@@ -24,12 +24,12 @@ coverage to lock the fixes in.
 
 ## Acceptance criteria
 
-- [ ] Test: a failing `DevicesService.list` (and/or policy) triggers the error
+- [x] Test: a failing `DevicesService.list` (and/or policy) triggers the error
       path and, per DASH-002, still renders the succeeded half.
-- [ ] Test: `loading` is true during the in-flight window and false after.
-- [ ] Test: empty devices → empty state only after load (per DASH-003).
-- [ ] Test: >5 devices shows the "view all" hint; ≤5 does not.
-- [ ] `ng test` green (AC6).
+- [x] Test: `loading` is true during the in-flight window and false after.
+- [x] Test: empty devices → empty state only after load (per DASH-003).
+- [x] Test: >5 devices shows the "view all" hint; ≤5 does not.
+- [x] `ng test` green (AC6).
 
 ## Implementation notes
 

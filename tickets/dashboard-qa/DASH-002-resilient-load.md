@@ -24,11 +24,11 @@ fine.
 
 ## Acceptance criteria
 
-- [ ] Devices and policy load independently; one failing does not discard the
+- [x] Devices and policy load independently; one failing does not discard the
       other's data.
-- [ ] The failed source renders an error/unknown card state; the succeeded
+- [x] The failed source renders an error/unknown card state; the succeeded
       source renders normally (AC2).
-- [ ] The error is still surfaced (banner/card) without hiding partial data.
+- [x] The error is still surfaced (banner/card) without hiding partial data.
 
 ## Implementation notes
 
