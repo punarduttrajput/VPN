@@ -4,7 +4,7 @@
 |---|---|
 | **Product** | Ferrum (Rust) |
 | **Phase** | 6 — Scale & Acceleration (prerequisite for anycast M5 and multi-PoP M4) |
-| **Status** | M1 (static relay mesh) implemented and verified in-process (2026-10-05); M2–M3 open |
+| **Status** | M1 (static relay mesh) and M2 (coordinator membership) implemented and verified in-process (2026-10-05); M3 open |
 | **Owner** | punarduttrajput |
 | **Depends on** | the Phase 4 relay (`crates/transport/src/relay.rs`), the relay registry (`phase-6-anycast-autoscaling.md` FR3), the XDP fast path (`phase-6-ebpf-xdp-relay.md`) |
 
@@ -137,9 +137,20 @@ elsewhere, the new relay's Present makes the draining one drop them.
    the sibling's Present with its own, so the sibling gives the client up at
    once rather than at its next announce. The XDP loader removes a moved
    client from both kernel maps (`RelayXdpHook::on_remove`).
-2. **M2 — Coordinator membership.** `mesh_addr` in the heartbeat, sibling
-   list in the response, registry keyed by mesh address; the anycast docs'
-   one-ready-PoP limit lifted.
+2. **M2 — Coordinator membership** ✅ *(2026-10-05)*. `mesh_addr` in the
+   heartbeat, sibling list in the response, registry keyed by mesh address;
+   the anycast docs' one-ready-PoP limit lifted.
+   *As built:* `RelayHeartbeatRequest.mesh_addr` / `RelayHeartbeatResponse.
+   mesh_peers`. The coordinator refuses a mesh address that's unspecified or
+   port 0 (siblings match a datagram's source against it), and so does
+   `ferrum relay` when it has `--coordinator`. A draining mesh relay stops
+   being advertised at once but stays in its siblings' lists until its
+   heartbeats lapse (45 s, longer than the 20 s default drain), so they keep
+   forwarding to the clients it still serves. The heartbeat loop moved from
+   the CLI into `ferrum_client_core::relay_heartbeat` (so it's testable
+   against a real coordinator); it merges the coordinator's list with any
+   `--mesh-peer`s and calls `set_mesh_peers` on every beat. Siblings learn a
+   new relay within one heartbeat interval (15 s).
 3. **M3 — Autoscaling (anycast M5).** The OCI instance pool, scaling
    signals and policies, Ansible node config, and the CI validation job, now
    that a scaled-out pool works.

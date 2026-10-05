@@ -33,6 +33,9 @@ pub mod ffi;
 #[cfg(feature = "data-plane")]
 pub mod data_plane;
 
+#[cfg(feature = "data-plane")]
+pub mod relay_heartbeat;
+
 #[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();
 
@@ -106,6 +109,15 @@ pub struct TunnelPlan {
 }
 
 /// A client connection to the coordinator.
+/// The coordinator's answer to a relay heartbeat.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RelayBeat {
+    /// Send the next heartbeat within this many seconds.
+    pub interval_secs: u32,
+    /// The other live relays' mesh listeners (empty without a mesh).
+    pub mesh_peers: Vec<String>,
+}
+
 pub struct ControlClient {
     inner: CoordinatorClient<Channel>,
     /// Optional OIDC bearer token attached to every RPC (`authorization` header).
@@ -317,12 +329,31 @@ impl ControlClient {
     /// the coordinator withdraws the relay from advertisement immediately.
     /// Returns the coordinator-directed heartbeat cadence in seconds.
     pub async fn relay_heartbeat(&mut self, addr: &str, draining: bool) -> Result<u32, Error> {
+        Ok(self
+            .relay_heartbeat_mesh(addr, "", draining)
+            .await?
+            .interval_secs)
+    }
+
+    /// [`relay_heartbeat`](Self::relay_heartbeat) for a relay in a relay mesh
+    /// (PRD `relay-mesh.md` M2): also sends its mesh listener (`mesh_addr`,
+    /// or empty for none) and returns the other relays' mesh listeners.
+    pub async fn relay_heartbeat_mesh(
+        &mut self,
+        addr: &str,
+        mesh_addr: &str,
+        draining: bool,
+    ) -> Result<RelayBeat, Error> {
         let req = self.request(RelayHeartbeatRequest {
             addr: addr.to_string(),
             draining,
+            mesh_addr: mesh_addr.to_string(),
         });
         let resp = self.inner.relay_heartbeat(req).await?.into_inner();
-        Ok(resp.interval_secs)
+        Ok(RelayBeat {
+            interval_secs: resp.interval_secs,
+            mesh_peers: resp.mesh_peers,
+        })
     }
 
     /// Register then fetch the map, returning a ready-to-apply [`TunnelPlan`].

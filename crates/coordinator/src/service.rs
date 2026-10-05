@@ -37,6 +37,15 @@ pub const RELAY_TAG: &str = "relay";
 
 /// A live, heartbeating relay known to the coordinator.
 struct RelayEntry {
+    /// The client-facing address it is advertised under (shared by anycast
+    /// relays).
+    addr: String,
+    /// Its mesh listener, or empty when it isn't in a relay mesh.
+    mesh_addr: String,
+    /// Said goodbye: no longer advertised, but still a mesh member until its
+    /// heartbeats lapse, so siblings keep forwarding to its remaining clients
+    /// through the drain.
+    draining: bool,
     last_beat: Instant,
     /// Registration order: selection prefers the earliest still-live relay, so
     /// the advertised relay is stable (a newly scaled-out relay doesn't steal
@@ -63,22 +72,41 @@ impl RelayRegistry {
         }
     }
 
-    /// Record a heartbeat from `addr`. A draining relay is withdrawn on the
-    /// spot (its goodbye); a new relay joins at the back of the selection
-    /// order; a known one just refreshes its deadline.
-    fn heartbeat(&mut self, addr: &str, draining: bool) {
+    /// Record a heartbeat from the relay at `addr` (mesh listener
+    /// `mesh_addr`, or empty). A relay is identified by its mesh address when
+    /// it has one, else by `addr`. A draining relay stops being advertised at
+    /// once (its goodbye); one in a mesh stays a member until its heartbeats
+    /// lapse. A new relay joins at the back of the selection order; a known
+    /// one just refreshes its deadline.
+    fn heartbeat(&mut self, addr: &str, mesh_addr: &str, draining: bool) {
+        let id = if mesh_addr.is_empty() {
+            addr
+        } else {
+            mesh_addr
+        };
         if draining {
-            self.entries.remove(addr);
+            if mesh_addr.is_empty() {
+                self.entries.remove(id);
+            } else if let Some(e) = self.entries.get_mut(id) {
+                e.draining = true;
+            }
             return;
         }
-        match self.entries.get_mut(addr) {
-            Some(e) => e.last_beat = Instant::now(),
+        match self.entries.get_mut(id) {
+            Some(e) => {
+                e.last_beat = Instant::now();
+                e.addr = addr.to_string();
+                e.draining = false;
+            }
             None => {
                 let joined = self.next_seq;
                 self.next_seq += 1;
                 self.entries.insert(
-                    addr.to_string(),
+                    id.to_string(),
                     RelayEntry {
+                        addr: addr.to_string(),
+                        mesh_addr: mesh_addr.to_string(),
+                        draining: false,
                         last_beat: Instant::now(),
                         joined,
                     },
@@ -88,13 +116,29 @@ impl RelayRegistry {
     }
 
     /// The relay this registry currently advertises: the earliest-joined entry
-    /// whose heartbeat is still fresh, or `None` when none are live.
+    /// whose heartbeat is still fresh and that isn't draining, or `None`.
     fn advertised(&self) -> Option<String> {
         self.entries
-            .iter()
-            .filter(|(_, e)| e.last_beat.elapsed() <= self.ttl)
-            .min_by_key(|(_, e)| e.joined)
-            .map(|(addr, _)| addr.clone())
+            .values()
+            .filter(|e| e.last_beat.elapsed() <= self.ttl && !e.draining)
+            .min_by_key(|e| e.joined)
+            .map(|e| e.addr.clone())
+    }
+
+    /// The live relays' mesh listeners other than `mesh_addr`'s own, sorted.
+    fn mesh_peers(&self, mesh_addr: &str) -> Vec<String> {
+        let mut peers: Vec<String> = self
+            .entries
+            .values()
+            .filter(|e| {
+                e.last_beat.elapsed() <= self.ttl
+                    && !e.mesh_addr.is_empty()
+                    && e.mesh_addr != mesh_addr
+            })
+            .map(|e| e.mesh_addr.clone())
+            .collect();
+        peers.sort();
+        peers
     }
 
     /// Drop entries whose heartbeat lapsed (the sweeper's cleanup half; the
@@ -170,6 +214,8 @@ pub struct CoordinatorService {
     /// Self-announced, heartbeating relays (PRD `phase-6-anycast-autoscaling.md`
     /// FR3). Advertised when no static `relay` override is configured.
     relays: Arc<Mutex<RelayRegistry>>,
+    /// The heartbeat cadence relays are told to keep.
+    relay_interval_secs: u32,
     /// DNS resolvers (bare IPs, reachable through the tunnel) advertised to
     /// every device in the network map (PRD leak-protection.md), or empty for
     /// none.
@@ -198,6 +244,7 @@ impl CoordinatorService {
             changes,
             relay: String::new(),
             relays: Arc::new(Mutex::new(RelayRegistry::new(DEFAULT_RELAY_TTL))),
+            relay_interval_secs: RELAY_HEARTBEAT_INTERVAL_SECS,
             dns_servers: Vec::new(),
             metrics: Metrics::new(),
             relay_identities: Vec::new(),
@@ -243,6 +290,13 @@ impl CoordinatorService {
     /// advertised without a heartbeat) — for tests that need fast expiry.
     pub fn with_relay_ttl(self, ttl: Duration) -> Self {
         self.relays.lock().expect("relay registry poisoned").ttl = ttl;
+        self
+    }
+
+    /// Tell relays to heartbeat every `secs` (default 15) — for tests that
+    /// need relays to learn about each other quickly.
+    pub fn with_relay_heartbeat_interval(mut self, secs: u32) -> Self {
+        self.relay_interval_secs = secs.max(1);
         self
     }
 
@@ -314,6 +368,7 @@ impl CoordinatorService {
             changes,
             relay: String::new(),
             relays: Arc::new(Mutex::new(RelayRegistry::new(DEFAULT_RELAY_TTL))),
+            relay_interval_secs: RELAY_HEARTBEAT_INTERVAL_SECS,
             dns_servers: Vec::new(),
             metrics: Metrics::new(),
             relay_identities: Vec::new(),
@@ -725,12 +780,30 @@ impl Coordinator for CoordinatorService {
         req.addr
             .parse::<std::net::SocketAddr>()
             .map_err(|e| Status::invalid_argument(format!("relay addr '{}': {e}", req.addr)))?;
-        let changed = {
+        if !req.mesh_addr.is_empty() {
+            let mesh: std::net::SocketAddr = req.mesh_addr.parse().map_err(|e| {
+                Status::invalid_argument(format!("relay mesh_addr '{}': {e}", req.mesh_addr))
+            })?;
+            // Siblings check a mesh datagram's source against this address,
+            // so it must be the one the relay actually sends from.
+            if mesh.ip().is_unspecified() || mesh.port() == 0 {
+                return Err(Status::invalid_argument(format!(
+                    "relay mesh_addr '{}' must be a specific address and port",
+                    req.mesh_addr
+                )));
+            }
+        }
+        let (changed, mesh_peers) = {
             let mut reg = self.relays.lock().expect("relay registry poisoned");
             let before = effective_relay(&self.relay, &reg);
-            reg.heartbeat(&req.addr, req.draining);
+            reg.heartbeat(&req.addr, &req.mesh_addr, req.draining);
             let after = effective_relay(&self.relay, &reg);
-            before != after
+            let peers = if req.mesh_addr.is_empty() {
+                Vec::new()
+            } else {
+                reg.mesh_peers(&req.mesh_addr)
+            };
+            (before != after, peers)
         };
         if changed {
             // The advertised relay changed (a first relay came up, the current
@@ -739,7 +812,8 @@ impl Coordinator for CoordinatorService {
             tracing::info!(draining = req.draining, "advertised relay changed");
         }
         Ok(Response::new(RelayHeartbeatResponse {
-            interval_secs: RELAY_HEARTBEAT_INTERVAL_SECS,
+            interval_secs: self.relay_interval_secs,
+            mesh_peers,
         }))
     }
 
@@ -1176,6 +1250,7 @@ mod tests {
             .relay_heartbeat(Request::new(RelayHeartbeatRequest {
                 addr: "9.9.9.1:51821".into(),
                 draining: false,
+                ..Default::default()
             }))
             .await
             .unwrap()
@@ -1188,6 +1263,7 @@ mod tests {
         svc.relay_heartbeat(Request::new(RelayHeartbeatRequest {
             addr: "9.9.9.2:51821".into(),
             draining: false,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -1197,6 +1273,7 @@ mod tests {
         svc.relay_heartbeat(Request::new(RelayHeartbeatRequest {
             addr: "9.9.9.1:51821".into(),
             draining: true,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -1206,6 +1283,7 @@ mod tests {
         svc.relay_heartbeat(Request::new(RelayHeartbeatRequest {
             addr: "9.9.9.2:51821".into(),
             draining: true,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -1216,6 +1294,7 @@ mod tests {
             .relay_heartbeat(Request::new(RelayHeartbeatRequest {
                 addr: "not-an-addr".into(),
                 draining: false,
+                ..Default::default()
             }))
             .await
             .unwrap_err();
@@ -1242,6 +1321,7 @@ mod tests {
         svc.relay_heartbeat(Request::new(RelayHeartbeatRequest {
             addr: "9.9.9.1:51821".into(),
             draining: false,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -1318,6 +1398,7 @@ mod tests {
         svc.relay_heartbeat(Request::new(RelayHeartbeatRequest {
             addr: "9.9.9.1:51821".into(),
             draining: false,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -1820,6 +1901,7 @@ mod tests {
         let beat = || RelayHeartbeatRequest {
             addr: "198.51.100.7:3478".into(),
             draining: false,
+            ..Default::default()
         };
 
         let err = client
@@ -1955,6 +2037,7 @@ mod tests {
         let beat = || RelayHeartbeatRequest {
             addr: "198.51.100.1:3478".into(),
             draining: false,
+            ..Default::default()
         };
 
         client.relay_heartbeat(beat()).await.unwrap();
@@ -2067,5 +2150,106 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::ResourceExhausted, "{err:?}");
         // Same source, different identity: unaffected.
         client.register_device(authed("BBB", &bob)).await.unwrap();
+    }
+
+    /// Relay mesh M2 (PRD `relay-mesh.md`): relays that share an anycast
+    /// address each get their own entry, keyed by mesh address; each learns
+    /// the others' mesh listeners; one PoP's goodbye doesn't withdraw the
+    /// shared advertisement; a draining relay stays a mesh member.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mesh_relays_share_an_address_and_learn_each_other() {
+        use ferrum_control_proto::coordinator::coordinator_server::Coordinator;
+
+        let registry = Arc::new(Mutex::new(Registry::new(Ipv4Addr::new(10, 8, 0, 0), 24)));
+        let svc = CoordinatorService::new(registry);
+        svc.register_device(Request::new(RegisterDeviceRequest {
+            public_key: "AAA".into(),
+            name: "a".into(),
+            endpoint: "1.1.1.1:51820".into(),
+            tags: vec![],
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        let beat = |mesh: &str, draining: bool| {
+            Request::new(RelayHeartbeatRequest {
+                addr: "192.0.2.10:51821".into(),
+                draining,
+                mesh_addr: mesh.into(),
+            })
+        };
+        let advertised = || async {
+            svc.get_network_map(Request::new(NetworkMapRequest {
+                public_key: "AAA".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .relay
+        };
+
+        let first = svc
+            .relay_heartbeat(beat("10.0.0.1:51822", false))
+            .await
+            .unwrap();
+        assert!(first.into_inner().mesh_peers.is_empty());
+        let second = svc
+            .relay_heartbeat(beat("10.0.0.2:51822", false))
+            .await
+            .unwrap();
+        assert_eq!(second.into_inner().mesh_peers, ["10.0.0.1:51822"]);
+        let first = svc
+            .relay_heartbeat(beat("10.0.0.1:51822", false))
+            .await
+            .unwrap();
+        assert_eq!(first.into_inner().mesh_peers, ["10.0.0.2:51822"]);
+        assert_eq!(advertised().await, "192.0.2.10:51821");
+
+        // One PoP drains: the shared address stays advertised (the other is
+        // live), and the drainer stays in the other's mesh.
+        svc.relay_heartbeat(beat("10.0.0.1:51822", true))
+            .await
+            .unwrap();
+        assert_eq!(advertised().await, "192.0.2.10:51821");
+        let second = svc
+            .relay_heartbeat(beat("10.0.0.2:51822", false))
+            .await
+            .unwrap();
+        assert_eq!(second.into_inner().mesh_peers, ["10.0.0.1:51822"]);
+
+        // The other drains too: nothing advertised any more.
+        svc.relay_heartbeat(beat("10.0.0.2:51822", true))
+            .await
+            .unwrap();
+        assert_eq!(advertised().await, "");
+
+        // A relay without a mesh gets no peer list.
+        let plain = svc
+            .relay_heartbeat(Request::new(RelayHeartbeatRequest {
+                addr: "9.9.9.9:51821".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert!(plain.into_inner().mesh_peers.is_empty());
+
+        // A mesh address siblings couldn't match a source against is refused.
+        for bad in ["0.0.0.0:51822", "10.0.0.3:0", "nope"] {
+            let err = svc.relay_heartbeat(beat(bad, false)).await.unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{bad}");
+        }
+    }
+
+    /// A draining mesh relay leaves the mesh once its heartbeats lapse.
+    #[test]
+    fn a_drained_mesh_relay_expires() {
+        let mut reg = RelayRegistry::new(Duration::from_millis(50));
+        reg.heartbeat("192.0.2.10:51821", "10.0.0.1:51822", false);
+        reg.heartbeat("192.0.2.10:51821", "10.0.0.2:51822", false);
+        reg.heartbeat("192.0.2.10:51821", "10.0.0.1:51822", true);
+        assert_eq!(reg.mesh_peers("10.0.0.2:51822"), ["10.0.0.1:51822"]);
+        std::thread::sleep(Duration::from_millis(80));
+        reg.heartbeat("192.0.2.10:51821", "10.0.0.2:51822", false);
+        assert!(reg.mesh_peers("10.0.0.2:51822").is_empty());
     }
 }

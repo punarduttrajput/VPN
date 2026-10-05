@@ -224,11 +224,13 @@ NFR.
   retried, and the decision is re-applied every 30 s because a restarted
   bird comes back disabled. Files: `bird.conf`, `ferrum-relay.service`,
   `ferrum-anycast-gate.service`, `README.md`.
-- **Anycast relays don't heartbeat to the coordinator.** The relay registry
-  (FR3) is keyed by address, so every PoP would share one entry and one
-  PoP's drain goodbye would withdraw it for all. With anycast the
-  coordinator advertises the anycast address statically (`--relay`) and BGP
-  does the steering.
+- **Anycast relays and the registry.** The relay registry (FR3) was keyed by
+  client-facing address, so PoPs sharing the anycast address would share one
+  entry, and one PoP's drain goodbye would withdraw it for all. Since relay
+  mesh M2 ([relay-mesh.md](relay-mesh.md)) a relay with a mesh address is
+  keyed by that instead, so meshed anycast relays can heartbeat normally.
+  Unmeshed anycast relays still shouldn't: the coordinator then advertises
+  the anycast address statically (`--relay`).
 - **Faster re-registration after a GoAway.** Behind an anycast address, a
   client whose traffic moves to another PoP isn't registered there until its
   next keepalive, up to 25 s later. After a GoAway the client now

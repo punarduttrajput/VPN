@@ -101,12 +101,20 @@ message PublishCandidatesResponse {}
 message RelayHeartbeatRequest {
   string addr = 1;   // the relay's client-reachable UDP listener, "ip:port"
   bool draining = 2; // goodbye: withdraw this relay from advertisement now
+  // The relay's mesh listener, "ip:port", or empty if it isn't in a relay mesh
+  // (PRD relay-mesh.md M2). When set it identifies the relay, so relays that
+  // share a client-facing (anycast) address each get their own entry.
+  string mesh_addr = 3;
 }
 
 message RelayHeartbeatResponse {
   // Send the next heartbeat within this many seconds; a relay silent for a
   // few multiples of this is withdrawn from advertisement.
   uint32 interval_secs = 1;
+  // The other live relays' mesh listeners, when the caller sent a mesh_addr.
+  // Draining relays stay listed until their heartbeats lapse, so siblings
+  // keep forwarding to the clients they still serve.
+  repeated string mesh_peers = 2;
 }
 
 message RotateKeyRequest {
