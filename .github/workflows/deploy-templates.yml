@@ -1,0 +1,122 @@
+name: Deploy templates
+
+# Checks the deployment templates nothing else can: the OCI Terraform module,
+# the Ansible relay role, the bird2 config and the relay systemd units
+# (PRD phase-6-anycast-autoscaling.md FR5/FR6). Only runs when they change.
+on:
+  pull_request:
+    paths:
+      - "deploy/autoscaling/**"
+      - "deploy/ansible/**"
+      - "deploy/anycast/**"
+      - ".github/workflows/deploy-templates.yml"
+  push:
+    branches: [main]
+    paths:
+      - "deploy/autoscaling/**"
+      - "deploy/ansible/**"
+      - "deploy/anycast/**"
+      - ".github/workflows/deploy-templates.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-templates-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  terraform:
+    name: terraform (OCI relay pool)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: deploy/autoscaling/terraform/oci-relay-pool
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+          terraform_wrapper: false
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive -diff
+
+      - name: terraform validate
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+
+      - name: Render the cloud-init template and check its schema
+        run: |
+          cat > /tmp/render.tf <<'EOF'
+          output "user_data" {
+            value = templatefile("${path.module}/relay-cloud-init.yaml.tftpl", {
+              ferrum_url      = "https://example.com/ferrum"
+              ferrum_sha256   = "0000000000000000000000000000000000000000000000000000000000000000"
+              coordinator_url = "http://10.0.1.10:50051"
+              advertise       = "192.0.2.10:51821"
+              relay_port      = 51821
+              mesh_port       = 51822
+              probe_port      = 9101
+              mesh_key        = "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio="
+              relay_token     = ""
+            })
+          }
+          EOF
+          mkdir -p /tmp/render && cp relay-cloud-init.yaml.tftpl /tmp/render/ && cp /tmp/render.tf /tmp/render/
+          (cd /tmp/render && terraform init -backend=false -input=false >/dev/null && terraform apply -auto-approve -input=false >/dev/null && terraform output -raw user_data) > /tmp/user-data.yaml
+          head -n 3 /tmp/user-data.yaml
+          sudo cloud-init schema --config-file /tmp/user-data.yaml
+
+  ansible:
+    name: ansible (relay role)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: deploy/ansible
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ansible-core
+        run: pipx install ansible-core==2.17.*
+
+      - name: Syntax check
+        run: ansible-playbook --syntax-check -i inventory.example.ini relay.yml
+
+      - name: Render the relay unit and verify it
+        run: |
+          for variant in full plain; do
+            if [ "$variant" = full ]; then
+              extra='{"ferrum_relay_listen":"192.0.2.10:51821","ferrum_relay_coordinator":"http://c:50051","ferrum_relay_advertise":"192.0.2.10:51821","ferrum_relay_token":"t","ferrum_relay_mesh_listen":"198.51.100.10:51822","ferrum_relay_mesh_peers":["203.0.113.20:51822"]}'
+            else
+              extra='{}'
+            fi
+            mkdir -p "/tmp/$variant"
+            ansible localhost -c local -m ansible.builtin.template \
+              -a "src=roles/ferrum_relay/templates/ferrum-relay.service.j2 dest=/tmp/$variant/ferrum-relay.service" \
+              -e @roles/ferrum_relay/defaults/main.yml -e "$extra"
+            cat "/tmp/$variant/ferrum-relay.service"
+          done
+          # verify checks ExecStart exists; a stub stands in for the binary.
+          sudo install -m 0755 /bin/true /usr/local/bin/ferrum
+          systemd-analyze verify /tmp/full/ferrum-relay.service /tmp/plain/ferrum-relay.service
+
+  anycast:
+    name: anycast (bird2 config, relay unit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install bird2
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq bird2
+
+      - name: bird -p
+        run: bird -p -c deploy/anycast/bird.conf
+
+      - name: Verify the anycast relay unit
+        run: |
+          sudo install -m 0755 /bin/true /usr/local/bin/ferrum
+          systemd-analyze verify deploy/anycast/ferrum-relay.service

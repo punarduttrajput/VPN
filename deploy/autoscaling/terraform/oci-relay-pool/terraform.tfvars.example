@@ -1,0 +1,20 @@
+# Copy to terraform.tfvars and fill in. Never commit the real file: it holds
+# the mesh key (and the relay token, if any).
+
+compartment_id      = "ocid1.compartment.oc1..example"
+availability_domain = "Uocm:EU-FRANKFURT-1-AD-1"
+vcn_id              = "ocid1.vcn.oc1.eu-frankfurt-1.example"
+vcn_cidr            = "10.0.0.0/16"
+relay_subnet_id     = "ocid1.subnet.oc1.eu-frankfurt-1.private-example"
+nlb_subnet_id       = "ocid1.subnet.oc1.eu-frankfurt-1.public-example"
+image_id            = "ocid1.image.oc1.eu-frankfurt-1.example"
+
+pool_min = 2
+pool_max = 6
+
+ferrum_url    = "https://example.com/releases/ferrum-aarch64-linux"
+ferrum_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+coordinator_url = "http://10.0.1.10:50051"
+# relay_token   = "<a JWT with the relay tag>"   # only if the coordinator uses OIDC
+mesh_key        = "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio="  # replace: head -c 32 /dev/urandom | base64

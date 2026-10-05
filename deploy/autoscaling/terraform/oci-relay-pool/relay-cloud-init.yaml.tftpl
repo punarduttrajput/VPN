@@ -1,0 +1,74 @@
+#cloud-config
+# Rendered by Terraform (main.tf) for every relay in the pool: installs the
+# pinned ferrum binary and runs it as a meshed relay that announces itself to
+# the coordinator.
+
+write_files:
+  - path: /etc/ferrum/mesh.key
+    permissions: "0600"
+    owner: root:root
+    content: |
+      ${mesh_key}
+  - path: /etc/ferrum/relay-token
+    permissions: "0600"
+    owner: root:root
+    content: "${relay_token}"
+  - path: /usr/local/libexec/ferrum-relay-start
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/bin/sh
+      # The mesh address must be this instance's own: sibling relays match a
+      # mesh datagram's source against it.
+      set -eu
+      ip=$(ip -4 -o route get 1.1.1.1 | sed -n 's/.* src \([0-9.]*\).*/\1/p')
+      [ -n "$ip" ] || { echo "ferrum-relay: no private IPv4 address" >&2; exit 1; }
+      set -- relay \
+        --listen 0.0.0.0:${relay_port} \
+        --metrics-listen 0.0.0.0:${probe_port} \
+        --drain-grace 20 \
+        --coordinator '${coordinator_url}' \
+        --advertise '${advertise}' \
+        --mesh-listen "$ip:${mesh_port}" \
+        --mesh-key-file "$CREDENTIALS_DIRECTORY/mesh.key"
+      if [ -s "$CREDENTIALS_DIRECTORY/relay-token" ]; then
+        set -- "$@" --token-file "$CREDENTIALS_DIRECTORY/relay-token"
+      fi
+      exec /usr/local/bin/ferrum "$@"
+  - path: /etc/systemd/system/ferrum-relay.service
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Ferrum relay (pool member)
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      ExecStart=/usr/local/libexec/ferrum-relay-start
+      LoadCredential=mesh.key:/etc/ferrum/mesh.key
+      LoadCredential=relay-token:/etc/ferrum/relay-token
+      # SIGTERM starts the drain (readiness fails, the NLB stops sending new
+      # flows, clients get a GoAway); allow the grace window plus slack.
+      KillSignal=SIGTERM
+      TimeoutStopSec=30
+      Restart=on-failure
+      RestartSec=2
+      DynamicUser=yes
+      NoNewPrivileges=yes
+      ProtectSystem=strict
+      ProtectHome=yes
+      PrivateTmp=yes
+      PrivateDevices=yes
+      RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK
+      LockPersonality=yes
+      MemoryDenyWriteExecute=yes
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - [sh, -c, 'curl -fsSL --proto =https -o /usr/local/bin/ferrum.download "${ferrum_url}" && echo "${ferrum_sha256}  /usr/local/bin/ferrum.download" | sha256sum -c - && install -m 0755 /usr/local/bin/ferrum.download /usr/local/bin/ferrum && rm -f /usr/local/bin/ferrum.download']
+  - [systemctl, daemon-reload]
+  - [systemctl, enable, --now, ferrum-relay.service]

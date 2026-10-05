@@ -1,0 +1,60 @@
+# Relay pool scaling signals (PRD phase-6-anycast-autoscaling.md FR6).
+#
+# Aggregate only, like every other Ferrum metric (NFR5). A relay counts as
+# ready while it isn't draining; a draining relay's clients are about to move,
+# so they count against the ready ones that will take them.
+#
+# The alerts are signals for whatever does the scaling (an operator, or an
+# Alertmanager webhook that resizes the pool). The OCI template in
+# deploy/autoscaling/ scales the pool natively on CPU and uses these for
+# visibility. The thresholds are starting points: measure a relay on your
+# shape and adjust.
+
+groups:
+  - name: ferrum-relay-scaling
+    interval: 30s
+    rules:
+      - record: ferrum:relay_pool_ready:count
+        expr: count(ferrum_relay_draining{job="ferrum-relay"} == 0)
+      - record: ferrum:relay_pool_clients:sum
+        expr: sum(ferrum_relay_clients_registered{job="ferrum-relay"})
+      - record: ferrum:relay_pool_forward_bps:rate5m
+        expr: sum(rate(ferrum_relay_bytes_forwarded_total{job="ferrum-relay"}[5m])) * 8
+      - record: ferrum:relay_clients_per_ready_relay
+        expr: ferrum:relay_pool_clients:sum / ferrum:relay_pool_ready:count
+      - record: ferrum:relay_forward_bps_per_ready_relay
+        expr: ferrum:relay_pool_forward_bps:rate5m / ferrum:relay_pool_ready:count
+
+      - alert: FerrumRelayPoolScaleOut
+        expr: >
+          ferrum:relay_clients_per_ready_relay > 2000
+          or ferrum:relay_forward_bps_per_ready_relay > 4e8
+        for: 5m
+        labels:
+          severity: info
+          action: scale-out
+        annotations:
+          summary: "Relay pool is busy: add a relay"
+          description: "Ready relays average more than 2000 clients or 400 Mbit/s each."
+
+      - alert: FerrumRelayPoolScaleIn
+        expr: >
+          ferrum:relay_clients_per_ready_relay < 200
+          and ferrum:relay_forward_bps_per_ready_relay < 4e7
+          and ferrum:relay_pool_ready:count > 2
+        for: 30m
+        labels:
+          severity: info
+          action: scale-in
+        annotations:
+          summary: "Relay pool is quiet: a relay can go"
+          description: "More than two ready relays, each under 200 clients and 40 Mbit/s, for 30 minutes."
+
+      - alert: FerrumRelayPoolNoReadyRelay
+        expr: (ferrum:relay_pool_ready:count or vector(0)) == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No ready relay"
+          description: "Every relay is draining or unreachable, so relayed peers can't connect."

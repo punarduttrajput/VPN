@@ -1,0 +1,26 @@
+---
+# Where to get the binary. The checksum is required: get_url refuses a
+# download that doesn't match.
+ferrum_url: ""
+ferrum_sha256: ""
+
+# The client-facing listener. For anycast, the anycast address itself (see
+# deploy/anycast/README.md); for a standalone relay, 0.0.0.0 works.
+ferrum_relay_listen: "0.0.0.0:51821"
+ferrum_relay_metrics_listen: "127.0.0.1:9101"
+ferrum_relay_drain_grace: 20
+
+# Announce to a coordinator (empty to skip): the address devices use, and
+# the coordinator URL.
+ferrum_relay_coordinator: ""
+ferrum_relay_advertise: ""
+
+# Relay mesh (PRD relay-mesh.md): this host's own unicast address, reachable
+# from the other relays. Empty disables the mesh. With a coordinator the
+# relays find each other; ferrum_relay_mesh_peers adds fixed ones.
+ferrum_relay_mesh_listen: ""
+ferrum_relay_mesh_peers: []
+
+# Secrets: set these from an Ansible Vault file.
+ferrum_relay_mesh_key: ""
+ferrum_relay_token: ""

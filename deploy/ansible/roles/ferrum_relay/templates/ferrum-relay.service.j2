@@ -1,0 +1,43 @@
+# Managed by Ansible (deploy/ansible, role ferrum_relay). %d is the
+# credentials directory holding the LoadCredential= files below.
+[Unit]
+Description=Ferrum relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ferrum relay \
+    --listen {{ ferrum_relay_listen }} \
+    --metrics-listen {{ ferrum_relay_metrics_listen }} \
+    --drain-grace {{ ferrum_relay_drain_grace }}{% if ferrum_relay_coordinator != '' %} \
+    --coordinator {{ ferrum_relay_coordinator }} \
+    --advertise {{ ferrum_relay_advertise }}{% endif %}{% if ferrum_relay_token != '' %} \
+    --token-file %d/relay-token{% endif %}{% if ferrum_relay_mesh_listen != '' %} \
+    --mesh-listen {{ ferrum_relay_mesh_listen }} \
+    --mesh-key-file %d/mesh.key{% for peer in ferrum_relay_mesh_peers %} \
+    --mesh-peer {{ peer }}{% endfor %}{% endif %}
+
+{% if ferrum_relay_mesh_listen != '' %}
+LoadCredential=mesh.key:/etc/ferrum/mesh.key
+{% endif %}
+{% if ferrum_relay_token != '' %}
+LoadCredential=relay-token:/etc/ferrum/relay-token
+{% endif %}
+# SIGTERM starts the drain; allow the grace window plus slack.
+KillSignal=SIGTERM
+TimeoutStopSec={{ ferrum_relay_drain_grace + 10 }}
+Restart=on-failure
+RestartSec=2
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

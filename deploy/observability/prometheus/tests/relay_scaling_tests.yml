@@ -1,0 +1,144 @@
+# promtool unit tests for the relay pool scaling rules (PRD
+# phase-6-anycast-autoscaling.md FR6).
+#
+# Run:  promtool test rules deploy/observability/prometheus/tests/relay_scaling_tests.yml
+
+rule_files:
+  - ../rules/relay_scaling.yml
+
+evaluation_interval: 1m
+
+tests:
+  # Two ready relays averaging 2300 clients each: scale out.
+  - name: a busy pool asks for another relay
+    interval: 1m
+    input_series:
+      - series: 'ferrum_relay_draining{job="ferrum-relay", instance="r1"}'
+        values: '0x20'
+      - series: 'ferrum_relay_draining{job="ferrum-relay", instance="r2"}'
+        values: '0x20'
+      - series: 'ferrum_relay_clients_registered{job="ferrum-relay", instance="r1"}'
+        values: '2500x20'
+      - series: 'ferrum_relay_clients_registered{job="ferrum-relay", instance="r2"}'
+        values: '2100x20'
+      - series: 'ferrum_relay_bytes_forwarded_total{job="ferrum-relay", instance="r1"}'
+        values: '0+60000x20'
+    promql_expr_test:
+      - expr: ferrum:relay_clients_per_ready_relay
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ferrum:relay_clients_per_ready_relay'
+            value: 2300
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: FerrumRelayPoolScaleOut
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: FerrumRelayPoolScaleOut
+        exp_alerts:
+          - exp_labels:
+              severity: info
+              action: scale-out
+            exp_annotations:
+              summary: "Relay pool is busy: add a relay"
+              description: "Ready relays average more than 2000 clients or 400 Mbit/s each."
+
+  # 3000 clients over two relays is fine, until one starts draining.
+  - name: a draining relay's clients count against the ready ones
+    interval: 1m
+    input_series:
+      - series: 'ferrum_relay_draining{job="ferrum-relay", instance="r1"}'
+        values: '1x20'
+      - series: 'ferrum_relay_draining{job="ferrum-relay", instance="r2"}'
+        values: '0x20'
+      - series: 'ferrum_relay_clients_registered{job="ferrum-relay", instance="r1"}'
+        values: '1500x20'
+      - series: 'ferrum_relay_clients_registered{job="ferrum-relay", instance="r2"}'
+        values: '1500x20'
+      - series: 'ferrum_relay_bytes_forwarded_total{job="ferrum-relay", instance="r2"}'
+        values: '0+60000x20'
+    promql_expr_test:
+      - expr: ferrum:relay_pool_ready:count
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ferrum:relay_pool_ready:count'
+            value: 1
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: FerrumRelayPoolScaleOut
+        exp_alerts:
+          - exp_labels:
+              severity: info
+              action: scale-out
+            exp_annotations:
+              summary: "Relay pool is busy: add a relay"
+              description: "Ready relays average more than 2000 clients or 400 Mbit/s each."
+
+  # Three quiet relays: one can go after 30 minutes. Two quiet relays stay.
+  - name: a quiet pool asks to shrink, down to two relays
+    interval: 1m
+    input_series:
+      - series: 'ferrum_relay_draining{job="ferrum-relay", instance="r1"}'
+        values: '0x45'
+      - series: 'ferrum_relay_draining{job="ferrum-relay", instance="r2"}'
+        values: '0x45'
+      - series: 'ferrum_relay_draining{job="ferrum-relay", instance="r3"}'
+        values: '0x45'
+      - series: 'ferrum_relay_clients_registered{job="ferrum-relay", instance="r1"}'
+        values: '50x45'
+      - series: 'ferrum_relay_clients_registered{job="ferrum-relay", instance="r2"}'
+        values: '50x45'
+      - series: 'ferrum_relay_clients_registered{job="ferrum-relay", instance="r3"}'
+        values: '50x45'
+      - series: 'ferrum_relay_bytes_forwarded_total{job="ferrum-relay", instance="r1"}'
+        values: '0+60000x45'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: FerrumRelayPoolScaleIn
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: FerrumRelayPoolScaleIn
+        exp_alerts:
+          - exp_labels:
+              severity: info
+              action: scale-in
+            exp_annotations:
+              summary: "Relay pool is quiet: a relay can go"
+              description: "More than two ready relays, each under 200 clients and 40 Mbit/s, for 30 minutes."
+
+  - name: two quiet relays are the floor
+    interval: 1m
+    input_series:
+      - series: 'ferrum_relay_draining{job="ferrum-relay", instance="r1"}'
+        values: '0x45'
+      - series: 'ferrum_relay_draining{job="ferrum-relay", instance="r2"}'
+        values: '0x45'
+      - series: 'ferrum_relay_clients_registered{job="ferrum-relay", instance="r1"}'
+        values: '50x45'
+      - series: 'ferrum_relay_clients_registered{job="ferrum-relay", instance="r2"}'
+        values: '50x45'
+      - series: 'ferrum_relay_bytes_forwarded_total{job="ferrum-relay", instance="r1"}'
+        values: '0+60000x45'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: FerrumRelayPoolScaleIn
+        exp_alerts: []
+
+  # Every relay draining (or none scraped): page.
+  - name: no ready relay pages
+    interval: 1m
+    input_series:
+      - series: 'ferrum_relay_draining{job="ferrum-relay", instance="r1"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: FerrumRelayPoolNoReadyRelay
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: FerrumRelayPoolNoReadyRelay
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "No ready relay"
+              description: "Every relay is draining or unreachable, so relayed peers can't connect."
