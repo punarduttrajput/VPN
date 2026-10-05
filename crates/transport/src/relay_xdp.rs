@@ -372,11 +372,14 @@ async fn resolve_gateway_info(iface: &str) -> Result<GatewayInfo, String> {
         .ok_or_else(|| "no default IPv4 route found".to_string())?;
     let gateway_mac = resolve_neighbor_mac(gateway_ip).await?;
 
-    Ok(GatewayInfo {
+    // `relay_ip` is also the destination the fast path requires (SEC-018):
+    // frames to any other address, e.g. a secondary IP on the interface,
+    // fall through to userspace.
+    Ok(GatewayInfo::new(
         relay_mac,
-        relay_ip: u32::from_be_bytes(relay_ip.octets()),
+        u32::from_be_bytes(relay_ip.octets()),
         gateway_mac,
-    })
+    ))
 }
 
 /// Resolve `ip`'s MAC via its ARP/neighbor cache entry, pinging once first

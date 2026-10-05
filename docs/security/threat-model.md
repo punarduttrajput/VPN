@@ -300,8 +300,9 @@ Ferrum for them.
 | Local `ferrum` group member | tunnel control | tunnel and kill-switch on/off | root code execution (SEC-005/012) |
 | Admin token holder | operations | everything the coordinator knows; revoke; policy | read traffic |
 
-**Status of fixes referenced here.** SEC-001 to SEC-018 are on `main`, except
-SEC-018's eBPF/XDP parser checks, which need a Linux host. SEC-019 (the
+**Status of fixes referenced here.** SEC-001 to SEC-018 are on `main`.
+SEC-018's eBPF/XDP parser checks are implemented and unit-tested but not yet
+loaded through the kernel verifier or re-run on live traffic (Linux host). SEC-019 (the
 boringtun upgrade) is on `main`, pending its Linux real-TUN and throughput
 runs. SEC-020 (the SNI default) is on `main`. SEC-021 (QUIC ALPN) is
 implemented and in review.

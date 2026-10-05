@@ -34,7 +34,10 @@ use aya_ebpf::macros::{map, xdp};
 use aya_ebpf::maps::{Array, HashMap, PerCpuArray};
 use aya_ebpf::programs::XdpContext;
 use aya_log_ebpf::debug;
-use ferrum_relay_xdp_common::{AddrKey, GatewayInfo, KEY_LEN, TAG_DATA};
+use ferrum_relay_xdp_common::{
+    checksum_update, fastpath_eligible, words_of, AddrKey, GatewayInfo, Ipv4UdpFields, ETH_LEN,
+    IPV4_MIN_LEN, KEY_LEN, TAG_DATA, UDP_LEN,
+};
 
 /// Mirrors `Clients::by_addr` (`relay.rs`) — a sender's source address to
 /// their public key, so a forwarded frame's rewritten payload can carry the
@@ -89,23 +92,25 @@ pub fn ferrum_relay_fastpath(ctx: XdpContext) -> u32 {
 // field accessors). Ethernet II (RFC 894), IPv4 with no options (RFC 791),
 // UDP (RFC 768).
 
-const ETH_LEN: usize = 14; // 6 (dst mac) + 6 (src mac) + 2 (ethertype)
+// ETH_LEN, IPV4_MIN_LEN, UDP_LEN and the eligibility rules live in
+// ferrum-relay-xdp-common, where they're unit-tested (SEC-018).
 const ETH_DST_OFF: usize = 0;
 const ETH_SRC_OFF: usize = 6;
 const ETH_TYPE_OFF: usize = 12;
 const ETH_TYPE_IPV4: u16 = 0x0800;
 
 const IPV4_VERSION_IHL_OFF: usize = 0; // relative to the IPv4 header's start
+const IPV4_TOTAL_LEN_OFF: usize = 2;
+const IPV4_FLAGS_FRAG_OFF: usize = 6;
 const IPV4_PROTO_OFF: usize = 9;
 const IPV4_CHECKSUM_OFF: usize = 10;
 const IPV4_SRC_OFF: usize = 12;
 const IPV4_DST_OFF: usize = 16;
-const IPV4_MIN_LEN: usize = 20; // no options — anything else falls through
-const IPPROTO_UDP: u8 = 17;
 
-const UDP_LEN: usize = 8; // relative offsets, within the UDP header
+// Relative offsets, within the UDP header.
 const UDP_SRC_PORT_OFF: usize = 0;
 const UDP_DST_PORT_OFF: usize = 2;
+const UDP_LEN_OFF: usize = 4;
 const UDP_CHECKSUM_OFF: usize = 6;
 
 /// Bounds-checked read of `size_of::<T>()` bytes at `offset` from the start
@@ -173,45 +178,8 @@ fn write_u32(ctx: &XdpContext, offset: usize, value: u32) -> Result<(), ()> {
     write_bytes(ctx, offset, &value.to_be_bytes())
 }
 
-/// RFC 1624 incremental checksum update. Every argument — and the result —
-/// is a plain integer *value* (see the byte-order convention above), not
-/// raw wire bytes: the caller reads the existing checksum and every changed
-/// 16-bit word via `read_u16`/manual splitting first, and writes the result
-/// back via `write_u16`.
-///
-/// `changed_words` is `(old_value, new_value)` pairs for every 16-bit word
-/// that changed between the original and rewritten header (for an IPv4
-/// address, that's its high and low 16 bits as two separate pairs).
-fn checksum_update(old_checksum: u16, changed_words: &[(u16, u16)]) -> u16 {
-    // Ones-complement arithmetic: start from the complement of the existing
-    // checksum, remove each old word's contribution (by adding its
-    // complement), add each new word's contribution, then fold the 32-bit
-    // accumulator's carry back in until it fits 16 bits, and complement
-    // once more for the final checksum. This is the textbook RFC 1624
-    // "adjust for a changed field" formula, applied one word at a time.
-    let mut sum: u32 = (!old_checksum) as u32;
-    for &(old, new) in changed_words {
-        sum += (!old) as u32;
-        sum += new as u32;
-    }
-    // Fold with a FIXED two folds, not a `while (sum >> 16) != 0` loop: the
-    // eBPF verifier rejects the loop form ("infinite loop detected" — its
-    // interval analysis can't prove the carry stops regenerating; found on
-    // the first real load, 2026-07-09). Two folds always suffice for this
-    // accumulator: the caller passes at most a handful of word pairs (4
-    // here), so `sum` is at most ~9 * 0xFFFF — the first fold leaves at
-    // most a single carry bit above bit 15, and the second absorbs it.
-    sum = (sum & 0xFFFF) + (sum >> 16);
-    sum = (sum & 0xFFFF) + (sum >> 16);
-    !(sum as u16)
-}
-
-/// Split a 32-bit value into its high/low 16-bit words, in the order the
-/// checksum needs them (matching how the two are laid out on the wire).
-#[inline(always)]
-fn words_of(v: u32) -> (u16, u16) {
-    ((v >> 16) as u16, (v & 0xFFFF) as u16)
-}
+// `checksum_update` and `words_of` are in ferrum-relay-xdp-common, unit-tested
+// there against a full checksum recomputation (SEC-018).
 
 fn try_fastpath(ctx: &XdpContext) -> Result<u32, ()> {
     // --- Ethernet: must be IPv4, else PASS (covers ARP/IPv6/etc.) ---
@@ -219,25 +187,36 @@ fn try_fastpath(ctx: &XdpContext) -> Result<u32, ()> {
         return Ok(xdp_action::XDP_PASS);
     }
 
-    // --- IPv4: must be UDP with no options, else PASS ---
+    // --- IPv4 + UDP: eligible shape, addressed to this relay, else PASS ---
+    // SEC-018: version nibble, no options, UDP, not a fragment, destination
+    // is the relay itself, and IPv4/UDP lengths that agree with the frame
+    // (`fastpath_eligible`, unit-tested in ferrum-relay-xdp-common). The
+    // gateway entry carries the relay's own address, so it's read first; an
+    // unresolved entry is a silent miss (no log: this runs for every IPv4
+    // packet on the interface, not just relay traffic).
     let ip_off = ETH_LEN;
-    let ihl = read_u8(ctx, ip_off + IPV4_VERSION_IHL_OFF)? & 0x0F;
-    let ip_hdr_len = (ihl as usize) * 4;
-    if ip_hdr_len != IPV4_MIN_LEN {
-        // Options present. Rare for this relay's own traffic and not worth
-        // the extra bounds-check complexity in a first fast-path version.
+    let udp_off = ip_off + IPV4_MIN_LEN;
+    // `Array::get` is a safe call (checked against the real `aya-ebpf =
+    // "0.2.1"` source — `fn get(&self, index: u32) -> Option<&T>`).
+    let gw = GATEWAY.get(0).copied().ok_or(())?;
+    if !gw.is_resolved() {
         return Ok(xdp_action::XDP_PASS);
     }
-    if read_u8(ctx, ip_off + IPV4_PROTO_OFF)? != IPPROTO_UDP {
+    let fields = Ipv4UdpFields {
+        version_ihl: read_u8(ctx, ip_off + IPV4_VERSION_IHL_OFF)?,
+        total_len: read_u16(ctx, ip_off + IPV4_TOTAL_LEN_OFF)?,
+        flags_frag: read_u16(ctx, ip_off + IPV4_FLAGS_FRAG_OFF)?,
+        protocol: read_u8(ctx, ip_off + IPV4_PROTO_OFF)?,
+        dst_ip: read_u32(ctx, ip_off + IPV4_DST_OFF)?,
+        udp_len: read_u16(ctx, udp_off + UDP_LEN_OFF)?,
+    };
+    let frame_len = ctx.data_end() - ctx.data();
+    if !fastpath_eligible(&fields, frame_len, gw.relay_ip) {
         return Ok(xdp_action::XDP_PASS);
     }
     let src_ip = read_u32(ctx, ip_off + IPV4_SRC_OFF)?;
 
     // --- UDP: must target the relay's configured listen port ---
-    let udp_off = ip_off + ip_hdr_len;
-    // `Array::get` is a safe call (checked against the real `aya-ebpf =
-    // "0.2.1"` source — its signature is `fn get(&self, index: u32) ->
-    // Option<&T>`, bounds-checked internally, no `unsafe` needed here).
     let relay_port = RELAY_PORT.get(0).copied().unwrap_or(0);
     if relay_port == 0 {
         // Loader hasn't configured the port yet — always miss until it has.
@@ -303,12 +282,6 @@ fn try_fastpath(ctx: &XdpContext) -> Result<u32, ()> {
         );
         return Ok(xdp_action::XDP_PASS);
     };
-    // `Array::get` is safe — see the `RELAY_PORT` lookup above.
-    let gw = GATEWAY.get(0).copied().ok_or(())?;
-    if !gw.is_resolved() {
-        debug!(ctx, "relay xdp: data frame, gateway not resolved yet");
-        return Err(());
-    }
 
     // --- Rewrite in place: the frame's length never changes, so there's no
     // head/tail room adjustment to make — only field rewrites. ---
@@ -320,7 +293,7 @@ fn try_fastpath(ctx: &XdpContext) -> Result<u32, ()> {
     // IPv4: src = this relay's own address, dst = the resolved
     // destination's address. Recompute the header checksum incrementally
     // (only these two 32-bit fields changed).
-    let old_dst_ip = read_u32(ctx, ip_off + IPV4_DST_OFF)?;
+    let old_dst_ip = fields.dst_ip;
     let old_checksum = read_u16(ctx, ip_off + IPV4_CHECKSUM_OFF)?;
     write_u32(ctx, ip_off + IPV4_SRC_OFF, gw.relay_ip)?;
     write_u32(ctx, ip_off + IPV4_DST_OFF, dest_addr.ip)?;
@@ -360,8 +333,7 @@ fn try_fastpath(ctx: &XdpContext) -> Result<u32, ()> {
     // exactly `relay.rs`'s `data_frame(&src_key, payload)` rewrite.
     write_bytes(ctx, payload_off + 1, &sender_key)?;
 
-    let frame_len = (ctx.data_end() - ctx.data()) as u64;
-    note_fastpathed(frame_len);
+    note_fastpathed(frame_len as u64);
     // No per-packet success log — see the lookup comment above; the STATS
     // counters are the observable.
     Ok(xdp_action::XDP_TX)
