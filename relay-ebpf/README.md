@@ -110,19 +110,28 @@ worth knowing about for any future map or rewrite change:
 ## Build
 
 ```sh
-rustup toolchain install nightly --component rust-src
 bash ../scripts/install-bpf-linker.sh   # pinned prebuilt, digest-verified — see below
 cd relay-ebpf
-cargo +nightly build --release
+cargo build --release   # rust-toolchain.toml pins nightly-2026-07-09 (rustup installs it)
 # -> target/bpfel-unknown-none/release/ferrum-relay-ebpf
 ```
+
+Don't pass `+nightly`: an explicit toolchain overrides `rust-toolchain.toml`
+and would pick today's nightly instead of the pinned one.
 
 `bpf-linker` produces the kernel XDP object, so it is **pinned** (SEC-008).
 [`scripts/install-bpf-linker.sh`](../scripts/install-bpf-linker.sh) downloads
 the prebuilt static musl binary from the aya-rs release and checks its SHA-256
 *before* extracting it into `~/.cargo/bin/` (`--dest DIR` to override). It is
-statically linked, so no LLVM version matching is needed; this is the path used
+statically linked, so no system LLVM install is needed; this is the path used
 for the first real build, 2026-07-09.
+
+**Its LLVM must match rustc's.** bpf-linker reads the LLVM bitcode rustc emits,
+and v0.10.4 is built against **LLVM 22**. A nightly on a newer LLVM major (23
+since the 1.99 cycle) produces bitcode it can't read. That's why
+`rust-toolchain.toml` pins `nightly-2026-07-09` (rustc 1.99.0-nightly
+`14cae6813`, LLVM 22.1.8) rather than floating `nightly`. Check with
+`rustc -vV` inside this directory. Move the pin and bpf-linker together.
 
 | Field | Value |
 |-------|-------|
@@ -138,11 +147,9 @@ every run. `cargo install bpf-linker` (built from source against `llvm-sys`,
 which needs a matching LLVM dev install) still works if you'd rather not use a
 prebuilt binary.
 
-(`.cargo/config.toml` already pins the target and `build-std`;
-`rust-toolchain.toml` pins nightly, so a plain `cargo build --release` from
-inside this directory should pick both up without needing `+nightly`
-explicitly — listed above for clarity in case a toolchain override elsewhere
-interferes.)
+(`.cargo/config.toml` pins the target and `build-std`; `rust-toolchain.toml`
+pins the dated nightly. A plain `cargo build --release` from inside this
+directory picks up both.)
 
 ## Load and attach (via the userspace loader — `crates/transport/src/relay_xdp.rs`,
 built with the `xdp` feature: `cargo build -p ferrum-cli --features xdp`)
