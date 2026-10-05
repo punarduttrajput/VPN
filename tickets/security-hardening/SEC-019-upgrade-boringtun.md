@@ -45,6 +45,10 @@ clarification is needed in `deny.toml`.
       cross-compile clippy. The real-TUN run and the throughput check need a
       Linux host with root and are still to do.)*
       Commands and pass criteria: [Linux verification runbook](../../docs/linux-verification-runbook.md).
+      *(2026-10-05: on boringtun 0.7, CI's real-TUN runs pass on `a0ad298`
+      (CI #423, run 37294507686): the default `verify-linux` set (M3/M5/M6)
+      and `verify-quic`, i.e. point-to-point QUIC over a real TUN. Still to
+      run: `TEST_MESH=1 MESH_QUIC=1` and `STRICT_THROUGHPUT=1`.)*
 - [x] Follow-up noted: `jsonwebtoken` 11 (`rust_crypto`) becomes possible.
       *(Noted in `crates/coordinator/Cargo.toml` next to the `jsonwebtoken`
       pin.)*
