@@ -34,7 +34,7 @@ auditors should know about are in §6.
 | Root | `Cargo.toml` | all `crates/*`: core, transport, tunnel, control-proto, coordinator, client-core, cli, helper, relay-xdp-common | stable |
 | Desktop | `apps/desktop/src-tauri` | Tauri app, Windows `ferrum-helper` service, WFP kill-switch | stable |
 | Fuzz | `fuzz/` | 8 `cargo-fuzz` targets + corpus | nightly |
-| eBPF | `relay-ebpf/` | the relay's in-kernel XDP fast path | nightly + `bpf-linker` |
+| eBPF | `relay-ebpf/` | the relay's in-kernel XDP fast path | `nightly-2026-07-09` (pinned) + `bpf-linker` |
 | Android | `clients/android/` | Kotlin app over the `uniffi` bindings | stable + NDK 27.2 |
 
 The audit scope and priority order are in the [audit plan](audit-plan.md) §4.1.
@@ -82,7 +82,7 @@ cd apps/desktop/src-tauri && cargo build --locked --release
 
 # eBPF/XDP program (Linux; nightly + the pinned bpf-linker)
 bash scripts/install-bpf-linker.sh
-cd relay-ebpf && cargo +nightly build --release
+cd relay-ebpf && cargo build --release   # uses the pinned nightly in rust-toolchain.toml
 #   -> relay-ebpf/target/bpfel-unknown-none/release/ferrum-relay-ebpf
 
 # Android (Windows host as used by the project; needs NDK 27.2)
@@ -218,8 +218,6 @@ how to mint test OIDC tokens (`deploy/oracle-vm/scripts/mint-token.py`).
   0.7. The QUIC mesh variant (`TEST_MESH=1 MESH_QUIC=1`) and
   `STRICT_THROUGHPUT=1` haven't been run.
 - **Desktop licences and bans** aren't gated in CI yet, only advisories.
-- **`relay-ebpf` tracks a floating `nightly`** (`relay-ebpf/rust-toolchain.toml`),
-  so its build isn't pinned to a dated toolchain.
 - **iOS and macOS** clients don't exist.
 - **Residual risks by design** are listed in the threat model §7.
 

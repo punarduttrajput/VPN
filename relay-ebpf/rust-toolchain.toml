@@ -1,3 +1,10 @@
+# Pinned, not floating `nightly` (the build needs nightly for `build-std`).
+# bpf-linker links the LLVM bitcode rustc emits, so rustc's LLVM major version
+# must be one bpf-linker can read: the pinned bpf-linker v0.10.4
+# (scripts/install-bpf-linker.sh) is built against LLVM 22, and nightlies moved
+# to LLVM 23 during the 1.99 cycle. nightly-2026-07-09 is rustc 1.99.0-nightly
+# (14cae6813) on LLVM 22.1.8, the toolchain generation of the first verified
+# build (2026-07-09). Move this and bpf-linker together.
 [toolchain]
-channel = "nightly"
+channel = "nightly-2026-07-09"
 components = ["rust-src"]
