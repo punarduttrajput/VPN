@@ -12,6 +12,7 @@ Run them in order: later steps reuse earlier builds.
 | 4 | Live relay traffic over the fast path, including the new rejections | SEC-018 XDP item (part 2) |
 | 5 | Real-TUN mesh over QUIC, and strict throughput | SEC-019 test-matrix item |
 | 6 | ≥ 10 Gbps relay on real hardware | NFR1 (Phase 6 FR1); needs hardware, see §6 |
+| 7 | Rolling relay deploy with real processes | anycast M3 (NFR-A6), netns |
 
 ## 1. Host
 
@@ -161,3 +162,65 @@ mode, so a benchmark can't silently measure the wrong path.
 
 **Pass:** ≥ 10 Gbps forwarded with `ferrum_relay_frames_forwarded_total`
 (userspace) flat. Record the NIC, driver, kernel, packet size and sender.
+
+## 7. Rolling relay deploy (anycast M3)
+
+The in-process test `rolling_relay_deploy_drops_no_session` already proves the
+logic. This runs the same roll with real processes and real TUN devices.
+Topology: the coordinator and both relays on a host bridge (`10.9.0.1`); two
+peers in netns `pa` (`10.9.0.2`) and `pb` (`10.9.0.3`). Peer-to-peer UDP is
+dropped, so the relay is the only path.
+
+```sh
+cargo build --release -p ferrum-cli -p ferrum-coordinator
+B=./target/release
+
+sudo ip link add br-roll type bridge && sudo ip addr add 10.9.0.1/24 dev br-roll && sudo ip link set br-roll up
+for i in 2 3; do n=$([ $i = 2 ] && echo pa || echo pb)
+  sudo ip netns add $n
+  sudo ip link add v-$n type veth peer name eth0 netns $n
+  sudo ip link set v-$n master br-roll up
+  sudo ip -n $n addr add 10.9.0.$i/24 dev eth0 && sudo ip -n $n link set eth0 up && sudo ip -n $n link set lo up
+done
+sudo ip netns exec pa nft add table inet roll
+sudo ip netns exec pa nft add chain inet roll out '{ type filter hook output priority 0; }'
+sudo ip netns exec pa nft add rule inet roll out ip daddr 10.9.0.3 udp dport 51820 drop
+sudo ip netns exec pb nft add table inet roll
+sudo ip netns exec pb nft add chain inet roll out '{ type filter hook output priority 0; }'
+sudo ip netns exec pb nft add rule inet roll out ip daddr 10.9.0.2 udp dport 51820 drop
+
+# Coordinator with no --relay, so the relay registry is on.
+$B/ferrum-coordinator --listen 10.9.0.1:50051 --insecure-no-auth > coord.log 2>&1 &
+$B/ferrum relay --listen 10.9.0.1:51821 --metrics-listen 10.9.0.1:9101 \
+  --coordinator http://10.9.0.1:50051 --advertise 10.9.0.1:51821 > relay-a.log 2>&1 &
+
+# Peer configs: private_key + listen_port 51820, no transport.relay (see
+# verify-linux.sh for the keygen/config pattern).
+sudo ip netns exec pa $B/ferrum up-mesh --config pa.toml --coordinator http://10.9.0.1:50051 \
+  --endpoint 10.9.0.2:51820 --name pa > pa.log 2>&1 &
+sudo ip netns exec pb $B/ferrum up-mesh --config pb.toml --coordinator http://10.9.0.1:50051 \
+  --endpoint 10.9.0.3:51820 --name pb > pb.log 2>&1 &
+sleep 5
+PB_TUN=$(sudo ip -n pb -4 -o addr show ferrum0 | awk '{print $4}' | cut -d/ -f1)
+sudo ip netns exec pa ping -D -i 0.05 "$PB_TUN" > ping.log &
+
+# The roll: start the replacement, then drain the old one.
+sleep 10
+$B/ferrum relay --listen 10.9.0.1:51822 --metrics-listen 10.9.0.1:9102 \
+  --coordinator http://10.9.0.1:50051 --advertise 10.9.0.1:51822 > relay-b.log 2>&1 &
+sleep 3
+kill -TERM %2          # relay A: drain + GoAway + goodbye, exits after --drain-grace (20 s)
+sleep 30
+sudo pkill -INT ping
+```
+
+**Pass:**
+- `ping.log` shows no gap over 3 s between replies, and only a few lost
+  (expect ≤ 10 at 20 per second).
+- `curl -s 10.9.0.1:9102/metrics` shows `ferrum_relay_clients_registered 2`,
+  and `ferrum_relay_frames_forwarded_total` keeps rising.
+- `relay-a.log` logs the drain with `goaway_sent=2`; `pa.log`/`pb.log` show one
+  session restart and no `Failed` state.
+
+Clean up with `sudo ip netns del pa; sudo ip netns del pb; sudo ip link del br-roll`
+and kill the background jobs. Record the loss count and longest gap in STATUS.md.

@@ -4,9 +4,9 @@
 |---|---|
 | **Product** | Ferrum (Rust) |
 | **Phase** | 6 of 6 — Scale & Acceleration (FR2 + FR3 drill-down) |
-| **Status** | M1 (health/readiness + relay graceful drain) and M2 (relay registry & dynamic advertisement) implemented and live-verified (2026-07-12); M3–M5 open |
+| **Status** | M1 (health/readiness + relay graceful drain) and M2 (relay registry & dynamic advertisement) implemented and live-verified (2026-07-12); M3 (GoAway + rolling relay deploy) implemented and verified in-process (2026-10-05; the netns run is in the Linux runbook); M4–M5 open |
 | **Owner** | punarduttrajput |
-| **Last updated** | 2026-07-12 |
+| **Last updated** | 2026-10-05 |
 | **Depends on** | [phase-6-scale-acceleration.md](phase-6-scale-acceleration.md) FR2/FR3/FR6; the Phase 4 relay (`RelayServer`, `crates/transport/src/relay.rs`); the Phase 3 coordinator (`ferrum-coordinator`) and its relay advertisement (`--relay` → `NetworkMapResponse.relay`); the Phase 6 FR4 metrics endpoints |
 
 ---
@@ -174,15 +174,37 @@ NFR.
   withdrawal push ≈ 3 ms.
 
 ### FR4 — Client drain handling & zero-drop rolling deploy (M3)
-- Optional relay→client `GOAWAY` frame (new wire tag `0x03`) sent to
-  registered clients when drain begins, so clients re-resolve their relay
-  *proactively* instead of riding the grace window down. Old clients ignore
-  unknown tags (verified — `RelayMeshTransport::recv_from` skips non-`Data`
-  frames), so the frame is backward-compatible.
-- Acceptance (netns bed, mirroring the XDP verification style): two meshed
-  peers relaying traffic; roll the relay (start replacement → drain old →
-  stop old) → **zero data-plane outage longer than the path machine's
-  failover time, zero dropped sessions**.
+- **Primary path (M2, unchanged):** the draining relay's goodbye withdraws it
+  from the coordinator's advertisement, the new map is pushed over
+  `WatchNetworkMap`, and the client session restarts onto the replacement.
+- **Fallback: a relay→client `GoAway` frame**, one byte, tag **`0x05`**
+  (`0x03`/`0x04` were already taken by the SEC challenge/response). The relay
+  sends it to every registered client when the drain starts
+  (`RelayServer::announce_goaway`, called by `ferrum relay` right after
+  `begin_drain`) and again in reply to any keepalive during the drain, in case
+  the first was lost. Only the relay's own address can deliver it. Clients
+  from before it ignore unknown tags, so it's backward-compatible.
+- **The client never restarts on the GoAway alone.** It re-reads the advertised
+  relay every 500 ms (for up to 30 s) and restarts only once the
+  advertisement names a *different* relay. Restarting earlier would rebuild
+  the session against the same draining relay, which refuses new
+  registrations. A failed lookup counts as "not yet". With a local
+  `transport.relay` override there's nothing to move to, so the GoAway is
+  only logged. This covers a missed watch push (a stream that was
+  reconnecting when the goodbye landed).
+- Acceptance: two meshed peers whose only path is the relay; roll it (start
+  replacement → drain old + GoAway + goodbye → stop old) → **no session
+  dropped, no outage longer than one supervised restart**.
+- **Verified in-process (2026-10-05)** by
+  `rolling_relay_deploy_drops_no_session` (`ferrum-client-core`,
+  `data-plane`): real relays, a real coordinator, two supervised sessions with
+  an unreachable direct endpoint, a numbered packet every 20 ms. Across the
+  roll: 1–2 packets lost, longest gap ≈ 65 ms (asserted < 3 s), the
+  replacement relay carries both clients, both supervisors stay Connected.
+  Unit tests cover the GoAway follow-up's safety rules (restart only on a
+  changed advertisement; never onto the same relay; failed lookups are "not
+  yet"; nothing before the GoAway). The real-process netns run is
+  [runbook §7](../docs/linux-verification-runbook.md#7-rolling-relay-deploy-anycast-m3).
 
 ### FR5 — Anycast/BGP health gate (M4)
 - Committed `deploy/anycast/` (bird2 config template + a health-gate unit
@@ -225,8 +247,10 @@ NFR.
    heartbeat RPC, TTL/sweeper withdrawal, stable selection, live watch push,
    client retarget-restart, < 90 s scale-out test + live two-relay
    handover run.
-3. **M3 — Client drain handling + rolling-deploy verification**: FR4;
-   `GOAWAY`, netns zero-drop roll.
+3. **M3 — Client drain handling + rolling-deploy verification** ✅
+   *(2026-10-05, in-process)*: FR4; GoAway (`0x05`) as a fallback to the
+   M2 goodbye, in-process zero-drop roll test; netns run in the Linux
+   runbook §7.
 4. **M4 — Anycast/BGP health gate**: FR5; `deploy/anycast/`, gate verified
    against a draining relay; BGP convergence documented as external.
 5. **M5 — Autoscaling policies + IaC**: FR6; templates + docs; cloud

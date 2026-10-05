@@ -111,6 +111,51 @@ async fn connect_relay(addr: &str, private_key_b64: &str) -> Result<RelayMeshTra
         .map_err(|e| Error::DataPlane(e.to_string()))
 }
 
+/// How often the session re-reads the advertised relay after a GoAway.
+const GOAWAY_RECHECK: Duration = Duration::from_millis(500);
+/// How long the session keeps re-reading it before leaving the restart to the
+/// watch stream and the relay's own shutdown (a dead relay fails the session).
+const GOAWAY_PATIENCE: Duration = Duration::from_secs(30);
+
+/// React to the session's relay saying it's draining (GoAway, PRD
+/// `phase-6-anycast-autoscaling.md` FR4): re-read the coordinator's advertised
+/// relay every `recheck` until it differs from `connected`, then fire
+/// `relay_changed` so the session restarts onto the replacement. It never
+/// restarts on the GoAway alone: the coordinator may not have moved the
+/// advertisement yet, and a session rebuilt against the same relay would be
+/// refused (a draining relay accepts no new clients). Gives up after
+/// `patience`; the watch stream remains the primary signal throughout.
+/// `advertised` returns `None` when the lookup fails, which counts as "not yet".
+async fn follow_goaway<F, Fut>(
+    goaway: Arc<tokio::sync::Notify>,
+    connected: Option<String>,
+    relay_changed: Arc<tokio::sync::Notify>,
+    recheck: Duration,
+    patience: Duration,
+    mut advertised: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Option<Option<String>>>,
+{
+    goaway.notified().await;
+    info!("relay is draining (goaway); looking for its replacement");
+    let deadline = tokio::time::Instant::now() + patience;
+    while tokio::time::Instant::now() < deadline {
+        match advertised().await {
+            Some(now) if now != connected => {
+                info!(
+                    has_relay = now.is_some(),
+                    "replacement relay advertised after goaway; session will restart"
+                );
+                relay_changed.notify_one();
+                return;
+            }
+            _ => tokio::time::sleep(recheck).await,
+        }
+    }
+    warn!("relay sent goaway but no replacement was advertised; staying on it");
+}
+
 /// Run the full client data plane until `shutdown` resolves.
 ///
 /// Registers `identity` with the coordinator (driving `client` to `Connected`),
@@ -223,12 +268,45 @@ where
         Some(addr) => Some(connect_relay(&addr, private_key_b64).await?),
         None => None,
     };
+    let goaway = relay.as_ref().map(RelayMeshTransport::goaway);
 
     let mut stream = control.watch(&identity.public_key).await?;
     let (tx, rx) = mpsc::channel::<Vec<MeshPeer>>(8);
     // Fired by the watcher when the advertised relay no longer matches the one
     // this session connected to; ends the mesh loop below.
     let relay_changed = Arc::new(tokio::sync::Notify::new());
+
+    // A GoAway from an advertised relay starts the replacement lookup; from a
+    // local override there's nothing to move to, so it's only logged.
+    let goaway_task = goaway.map(|goaway| match tracked_relay.clone() {
+        Some(connected) => {
+            let control = Arc::new(tokio::sync::Mutex::new(control));
+            let public_key = identity.public_key.clone();
+            tokio::spawn(follow_goaway(
+                goaway,
+                connected,
+                relay_changed.clone(),
+                GOAWAY_RECHECK,
+                GOAWAY_PATIENCE,
+                move || {
+                    let control = control.clone();
+                    let public_key = public_key.clone();
+                    async move {
+                        control
+                            .lock()
+                            .await
+                            .advertised_relay(&public_key)
+                            .await
+                            .ok()
+                    }
+                },
+            ))
+        }
+        None => tokio::spawn(async move {
+            goaway.notified().await;
+            warn!("relay is draining (goaway), but it's a local override; nothing to retarget");
+        }),
+    });
 
     let watch_client = client.clone();
     let priv_b64 = private_key_b64.to_string();
@@ -297,6 +375,9 @@ where
     .map_err(|e| Error::DataPlane(e.to_string()));
 
     watcher.abort();
+    if let Some(task) = goaway_task {
+        task.abort();
+    }
     client.disconnect();
     if result.is_ok() && retarget.load(std::sync::atomic::Ordering::Relaxed) {
         // A clean end we caused ourselves: report it as an error so the
@@ -943,6 +1024,357 @@ mod tests {
             "unexpected error: {err}"
         );
         assert_eq!(client.status(), ConnectionState::Disconnected);
+    }
+
+    /// Run `follow_goaway` against a scripted advertisement lookup (one entry
+    /// per call, the last repeating) after a GoAway that arrives at once.
+    /// Returns whether it fired a restart within `wait`, and how many lookups
+    /// it made.
+    async fn follow_goaway_with(
+        connected: Option<&str>,
+        script: Vec<Option<Option<&'static str>>>,
+        send_goaway: bool,
+        wait: Duration,
+    ) -> (bool, usize) {
+        let goaway = Arc::new(tokio::sync::Notify::new());
+        let changed = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        if send_goaway {
+            goaway.notify_one();
+        }
+        let task = {
+            let calls = calls.clone();
+            tokio::spawn(follow_goaway(
+                goaway,
+                connected.map(str::to_string),
+                changed.clone(),
+                Duration::from_millis(20),
+                Duration::from_millis(400),
+                move || {
+                    let n = calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let answer = script[n.min(script.len() - 1)];
+                    async move { answer.map(|relay| relay.map(str::to_string)) }
+                },
+            ))
+        };
+        let fired = tokio::time::timeout(wait, changed.notified()).await.is_ok();
+        task.abort();
+        (fired, calls.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// FR4: after a GoAway the session restarts as soon as the coordinator
+    /// advertises a different relay, not before.
+    #[tokio::test]
+    async fn goaway_restarts_once_the_advertisement_moves() {
+        let (fired, calls) = follow_goaway_with(
+            Some("10.0.0.1:3478"),
+            vec![
+                Some(Some("10.0.0.1:3478")),
+                Some(Some("10.0.0.1:3478")),
+                Some(Some("10.0.0.2:3478")),
+            ],
+            true,
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(fired, "no restart after the advertisement moved");
+        assert!(
+            calls >= 3,
+            "restarted before the advertisement moved ({calls} lookups)"
+        );
+    }
+
+    /// FR4 safety: a GoAway alone never restarts the session. If the
+    /// advertisement still names the draining relay, a rebuilt session would
+    /// re-register with it and be refused.
+    #[tokio::test]
+    async fn goaway_never_restarts_onto_the_same_relay() {
+        let (fired, _) = follow_goaway_with(
+            Some("10.0.0.1:3478"),
+            vec![Some(Some("10.0.0.1:3478"))],
+            true,
+            Duration::from_millis(700),
+        )
+        .await;
+        assert!(
+            !fired,
+            "restarted while the draining relay was still advertised"
+        );
+    }
+
+    /// A failed lookup counts as "not yet", not as a change.
+    #[tokio::test]
+    async fn goaway_treats_a_failed_lookup_as_no_change() {
+        let (fired, calls) = follow_goaway_with(
+            Some("10.0.0.1:3478"),
+            vec![None, None, Some(Some("10.0.0.2:3478"))],
+            true,
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(fired && calls >= 3, "fired={fired} after {calls} lookups");
+    }
+
+    /// Nothing happens until the relay actually sends a GoAway.
+    #[tokio::test]
+    async fn goaway_follow_up_waits_for_the_goaway() {
+        let (fired, calls) = follow_goaway_with(
+            Some("10.0.0.1:3478"),
+            vec![Some(Some("10.0.0.2:3478"))],
+            false,
+            Duration::from_millis(300),
+        )
+        .await;
+        assert!(
+            !fired && calls == 0,
+            "fired={fired} after {calls} lookups without a goaway"
+        );
+    }
+
+    /// A 20-byte IPv4 header from `src` to `dst` carrying a 4-byte sequence
+    /// number, so the receiver can tell which packets made it.
+    fn seq_packet(src: Ipv4Addr, dst: Ipv4Addr, seq: u32) -> Vec<u8> {
+        let mut p = vec![0u8; 24];
+        p[0] = 0x45;
+        p[3] = 24;
+        p[8] = 64;
+        p[12..16].copy_from_slice(&src.octets());
+        p[16..20].copy_from_slice(&dst.octets());
+        p[20..24].copy_from_slice(&seq.to_be_bytes());
+        p
+    }
+
+    /// Bind a relay on loopback and serve it; returns the server, its address
+    /// and the serve task (abort it to stop the relay).
+    async fn start_relay() -> (
+        Arc<ferrum_transport::RelayServer>,
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let server = Arc::new(
+            ferrum_transport::RelayServer::bind("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap(),
+        );
+        let addr = server.local_addr().unwrap();
+        let s = server.clone();
+        let task = tokio::spawn(async move {
+            let _ = s.serve().await;
+        });
+        (server, addr, task)
+    }
+
+    /// PRD `phase-6-anycast-autoscaling.md` FR4 / NFR-A6: a rolling relay deploy
+    /// (start the replacement, drain the old one, stop it) drops no session and
+    /// interrupts relayed traffic only for the length of a session restart.
+    ///
+    /// Two supervised mesh sessions whose only working path is the relay (each
+    /// registers an unreachable direct endpoint and no candidates) exchange a
+    /// numbered packet every 20 ms while relay A is rolled to relay B: B
+    /// heartbeats, A begins draining and sends its goodbye (so the coordinator
+    /// advertises B and both sessions restart onto it), then A stops.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rolling_relay_deploy_drops_no_session() {
+        const SEND_EVERY: Duration = Duration::from_millis(20);
+        // A session restart (watch push, re-register, relay challenge,
+        // WireGuard handshake over the new relay) has to fit in this.
+        const MAX_OUTAGE: Duration = Duration::from_secs(3);
+
+        let url = start_coordinator().await;
+        let (relay_a, addr_a, task_a) = start_relay().await;
+        let mut ctl = ControlClient::connect(url.clone()).await.unwrap();
+        ctl.relay_heartbeat(&addr_a.to_string(), false)
+            .await
+            .unwrap();
+
+        // Direct traffic goes to a socket nobody reads, so the relay is the
+        // only path.
+        let sink = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let unreachable = sink.local_addr().unwrap().to_string();
+        let policy = ReconnectPolicy {
+            max_retries: 0,
+            initial_backoff_ms: 10,
+            max_backoff_ms: 200,
+        };
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+
+        let spawn_node = |name: &'static str, tun: MockTun| {
+            let me = ferrum_core::keys::KeyPair::generate();
+            let client = FerrumClient::new();
+            let identity = ClientIdentity {
+                public_key: me.public_base64(),
+                name: name.into(),
+                endpoint: unreachable.clone(),
+                tags: vec![],
+            };
+            let c = client.clone();
+            let url = url.clone();
+            let mut stop = stop_rx.clone();
+            let handle = tokio::spawn(async move {
+                run_mesh_session_supervised(
+                    &c,
+                    &url,
+                    &identity,
+                    &me.private_base64(),
+                    &[],
+                    move || {
+                        let tun = tun.clone();
+                        async move { Ok::<_, Error>(tun) }
+                    },
+                    || async {
+                        let sock = UdpSocket::bind("127.0.0.1:0")
+                            .await
+                            .map_err(|e| Error::DataPlane(e.to_string()))?;
+                        Ok::<_, Error>(UdpMeshTransport::from_socket(sock))
+                    },
+                    None, // follow the coordinator's advertised relay
+                    &policy,
+                    async move {
+                        let _ = stop.wait_for(|s| *s).await;
+                    },
+                )
+                .await
+            });
+            (client, handle)
+        };
+        let (tun_x, tun_y) = (MockTun::default(), MockTun::default());
+        let (client_x, handle_x) = spawn_node("node-x", tun_x.clone());
+        let (client_y, handle_y) = spawn_node("node-y", tun_y.clone());
+
+        let ip_of =
+            |c: &FerrumClient| -> Option<Ipv4Addr> { c.address()?.split('/').next()?.parse().ok() };
+        wait_for(Duration::from_secs(10), || {
+            ip_of(&client_x).is_some() && ip_of(&client_y).is_some()
+        })
+        .await;
+        let (ip_x, ip_y) = (ip_of(&client_x).unwrap(), ip_of(&client_y).unwrap());
+
+        // X sends a numbered packet to Y every 20 ms for the whole test; a
+        // collector timestamps each one Y's TUN receives.
+        let sender = {
+            let tun_x = tun_x.clone();
+            tokio::spawn(async move {
+                for seq in 0u32..=u32::MAX {
+                    tun_x
+                        .to_runner
+                        .lock()
+                        .unwrap()
+                        .push_back(seq_packet(ip_x, ip_y, seq));
+                    tokio::time::sleep(SEND_EVERY).await;
+                }
+            })
+        };
+        let arrivals = Arc::new(Mutex::new(Vec::<(std::time::Instant, u32)>::new()));
+        let collector = {
+            let tun_y = tun_y.clone();
+            let arrivals = arrivals.clone();
+            tokio::spawn(async move {
+                loop {
+                    let got: Vec<Vec<u8>> = tun_y.from_runner.lock().unwrap().drain(..).collect();
+                    let now = std::time::Instant::now();
+                    arrivals.lock().unwrap().extend(
+                        got.iter()
+                            .filter(|p| p.len() == 24)
+                            .map(|p| (now, u32::from_be_bytes([p[20], p[21], p[22], p[23]]))),
+                    );
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+        };
+        let received = || arrivals.lock().unwrap().len();
+
+        // Traffic flows over relay A.
+        wait_for(Duration::from_secs(10), || received() >= 10).await;
+        assert!(received() >= 10, "no relayed traffic over relay A");
+
+        // Roll: the replacement joins (A stays advertised: earliest-joined)...
+        let (relay_b, addr_b, task_b) = start_relay().await;
+        ctl.relay_heartbeat(&addr_b.to_string(), false)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // ...A drains (refuses new clients) and says goodbye, so B is
+        // advertised and both sessions restart onto it...
+        // (As `ferrum relay` does: drain, GoAway to its clients, goodbye.)
+        relay_a.begin_drain();
+        relay_a.announce_goaway().await;
+        ctl.relay_heartbeat(&addr_a.to_string(), true)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        // ...then A goes away.
+        task_a.abort();
+        drop(relay_a);
+        let a_stopped = std::time::Instant::now();
+        let before_stop = received();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let t = arrivals.lock().unwrap().clone();
+        let after_stop = t.len() - before_stop;
+        let max_gap = t
+            .windows(2)
+            .map(|w| w[1].0 - w[0].0)
+            .max()
+            .unwrap_or_default();
+        // Losses: sequence numbers missing between the first and last arrival
+        // (the TUN sleep granularity varies by OS, so count sequence numbers
+        // rather than assuming a send rate).
+        let mut seqs: Vec<u32> = t.iter().map(|&(_, s)| s).collect();
+        seqs.sort_unstable();
+        seqs.dedup();
+        let span = seqs.last().unwrap() - seqs.first().unwrap() + 1;
+        let lost = span as usize - seqs.len();
+        eprintln!(
+            "rolling deploy: {} packets received ({lost} of {span} lost), {after_stop} after relay A stopped, longest gap {max_gap:?}",
+            t.len()
+        );
+        assert!(
+            after_stop >= 30,
+            "traffic didn't keep flowing after relay A stopped ({after_stop} packets)"
+        );
+        assert!(
+            t.last().is_some_and(|(last, _)| *last > a_stopped),
+            "nothing arrived after relay A stopped"
+        );
+        assert!(
+            max_gap < MAX_OUTAGE,
+            "relayed traffic stopped for {max_gap:?} during the roll"
+        );
+        // At most a restart's worth of packets lost (two sessions restart).
+        let budget = (2 * MAX_OUTAGE.as_millis() / SEND_EVERY.as_millis()) as usize;
+        assert!(
+            lost <= budget,
+            "{lost} packets lost during the roll (budget {budget})"
+        );
+        // The traffic really moved to relay B: both nodes registered there and
+        // it forwarded their frames.
+        let b = relay_b.metrics().render();
+        assert!(b.contains("ferrum_relay_clients_registered 2\n"), "{b}");
+        let forwarded_b: u64 = b
+            .lines()
+            .find_map(|l| l.strip_prefix("ferrum_relay_frames_forwarded_total "))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0);
+        assert!(
+            forwarded_b >= 30,
+            "relay B forwarded only {forwarded_b} frames\n{b}"
+        );
+        // Zero dropped sessions: both supervisors still running and connected.
+        assert!(!handle_x.is_finished() && !handle_y.is_finished());
+        assert_eq!(client_x.status(), ConnectionState::Connected);
+        assert_eq!(client_y.status(), ConnectionState::Connected);
+
+        sender.abort();
+        collector.abort();
+        task_b.abort();
+        let _ = stop_tx.send(true);
+        for h in [handle_x, handle_y] {
+            let r = tokio::time::timeout(Duration::from_secs(5), h)
+                .await
+                .expect("supervisor did not stop")
+                .expect("supervisor task panicked");
+            assert!(r.is_ok(), "supervisor returned {r:?}");
+        }
     }
 
     /// The supervisor retries a failing data-plane build with backoff and reaches

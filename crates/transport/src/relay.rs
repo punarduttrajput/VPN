@@ -29,6 +29,12 @@
 //!     sender's key by its source address, finds the destination's address by its
 //!     key, and forwards `0x02 || src_key || payload`. Data is the only frame the
 //!     XDP fast path touches; every control frame falls through to userspace.
+//!   * **GoAway** — `0x05`, relay→client: "I'm draining; find another relay."
+//!     Sent to every registered client when the drain starts
+//!     ([`RelayServer::announce_goaway`]) and in reply to any keepalive during
+//!     the drain, in case the first one was lost (PRD
+//!     `phase-6-anycast-autoscaling.md` FR4). Only the relay's own address can
+//!     deliver it. Clients from before it ignore unknown tags.
 //!
 //! The relay never sees plaintext: `payload` is an opaque WireGuard datagram, so
 //! the relay is an untrusted forwarder (it learns who talks to whom and when, but
@@ -66,6 +72,8 @@ const TAG_DATA: u8 = 0x02;
 const TAG_CHALLENGE: u8 = 0x03;
 /// Frame tag: a client's answer to a challenge (client→relay).
 const TAG_RESPONSE: u8 = 0x04;
+/// Frame tag: the relay is draining (relay→client). A one-byte frame.
+const TAG_GOAWAY: u8 = 0x05;
 /// Register frame: tag + key + zero-filled reserved tail (see the module doc).
 const REGISTER_LEN: usize = 1 + KEY_LEN + 32;
 /// Challenge frame: tag + relay X25519 public key + cookie.
@@ -555,6 +563,30 @@ impl RelayServer {
         self.draining.load(Ordering::Relaxed)
     }
 
+    /// Send a GoAway frame to every registered client (call it right after
+    /// [`begin_drain`](Self::begin_drain)), so they look for another relay
+    /// before the drain window ends rather than riding it down. Best-effort:
+    /// a client that misses it gets another reply to its next keepalive.
+    /// Returns how many clients it was sent to.
+    pub async fn announce_goaway(&self) -> usize {
+        let addrs: Vec<SocketAddr> = self
+            .clients
+            .lock()
+            .expect("relay table poisoned")
+            .by_addr
+            .keys()
+            .copied()
+            .collect();
+        let mut sent = 0;
+        for addr in addrs {
+            match self.socket.send_to(&[TAG_GOAWAY], addr).await {
+                Ok(_) => sent += 1,
+                Err(e) => debug!(%addr, "relay goaway send failed: {e}"),
+            }
+        }
+        sent
+    }
+
     /// How a register/response for `key` from `from` should be treated, given
     /// the live table and the drain state.
     fn admit(&self, key: PublicKey, from: SocketAddr) -> Admit {
@@ -628,7 +660,16 @@ impl RelayServer {
                     key.copy_from_slice(&frame[1..1 + KEY_LEN]);
                     match self.admit(key, from) {
                         // Keepalive for the live mapping: refresh, no challenge.
-                        Admit::Refresh => self.commit(key, from),
+                        // While draining, also repeat the GoAway in case the
+                        // announcement was lost.
+                        Admit::Refresh => {
+                            self.commit(key, from);
+                            if self.is_draining() {
+                                if let Err(e) = self.socket.send_to(&[TAG_GOAWAY], from).await {
+                                    debug!(%from, "relay goaway send failed: {e}");
+                                }
+                            }
+                        }
                         Admit::Refused => {}
                         Admit::Challenge => {
                             if !self.allow_ip(from) {
@@ -742,6 +783,8 @@ pub struct RelayMeshTransport {
     recv_buf: tokio::sync::Mutex<Vec<u8>>,
     peers: Arc<Mutex<PeerMap>>,
     keepalive: tokio::task::JoinHandle<()>,
+    /// Signalled when the relay sends GoAway (it's draining).
+    goaway: Arc<tokio::sync::Notify>,
 }
 
 /// How long after sending a Register the client will answer a challenge.
@@ -864,7 +907,15 @@ impl RelayMeshTransport {
             recv_buf: tokio::sync::Mutex::new(vec![0u8; FRAME_BUF]),
             peers: Arc::new(Mutex::new(map)),
             keepalive,
+            goaway: Arc::new(tokio::sync::Notify::new()),
         })
+    }
+
+    /// Signalled (`notify_one`, so a GoAway received before anyone waits is
+    /// kept) when the relay says it's draining. The data-plane session uses it
+    /// to look for the relay's replacement; see `ferrum-client-core`.
+    pub fn goaway(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.goaway)
     }
 
     /// Replace the known peer set (e.g. on a live network-map update).
@@ -936,6 +987,11 @@ impl MeshTransport for RelayMeshTransport {
                         warn!("relay challenge response failed: {e}");
                     }
                 }
+                continue;
+            }
+            if frame.first() == Some(&TAG_GOAWAY) && n == 1 {
+                debug!(relay = %self.relay, "relay is draining (goaway)");
+                self.goaway.notify_one();
                 continue;
             }
             if frame.first() != Some(&TAG_DATA) || n < DATA_HEADER {
@@ -1566,5 +1622,85 @@ mod tests {
         // Destination key 0x99 never registered: the relay drops it. We just
         // assert the send path doesn't error.
         a.send_to(handle_ghost, b"into the void").await.unwrap();
+    }
+
+    /// Receive one datagram on `sock` within `ms`, or `None`.
+    async fn recv_within(sock: &UdpSocket, ms: u64) -> Option<Vec<u8>> {
+        let mut buf = [0u8; 256];
+        match tokio::time::timeout(Duration::from_millis(ms), sock.recv_from(&mut buf)).await {
+            Ok(Ok((n, _))) => Some(buf[..n].to_vec()),
+            _ => None,
+        }
+    }
+
+    /// FR4: when the drain starts, every registered client gets a GoAway.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_announces_goaway_to_registered_clients() {
+        let server = start_server().await;
+        let relay = server.local_addr().unwrap();
+        let metrics = server.metrics();
+        let ((s1, _), (s2, _)) = (ident(11), ident(12));
+        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        register(&a, relay, &s1).await;
+        register(&b, relay, &s2).await;
+        wait_for(&metrics, "ferrum_relay_clients_registered 2\n").await;
+
+        server.begin_drain();
+        assert_eq!(server.announce_goaway().await, 2);
+        assert_eq!(recv_within(&a, 1000).await, Some(vec![TAG_GOAWAY]));
+        assert_eq!(recv_within(&b, 1000).await, Some(vec![TAG_GOAWAY]));
+    }
+
+    /// FR4: a keepalive during the drain is answered with a GoAway (covering a
+    /// lost announcement); outside a drain it gets no reply at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn keepalive_during_drain_is_answered_with_goaway() {
+        let server = start_server().await;
+        let relay = server.local_addr().unwrap();
+        let (s1, k1) = ident(13);
+        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        register(&a, relay, &s1).await;
+
+        a.send_to(&register_frame(&k1), relay).await.unwrap();
+        assert_eq!(
+            recv_within(&a, 300).await,
+            None,
+            "keepalive answered outside a drain"
+        );
+
+        server.begin_drain();
+        a.send_to(&register_frame(&k1), relay).await.unwrap();
+        assert_eq!(recv_within(&a, 1000).await, Some(vec![TAG_GOAWAY]));
+    }
+
+    /// FR4: the client transport signals its GoAway notifier when the relay
+    /// announces a drain, and keeps working as a transport.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_transport_signals_goaway() {
+        let server = start_server().await;
+        let relay = server.local_addr().unwrap();
+        let metrics = server.metrics();
+        let (s1, _) = ident(14);
+        let t = Arc::new(RelayMeshTransport::connect(relay, &s1, &[]).await.unwrap());
+        wait_for(&metrics, "ferrum_relay_clients_registered 1\n").await;
+        let goaway = t.goaway();
+
+        // The mesh loop is what reads the socket; stand in for it.
+        let reader = {
+            let t = t.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                loop {
+                    let _ = t.recv_from(&mut buf).await;
+                }
+            })
+        };
+        server.begin_drain();
+        assert_eq!(server.announce_goaway().await, 1);
+        tokio::time::timeout(Duration::from_secs(2), goaway.notified())
+            .await
+            .expect("the client never saw the relay's goaway");
+        reader.abort();
     }
 }
