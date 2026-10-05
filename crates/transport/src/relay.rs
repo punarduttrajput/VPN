@@ -108,6 +108,14 @@ const FRAME_BUF: usize = DATA_HEADER + 65_600;
 /// How often a connected client re-announces itself, to keep its NAT mapping
 /// (and the relay's `addr -> key` record) fresh.
 const KEEPALIVE: Duration = Duration::from_secs(25);
+/// The keepalive period for [`GOAWAY_HURRY`] after a GoAway. Behind an
+/// anycast address the next keepalive is what registers the client with the
+/// PoP the route moves to, so it shouldn't be 25 s away (PRD
+/// `phase-6-anycast-autoscaling.md` FR5). Refreshes cost the relay no
+/// rate-limit budget.
+const GOAWAY_KEEPALIVE: Duration = Duration::from_secs(1);
+/// How long the client keeps the fast keepalive after the last GoAway.
+const GOAWAY_HURRY: Duration = Duration::from_secs(30);
 /// How long [`RelayMeshTransport::connect`] waits for the register challenge —
 /// a relay RTT is far below this; past it the challenge is answered on receive.
 pub const CONNECT_HANDSHAKE: Duration = Duration::from_millis(500);
@@ -785,6 +793,8 @@ pub struct RelayMeshTransport {
     keepalive: tokio::task::JoinHandle<()>,
     /// Signalled when the relay sends GoAway (it's draining).
     goaway: Arc<tokio::sync::Notify>,
+    /// Also signalled on GoAway: switches the keepalive to [`GOAWAY_KEEPALIVE`].
+    hurry: Arc<tokio::sync::Notify>,
 }
 
 /// How long after sending a Register the client will answer a challenge.
@@ -880,15 +890,30 @@ impl RelayMeshTransport {
             debug!(%relay, "relay sent no register challenge yet; will answer it on receive");
         }
 
-        // Keepalive: re-register periodically to refresh the NAT mapping.
+        // Keepalive: re-register periodically to refresh the NAT mapping, and
+        // every GOAWAY_KEEPALIVE for a while after a GoAway. A GoAway only
+        // starts the fast period; it never sends at once, since the draining
+        // relay answers each keepalive with another GoAway.
         let ka_socket = Arc::clone(&socket);
         let ka_gate = Arc::clone(&gate);
+        let hurry = Arc::new(tokio::sync::Notify::new());
+        let ka_hurry = Arc::clone(&hurry);
         let keepalive = tokio::spawn(async move {
             let frame = register_frame(&self_key);
-            let mut tick = tokio::time::interval(KEEPALIVE);
-            tick.tick().await; // consume the immediate first tick (already sent)
+            let mut fast_until: Option<Instant> = None;
             loop {
-                tick.tick().await;
+                let period = if fast_until.is_some_and(|t| Instant::now() < t) {
+                    GOAWAY_KEEPALIVE
+                } else {
+                    KEEPALIVE
+                };
+                tokio::select! {
+                    _ = tokio::time::sleep(period) => {}
+                    _ = ka_hurry.notified() => {
+                        fast_until = Some(Instant::now() + GOAWAY_HURRY);
+                        continue;
+                    }
+                }
                 ka_gate
                     .lock()
                     .expect("relay challenge gate poisoned")
@@ -908,6 +933,7 @@ impl RelayMeshTransport {
             peers: Arc::new(Mutex::new(map)),
             keepalive,
             goaway: Arc::new(tokio::sync::Notify::new()),
+            hurry,
         })
     }
 
@@ -992,6 +1018,7 @@ impl MeshTransport for RelayMeshTransport {
             if frame.first() == Some(&TAG_GOAWAY) && n == 1 {
                 debug!(relay = %self.relay, "relay is draining (goaway)");
                 self.goaway.notify_one();
+                self.hurry.notify_one();
                 continue;
             }
             if frame.first() != Some(&TAG_DATA) || n < DATA_HEADER {
@@ -1701,6 +1728,47 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), goaway.notified())
             .await
             .expect("the client never saw the relay's goaway");
+        reader.abort();
+    }
+
+    /// FR5: after a GoAway the client re-registers every second instead of
+    /// every 25 s, so behind an anycast address it registers with the next
+    /// PoP soon after the route moves.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn goaway_speeds_up_the_keepalive() {
+        let server = start_server().await;
+        let relay = server.local_addr().unwrap();
+        let metrics = server.metrics();
+        let (s1, _) = ident(15);
+        let t = Arc::new(RelayMeshTransport::connect(relay, &s1, &[]).await.unwrap());
+        wait_for(
+            &metrics,
+            "ferrum_relay_clients_registered 1
+",
+        )
+        .await;
+        let reader = {
+            let t = t.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                loop {
+                    let _ = t.recv_from(&mut buf).await;
+                }
+            })
+        };
+        // Without a GoAway, no keepalive inside 3 s.
+        let before = metric(&metrics, "ferrum_relay_registers_total");
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert_eq!(metric(&metrics, "ferrum_relay_registers_total"), before);
+
+        server.begin_drain();
+        assert_eq!(server.announce_goaway().await, 1);
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+        let refreshed = metric(&metrics, "ferrum_relay_registers_total") - before;
+        assert!(
+            (2..=5).contains(&refreshed),
+            "{refreshed} keepalives in 3.5 s after a goaway"
+        );
         reader.abort();
     }
 }

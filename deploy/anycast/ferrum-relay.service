@@ -1,0 +1,34 @@
+[Unit]
+Description=Ferrum relay on the anycast address
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Bind the anycast address itself, not 0.0.0.0: replies must come from the
+# address clients sent to, or their transport drops them (see README.md).
+# No --coordinator/--advertise: with anycast the coordinator advertises the
+# anycast address statically (`ferrum-coordinator --relay 192.0.2.10:51821`).
+ExecStart=/usr/local/bin/ferrum relay \
+    --listen 192.0.2.10:51821 \
+    --metrics-listen 127.0.0.1:9101 \
+    --drain-grace 20
+# SIGTERM starts the drain; give it the grace window plus some slack before
+# systemd escalates to SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=2
+
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

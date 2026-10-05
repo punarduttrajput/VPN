@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing::info;
 
+mod anycast_gate;
 mod telemetry;
 
 use ferrum_client_core::data_plane::run_mesh_session_supervised;
@@ -104,6 +105,37 @@ enum Command {
         /// fall back to `skb`.
         #[arg(long, value_enum, default_value_t = XdpModeArg::Skb)]
         xdp_mode: XdpModeArg,
+    },
+    /// Announce this relay's anycast route through bird2 only while the relay
+    /// is ready (PRD `phase-6-anycast-autoscaling.md` FR5). Polls the relay's
+    /// `/readyz` and runs `birdc enable|disable` on the static protocol(s)
+    /// carrying the route: announce after `--rise` ready probes, withdraw at
+    /// once when the relay drains, or after `--fall` failed probes. Withdraws
+    /// on start and on exit. See `deploy/anycast/`.
+    AnycastGate {
+        /// The relay's readiness URL (plain HTTP, explicit port).
+        #[arg(long, default_value = "http://127.0.0.1:9101/readyz")]
+        readyz: String,
+        /// bird2 protocol carrying the anycast route (repeatable, e.g. one
+        /// per address family).
+        #[arg(long = "protocol", required = true)]
+        protocols: Vec<String>,
+        /// Path to `birdc`.
+        #[arg(long, default_value = "birdc")]
+        birdc: String,
+        /// Milliseconds between probes.
+        #[arg(long, default_value_t = 2000)]
+        interval_ms: u64,
+        /// Milliseconds a probe may take before it counts as failed.
+        #[arg(long, default_value_t = 1000)]
+        timeout_ms: u64,
+        /// Ready probes in a row before the route is announced.
+        #[arg(long, default_value_t = 3)]
+        rise: u32,
+        /// Failed probes in a row before the route is withdrawn (a draining
+        /// relay is withdrawn at once).
+        #[arg(long, default_value_t = 3)]
+        fall: u32,
     },
     /// Print the pin (SHA-256 of the public key) of the QUIC/MASQUE TLS certificate this
     /// node presents (derived from the config's `private_key`, so it's stable
@@ -207,6 +239,36 @@ fn main() -> Result<()> {
                 xdp_program.as_deref(),
                 xdp_mode,
             )),
+        Command::AnycastGate {
+            readyz,
+            protocols,
+            birdc,
+            interval_ms,
+            timeout_ms,
+            rise,
+            fall,
+        } => {
+            let target = anycast_gate::Target::parse(&readyz)?;
+            let timing = anycast_gate::Timing {
+                interval: std::time::Duration::from_millis(interval_ms.max(1)),
+                timeout: std::time::Duration::from_millis(timeout_ms.max(1)),
+                rise,
+                fall,
+                resync: std::time::Duration::from_secs(30),
+            };
+            let mut route = anycast_gate::Birdc { birdc, protocols };
+            info!(%readyz, "anycast gate running (Ctrl-C to stop)");
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(anycast_gate::run(
+                    &target,
+                    &mut route,
+                    timing,
+                    shutdown_signal(),
+                ));
+            Ok(())
+        }
         #[cfg(any(feature = "quic", feature = "masque"))]
         Command::TlsFingerprint { config } => tls_fingerprint(&config),
         Command::Up { config, iface, mtu } => tokio::runtime::Builder::new_multi_thread()
@@ -1230,5 +1292,36 @@ mod tests {
             XdpModeArg::Native
         );
         assert!(relay_mode(&["--xdp-mode", "hardware"]).is_err());
+    }
+
+    /// `anycast-gate` needs at least one `--protocol`, and defaults to the
+    /// PRD's 2 s × 3 timing against the local relay's probe port.
+    #[test]
+    fn anycast_gate_flags() {
+        assert!(Cli::try_parse_from(["ferrum", "anycast-gate"]).is_err());
+        let cli = Cli::try_parse_from([
+            "ferrum",
+            "anycast-gate",
+            "--protocol",
+            "ferrum_anycast4",
+            "--protocol",
+            "ferrum_anycast6",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::AnycastGate {
+                readyz,
+                protocols,
+                interval_ms,
+                rise,
+                fall,
+                ..
+            } => {
+                assert_eq!(readyz, "http://127.0.0.1:9101/readyz");
+                assert_eq!(protocols, ["ferrum_anycast4", "ferrum_anycast6"]);
+                assert_eq!((interval_ms, rise, fall), (2000, 3, 3));
+            }
+            _ => unreachable!("parsed an anycast-gate command"),
+        }
     }
 }

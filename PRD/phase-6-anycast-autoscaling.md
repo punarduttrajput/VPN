@@ -4,7 +4,7 @@
 |---|---|
 | **Product** | Ferrum (Rust) |
 | **Phase** | 6 of 6 — Scale & Acceleration (FR2 + FR3 drill-down) |
-| **Status** | M1 (health/readiness + relay graceful drain) and M2 (relay registry & dynamic advertisement) implemented and live-verified (2026-07-12); M3 (GoAway + rolling relay deploy) implemented and verified in-process (2026-10-05; the netns run is in the Linux runbook); M4–M5 open |
+| **Status** | M1 (health/readiness + relay graceful drain) and M2 (relay registry & dynamic advertisement) implemented and live-verified (2026-07-12); M3 (GoAway + rolling relay deploy) and M4 (anycast health gate) implemented and verified in-process (2026-10-05; the netns and bird runs are in the Linux runbook); M5 open |
 | **Owner** | punarduttrajput |
 | **Last updated** | 2026-10-05 |
 | **Depends on** | [phase-6-scale-acceleration.md](phase-6-scale-acceleration.md) FR2/FR3/FR6; the Phase 4 relay (`RelayServer`, `crates/transport/src/relay.rs`); the Phase 3 coordinator (`ferrum-coordinator`) and its relay advertisement (`--relay` → `NetworkMapResponse.relay`); the Phase 6 FR4 metrics endpoints |
@@ -214,6 +214,28 @@ NFR.
   against a real draining relay. **External (documented, not claimed):**
   real BGP announcement/withdrawal convergence and the parent NFR2
   (< 20 ms RTT for 90% of users) — needs a provider and a fleet.
+- **As built (2026-10-05):** the gate is a `ferrum anycast-gate`
+  subcommand (`crates/cli/src/anycast_gate.rs`), not a script, so it's
+  tested against a real relay in-process. It runs `birdc enable|disable` on
+  the static protocols carrying the prefix (they start `disabled yes`):
+  announce after 3 ready probes 2 s apart, withdraw **at once on a 503**,
+  after 3 failed probes, on start and on exit (a systemd `ExecStopPost`
+  covers a crash). A `birdc` reply must confirm the new state; failures are
+  retried, and the decision is re-applied every 30 s because a restarted
+  bird comes back disabled. Files: `bird.conf`, `ferrum-relay.service`,
+  `ferrum-anycast-gate.service`, `README.md`.
+- **Anycast relays don't heartbeat to the coordinator.** The relay registry
+  (FR3) is keyed by address, so every PoP would share one entry and one
+  PoP's drain goodbye would withdraw it for all. With anycast the
+  coordinator advertises the anycast address statically (`--relay`) and BGP
+  does the steering.
+- **Faster re-registration after a GoAway.** Behind an anycast address, a
+  client whose traffic moves to another PoP isn't registered there until its
+  next keepalive, up to 25 s later. After a GoAway the client now
+  re-registers every 1 s for 30 s (`GOAWAY_KEEPALIVE`), so it's registered
+  at the next PoP about a second after the route moves. Refreshes cost the
+  relay no rate-limit budget. The relay must also bind the anycast address
+  itself, so replies come from the address clients sent to.
 
 ### FR6 — Autoscaling policies & IaC (M5)
 - Scaling signals from existing metrics (`ferrum_relay_clients_registered`,
@@ -251,8 +273,10 @@ NFR.
    *(2026-10-05, in-process)*: FR4; GoAway (`0x05`) as a fallback to the
    M2 goodbye, in-process zero-drop roll test; netns run in the Linux
    runbook §7.
-4. **M4 — Anycast/BGP health gate**: FR5; `deploy/anycast/`, gate verified
-   against a draining relay; BGP convergence documented as external.
+4. **M4 — Anycast/BGP health gate** ✅ *(2026-10-05, in-process)*: FR5;
+   `deploy/anycast/` + `ferrum anycast-gate`, gate verified against a real
+   draining relay; the real-bird run is in the Linux runbook §8; BGP
+   convergence documented as external.
 5. **M5 — Autoscaling policies + IaC**: FR6; templates + docs; cloud
    verification external.
 

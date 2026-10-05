@@ -13,6 +13,7 @@ Run them in order: later steps reuse earlier builds.
 | 5 | Real-TUN mesh over QUIC, and strict throughput | SEC-019 test-matrix item |
 | 6 | ≥ 10 Gbps relay on real hardware | NFR1 (Phase 6 FR1); needs hardware, see §6 |
 | 7 | Rolling relay deploy with real processes | anycast M3 (NFR-A6), netns |
+| 8 | Anycast gate driving a real bird over BGP | anycast M4, netns |
 
 ## 1. Host
 
@@ -224,3 +225,63 @@ sudo pkill -INT ping
 
 Clean up with `sudo ip netns del pa; sudo ip netns del pb; sudo ip link del br-roll`
 and kill the background jobs. Record the loss count and longest gap in STATUS.md.
+
+## 8. Anycast gate with a real bird (anycast M4)
+
+The gate is tested in-process against a real relay with a stub `birdc`. This
+checks the committed bird config and the gate against real bird2 daemons: a
+"PoP" announces the anycast prefix to an "ISP" over BGP in two netns.
+
+```sh
+sudo apt install bird2
+bird -p -c deploy/anycast/bird.conf          # the committed config parses as-is
+
+sudo ip netns add pop && sudo ip netns add isp
+sudo ip link add v-pop netns pop type veth peer name v-isp netns isp
+sudo ip -n pop addr add 10.10.0.1/24 dev v-pop && sudo ip -n pop link set v-pop up && sudo ip -n pop link set lo up
+sudo ip -n isp addr add 10.10.0.2/24 dev v-isp && sudo ip -n isp link set v-isp up
+sudo ip -n pop addr add 192.0.2.10/32 dev lo
+
+cat > pop.conf <<'EOF'
+router id 10.10.0.1;
+protocol device {}
+protocol static ferrum_anycast4 { disabled yes; ipv4; route 192.0.2.0/24 blackhole; }
+protocol bgp upstream4 {
+    local 10.10.0.1 as 64512; neighbor 10.10.0.2 as 64496;
+    ipv4 { import none; export where proto = "ferrum_anycast4"; };
+}
+EOF
+cat > isp.conf <<'EOF'
+router id 10.10.0.2;
+protocol device {}
+protocol bgp pop {
+    local 10.10.0.2 as 64496; neighbor 10.10.0.1 as 64512;
+    ipv4 { import all; export none; };
+}
+EOF
+sudo ip netns exec pop bird -c pop.conf -s /run/bird-pop.ctl
+sudo ip netns exec isp bird -c isp.conf -s /run/bird-isp.ctl
+printf '#!/bin/sh\nexec birdc -s /run/bird-pop.ctl "$@"\n' > birdc-pop && chmod +x birdc-pop
+
+B=./target/release/ferrum
+sudo ip netns exec pop $B relay --listen 192.0.2.10:51821 --metrics-listen 127.0.0.1:9101 --drain-grace 20 &
+sudo ip netns exec pop $B anycast-gate --protocol ferrum_anycast4 --birdc ./birdc-pop &
+watch -n 0.5 sudo birdc -s /run/bird-isp.ctl show route 192.0.2.0/24
+```
+
+Then, in another shell:
+
+1. Wait for the route to appear on the ISP: about 6 s after the gate starts
+   (3 ready probes, 2 s apart).
+2. `sudo pkill -TERM -f 'ferrum relay'`: the route disappears within about
+   2 s, while the relay keeps running for the 20 s grace.
+3. Start the relay again: the route comes back after about 6 s.
+4. `sudo pkill -TERM -f 'anycast-gate'`: the route disappears (the gate
+   withdraws on exit).
+5. Restart the gate, wait for the route, then
+   `sudo birdc -s /run/bird-pop.ctl down` and start bird again in `pop`: the
+   route returns within 30 s without touching the gate (the resync).
+
+**Pass:** each step behaves as described. Record the times in STATUS.md.
+Clean up with `sudo birdc -s /run/bird-pop.ctl down; sudo birdc -s
+/run/bird-isp.ctl down; sudo ip netns del pop; sudo ip netns del isp`.
