@@ -236,11 +236,12 @@ NFR.
   at the next PoP about a second after the route moves. Refreshes cost the
   relay no rate-limit budget. The relay must also bind the anycast address
   itself, so replies come from the address clients sent to.
-- **Open: multi-PoP needs relay-to-relay forwarding.** A relay forwards only
-  between clients registered on itself, so peers on different PoPs can't
-  relay to each other. Until the relay mesh lands, anycast is correct only
-  with one ready PoP (active/standby). The same limit applies to any
-  horizontally scaled relay pool (M5), which is why the mesh comes first.
+- **Multi-PoP needs relay-to-relay forwarding.** A relay forwards only
+  between clients registered on itself, so peers on different PoPs couldn't
+  relay to each other. The relay mesh ([relay-mesh.md](relay-mesh.md), M1
+  2026-10-05) fixes that with static membership: mesh the PoPs and several
+  can be ready at once. Without the mesh, anycast is correct only with one
+  ready PoP (active/standby). The same applies to a scaled-out pool (M5).
 
 ### FR6 — Autoscaling policies & IaC (M5)
 - Scaling signals from existing metrics (`ferrum_relay_clients_registered`,

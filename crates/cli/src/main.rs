@@ -105,6 +105,19 @@ enum Command {
         /// fall back to `skb`.
         #[arg(long, value_enum, default_value_t = XdpModeArg::Skb)]
         xdp_mode: XdpModeArg,
+        /// This relay's mesh listener (`ip:port`, on a network its sibling
+        /// relays can reach): frames for a client registered on a sibling are
+        /// forwarded to it (PRD `relay-mesh.md`). Requires `--mesh-key-file`.
+        #[arg(long, requires = "mesh_key_file")]
+        mesh_listen: Option<String>,
+        /// A sibling relay's mesh listener (repeatable).
+        #[arg(long = "mesh-peer", requires = "mesh_listen")]
+        mesh_peers: Vec<String>,
+        /// File holding the deployment's mesh key (32 bytes, base64; e.g.
+        /// `head -c 32 /dev/urandom | base64`). Every relay in the mesh uses the
+        /// same one. Read from a file to keep it out of the process list.
+        #[arg(long, requires = "mesh_listen")]
+        mesh_key_file: Option<String>,
     },
     /// Announce this relay's anycast route through bird2 only while the relay
     /// is ready (PRD `phase-6-anycast-autoscaling.md` FR5). Polls the relay's
@@ -224,21 +237,32 @@ fn main() -> Result<()> {
             xdp_iface,
             xdp_program,
             xdp_mode,
-        } => tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()?
-            .block_on(relay(
-                &listen,
-                metrics_listen.as_deref(),
-                drain_grace,
-                coordinator.as_deref(),
-                advertise.as_deref(),
-                token_file.as_deref(),
-                otlp_endpoint.as_deref(),
-                xdp_iface.as_deref(),
-                xdp_program.as_deref(),
-                xdp_mode,
-            )),
+            mesh_listen,
+            mesh_peers,
+            mesh_key_file,
+        } => {
+            let mesh = mesh_config(
+                mesh_listen.as_deref(),
+                &mesh_peers,
+                mesh_key_file.as_deref(),
+            )?;
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(relay(
+                    &listen,
+                    metrics_listen.as_deref(),
+                    drain_grace,
+                    coordinator.as_deref(),
+                    advertise.as_deref(),
+                    token_file.as_deref(),
+                    otlp_endpoint.as_deref(),
+                    xdp_iface.as_deref(),
+                    xdp_program.as_deref(),
+                    xdp_mode,
+                    mesh,
+                ))
+        }
         Command::AnycastGate {
             readyz,
             protocols,
@@ -353,6 +377,33 @@ fn tls_fingerprint(config_path: &str) -> Result<()> {
     Ok(())
 }
 
+/// The relay mesh settings from `ferrum relay`'s `--mesh-*` flags (PRD
+/// `relay-mesh.md`), or `None` without `--mesh-listen`.
+fn mesh_config(
+    listen: Option<&str>,
+    peers: &[String],
+    key_file: Option<&str>,
+) -> Result<Option<ferrum_transport::MeshConfig>> {
+    let (Some(listen), Some(key_file)) = (listen, key_file) else {
+        return Ok(None);
+    };
+    let listen = listen
+        .parse()
+        .with_context(|| format!("parsing --mesh-listen '{listen}'"))?;
+    let peers = peers
+        .iter()
+        .map(|p| {
+            p.parse()
+                .with_context(|| format!("parsing --mesh-peer '{p}'"))
+        })
+        .collect::<Result<Vec<SocketAddr>>>()?;
+    let key = std::fs::read_to_string(key_file)
+        .with_context(|| format!("reading --mesh-key-file '{key_file}'"))?;
+    let key = ferrum_core::keys::decode_key(&key)
+        .with_context(|| format!("--mesh-key-file '{key_file}' must hold 32 bytes, base64"))?;
+    Ok(Some(ferrum_transport::MeshConfig { listen, peers, key }))
+}
+
 /// Phase 4 M3: run the public-key-keyed relay until interrupted. The relay only
 /// forwards opaque (already-encrypted) datagrams between registered peers, so it
 /// needs no keys of its own. With `metrics_listen` set, also serve
@@ -370,7 +421,7 @@ fn tls_fingerprint(config_path: &str) -> Result<()> {
 /// `RelayHeartbeat` RPC (PRD `phase-6-anycast-autoscaling.md` FR3) so the
 /// coordinator advertises it to devices, and sends a draining goodbye when
 /// the drain begins so it is withdrawn from advertisement immediately.
-// Ten parameters, all independent CLI flags of the one relay subcommand;
+// Eleven parameters, all independent CLI flags of the one relay subcommand;
 // grouping them into a struct would only move the noise, so allow the lint.
 #[allow(clippy::too_many_arguments)]
 async fn relay(
@@ -384,6 +435,7 @@ async fn relay(
     xdp_iface: Option<&str>,
     xdp_program: Option<&str>,
     xdp_mode: XdpModeArg,
+    mesh: Option<ferrum_transport::MeshConfig>,
 ) -> Result<()> {
     // Tracing: stderr logs always; OTLP span export (Phase 6 FR4) when
     // --otlp-endpoint is given and the `otlp` feature is built. The guard flushes
@@ -393,11 +445,20 @@ async fn relay(
     let addr: SocketAddr = listen
         .parse()
         .with_context(|| format!("parsing --listen '{listen}'"))?;
-    let server = std::sync::Arc::new(
-        ferrum_transport::RelayServer::bind(addr)
+    let server = match mesh {
+        Some(mesh) => {
+            let (mesh_listen, peers) = (mesh.listen, mesh.peers.len());
+            let server = ferrum_transport::RelayServer::bind_with_mesh(addr, mesh)
+                .await
+                .with_context(|| format!("binding relay on {addr} with mesh on {mesh_listen}"))?;
+            info!(%mesh_listen, peers, "relay mesh enabled");
+            server
+        }
+        None => ferrum_transport::RelayServer::bind(addr)
             .await
             .with_context(|| format!("binding relay on {addr}"))?,
-    );
+    };
+    let server = std::sync::Arc::new(server);
 
     if let Some(metrics_addr) = metrics_listen {
         let metrics_addr: SocketAddr = metrics_addr
@@ -1292,6 +1353,63 @@ mod tests {
             XdpModeArg::Native
         );
         assert!(relay_mode(&["--xdp-mode", "hardware"]).is_err());
+    }
+
+    /// The mesh flags come as a set: a listener needs a key and vice versa,
+    /// and peers need a listener.
+    #[test]
+    fn relay_mesh_flags() {
+        let parse = |args: &[&str]| {
+            let argv = ["ferrum", "relay", "--listen", "0.0.0.0:51821"];
+            Cli::try_parse_from(argv.iter().chain(args)).map(|_| ())
+        };
+        assert!(parse(&[]).is_ok());
+        assert!(parse(&[
+            "--mesh-listen",
+            "10.0.0.1:51822",
+            "--mesh-key-file",
+            "k",
+            "--mesh-peer",
+            "10.0.0.2:51822",
+            "--mesh-peer",
+            "10.0.0.3:51822",
+        ])
+        .is_ok());
+        assert!(parse(&["--mesh-listen", "10.0.0.1:51822"]).is_err());
+        assert!(parse(&["--mesh-key-file", "k"]).is_err());
+        assert!(parse(&["--mesh-peer", "10.0.0.2:51822"]).is_err());
+    }
+
+    /// The key file must hold exactly 32 base64-encoded bytes.
+    #[test]
+    fn mesh_key_file_is_checked() {
+        let dir = std::env::temp_dir().join(format!("ferrum-mesh-key-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("good");
+        let bad = dir.join("bad");
+        std::fs::write(&good, "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=\n").unwrap();
+        std::fs::write(&bad, "c2hvcnQ=").unwrap();
+        let cfg = mesh_config(
+            Some("127.0.0.1:51822"),
+            &["127.0.0.1:51823".to_string()],
+            Some(good.to_str().unwrap()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(cfg.key, [b'*'; 32]);
+        assert_eq!(
+            cfg.peers,
+            ["127.0.0.1:51823".parse::<SocketAddr>().unwrap()]
+        );
+        assert!(mesh_config(Some("127.0.0.1:51822"), &[], Some(bad.to_str().unwrap())).is_err());
+        assert!(mesh_config(
+            Some("127.0.0.1:51822"),
+            &["nope".into()],
+            Some(good.to_str().unwrap())
+        )
+        .is_err());
+        assert!(mesh_config(None, &[], None).unwrap().is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// `anycast-gate` needs at least one `--protocol`, and defaults to the
