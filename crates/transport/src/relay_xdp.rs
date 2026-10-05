@@ -121,8 +121,8 @@ pub struct RelayXdpLoader {
     // Kept alive so the loaded program/maps stay attached; never read after
     // construction (the typed map handles below are the working API).
     _ebpf: Ebpf,
-    addr_to_key: Mutex<AyaHashMap<aya::maps::MapData, AddrKey, PublicKey>>,
-    key_to_addr: Mutex<AyaHashMap<aya::maps::MapData, PublicKey, AddrKey>>,
+    addr_to_key: Arc<Mutex<AyaHashMap<aya::maps::MapData, AddrKey, PublicKey>>>,
+    key_to_addr: Arc<Mutex<AyaHashMap<aya::maps::MapData, PublicKey, AddrKey>>>,
     gateway: Mutex<Array<aya::maps::MapData, GatewayInfo>>,
     stats: Mutex<PerCpuArray<aya::maps::MapData, u64>>,
     metrics: Arc<RelayMetrics>,
@@ -216,8 +216,8 @@ impl RelayXdpLoader {
 
         let this = Arc::new(Self {
             _ebpf: ebpf,
-            addr_to_key: Mutex::new(addr_to_key),
-            key_to_addr: Mutex::new(key_to_addr),
+            addr_to_key: Arc::new(Mutex::new(addr_to_key)),
+            key_to_addr: Arc::new(Mutex::new(key_to_addr)),
             gateway: Mutex::new(gateway),
             stats: Mutex::new(stats),
             metrics,
@@ -346,6 +346,22 @@ impl RelayXdpHook for RelayXdpLoader {
         if let Err(e) = key_to_addr.insert(key, addr_key, 0) {
             warn!("relay xdp: mirroring key->addr failed: {e}");
         }
+    }
+
+    fn on_remove(&self, key: PublicKey, addr: std::net::SocketAddr) {
+        // A failed removal leaves the fast path forwarding to the client's old
+        // address, so unlike a skipped insert this waits for the locks.
+        let addr_to_key = self.addr_to_key.clone();
+        let key_to_addr = self.key_to_addr.clone();
+        tokio::spawn(async move {
+            if let std::net::SocketAddr::V4(v4) = addr {
+                let _ = addr_to_key
+                    .lock()
+                    .await
+                    .remove(&AddrKey::from_v4(v4.ip().octets(), v4.port()));
+            }
+            let _ = key_to_addr.lock().await.remove(&key);
+        });
     }
 }
 

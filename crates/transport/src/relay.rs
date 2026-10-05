@@ -57,6 +57,7 @@ use tracing::{debug, warn};
 use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
 
 use crate::relay_auth::{self, RateLimiter, RegisterAuth, COOKIE_LEN, PROOF_LEN};
+use crate::relay_mesh::{self, Codec, MeshConfig, Msg, Remote, Replay};
 use crate::{MeshTransport, TransportError};
 
 /// A peer's 32-byte WireGuard public key — the relay's routing key.
@@ -242,9 +243,38 @@ pub struct RelayMetrics {
     /// upgrade. Kept out of `frames_dropped_total`, the forwarding SLI, so
     /// they can't trip the relay-forwarding SLO alerts.
     control_frames_invalid_total: AtomicU64,
+    /// Relay mesh (PRD `relay-mesh.md`): rendered only when a mesh is
+    /// configured, so a relay without one exposes exactly what it did before.
+    mesh_enabled: AtomicBool,
+    mesh_peers: AtomicU64,
+    mesh_remote_keys: AtomicU64,
+    mesh_frames_forwarded_total: AtomicU64,
+    mesh_frames_delivered_total: AtomicU64,
+    mesh_rejected_total: AtomicU64,
 }
 
 impl RelayMetrics {
+    /// The live client count changed outside a registration (a client moved
+    /// to a sibling relay).
+    fn set_clients(&self, client_count: usize) {
+        self.clients_registered
+            .store(client_count as u64, Ordering::Relaxed);
+    }
+
+    fn note_mesh_forwarded(&self) {
+        self.mesh_frames_forwarded_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_mesh_delivered(&self) {
+        self.mesh_frames_delivered_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_mesh_rejected(&self) {
+        self.mesh_rejected_total.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// A register frame was processed; `client_count` is the live `key -> addr`
     /// table size right after it (the current gauge value).
     fn note_register(&self, client_count: usize) {
@@ -387,6 +417,38 @@ impl RelayMetrics {
             "Total malformed control frames (wrong-length register/response, unknown tag), e.g. from pre-upgrade clients. Not a forwarding drop.",
             self.control_frames_invalid_total.load(Ordering::Relaxed),
         );
+        if self.mesh_enabled.load(Ordering::Relaxed) {
+            gauge(
+                &mut out,
+                "ferrum_relay_mesh_peers",
+                "Sibling relays in this relay's mesh.",
+                self.mesh_peers.load(Ordering::Relaxed),
+            );
+            gauge(
+                &mut out,
+                "ferrum_relay_mesh_remote_keys",
+                "Clients known to be registered on a sibling relay.",
+                self.mesh_remote_keys.load(Ordering::Relaxed),
+            );
+            counter(
+                &mut out,
+                "ferrum_relay_mesh_frames_forwarded_total",
+                "Total data frames sent to a sibling relay for one of its clients.",
+                self.mesh_frames_forwarded_total.load(Ordering::Relaxed),
+            );
+            counter(
+                &mut out,
+                "ferrum_relay_mesh_frames_delivered_total",
+                "Total data frames from a sibling relay delivered to a client here.",
+                self.mesh_frames_delivered_total.load(Ordering::Relaxed),
+            );
+            counter(
+                &mut out,
+                "ferrum_relay_mesh_rejected_total",
+                "Total mesh datagrams rejected (unknown sender, bad tag, malformed, or replayed).",
+                self.mesh_rejected_total.load(Ordering::Relaxed),
+            );
+        }
         out
     }
 }
@@ -420,6 +482,8 @@ struct RegisterDelta {
     evicted_addr: Option<SocketAddr>,
     /// This address's previous key, if it was just reassigned (now stale).
     evicted_key: Option<PublicKey>,
+    /// A new or changed mapping, not a keepalive refresh of the live one.
+    fresh: bool,
 }
 
 /// An observer notified of every successful registration, so a fast-path
@@ -439,6 +503,10 @@ pub trait RelayXdpHook: Send + Sync {
         evicted_addr: Option<SocketAddr>,
         evicted_key: Option<PublicKey>,
     );
+
+    /// Called when `key` (last at `addr`) leaves this relay's table because
+    /// it registered on a sibling relay (PRD `relay-mesh.md`).
+    fn on_remove(&self, key: PublicKey, addr: SocketAddr);
 }
 
 /// The relay server: a public-key-keyed UDP packet forwarder.
@@ -458,6 +526,8 @@ pub struct RelayServer {
     /// Register challenge issuer/verifier (SEC-003).
     auth: RegisterAuth,
     limits: Mutex<Limits>,
+    /// Sibling relays to forward to, if configured (PRD `relay-mesh.md`).
+    mesh: Option<Mesh>,
 }
 
 /// The register path's flood limits (SEC-003).
@@ -477,11 +547,13 @@ enum Admit {
     Refused,
 }
 
-/// The relay's bidirectional `key <-> addr` table.
+/// The relay's bidirectional `key <-> addr` table, plus when each client was
+/// last heard from (the relay mesh compares it with a sibling's).
 #[derive(Default)]
 struct Clients {
     by_key: HashMap<PublicKey, SocketAddr>,
     by_addr: HashMap<SocketAddr, PublicKey>,
+    heard: HashMap<PublicKey, Instant>,
 }
 
 impl Clients {
@@ -491,7 +563,8 @@ impl Clients {
     fn register(&mut self, key: PublicKey, addr: SocketAddr) -> RegisterDelta {
         let mut evicted_addr = None;
         let mut evicted_key = None;
-        if let Some(old_addr) = self.by_key.insert(key, addr) {
+        let previous = self.by_key.insert(key, addr);
+        if let Some(old_addr) = previous {
             if old_addr != addr {
                 self.by_addr.remove(&old_addr);
                 evicted_addr = Some(old_addr);
@@ -500,25 +573,101 @@ impl Clients {
         if let Some(old_key) = self.by_addr.insert(addr, key) {
             if old_key != key {
                 self.by_key.remove(&old_key);
+                self.heard.remove(&old_key);
                 evicted_key = Some(old_key);
             }
         }
+        self.heard.insert(key, Instant::now());
         RegisterDelta {
             key,
             addr,
             evicted_addr,
             evicted_key,
+            fresh: previous != Some(addr),
         }
     }
+
+    /// Note traffic from `key`.
+    fn touch(&mut self, key: &PublicKey) {
+        if let Some(at) = self.heard.get_mut(key) {
+            *at = Instant::now();
+        }
+    }
+
+    /// Drop `key`, returning its address.
+    fn remove(&mut self, key: &PublicKey) -> Option<SocketAddr> {
+        let addr = self.by_key.remove(key)?;
+        self.by_addr.remove(&addr);
+        self.heard.remove(key);
+        Some(addr)
+    }
+
+    /// Every client with milliseconds since it was last heard from.
+    fn ages(&self, now: Instant) -> Vec<(PublicKey, u32)> {
+        self.heard
+            .iter()
+            .map(|(k, at)| (*k, relay_mesh::age_ms(*at, now)))
+            .collect()
+    }
+}
+
+/// This relay's side of a relay mesh (PRD `relay-mesh.md`).
+struct Mesh {
+    socket: UdpSocket,
+    peers: Mutex<Vec<SocketAddr>>,
+    key: [u8; 32],
+    codec: Codec,
+    replay: Mutex<Replay>,
+    remote: Mutex<Remote>,
+}
+
+/// Where a client data frame goes.
+enum Route {
+    Local(SocketAddr),
+    Sibling(SocketAddr),
 }
 
 impl RelayServer {
     /// Bind the relay on `local`.
     pub async fn bind(local: SocketAddr) -> Result<Self, TransportError> {
+        Self::bind_inner(local, None).await
+    }
+
+    /// Bind the relay on `local` as a member of a relay mesh: frames for a
+    /// key registered on a sibling are forwarded to it (PRD `relay-mesh.md`).
+    pub async fn bind_with_mesh(
+        local: SocketAddr,
+        mesh: MeshConfig,
+    ) -> Result<Self, TransportError> {
+        Self::bind_inner(local, Some(mesh)).await
+    }
+
+    async fn bind_inner(
+        local: SocketAddr,
+        mesh: Option<MeshConfig>,
+    ) -> Result<Self, TransportError> {
+        let metrics = Arc::new(RelayMetrics::default());
+        let mesh = match mesh {
+            Some(cfg) => {
+                metrics.mesh_enabled.store(true, Ordering::Relaxed);
+                metrics
+                    .mesh_peers
+                    .store(cfg.peers.len() as u64, Ordering::Relaxed);
+                Some(Mesh {
+                    socket: UdpSocket::bind(cfg.listen).await?,
+                    peers: Mutex::new(cfg.peers),
+                    key: cfg.key,
+                    codec: Codec::new(cfg.key),
+                    replay: Mutex::new(Replay::default()),
+                    remote: Mutex::new(Remote::default()),
+                })
+            }
+            None => None,
+        };
         Ok(Self {
             socket: UdpSocket::bind(local).await?,
             clients: Mutex::new(Clients::default()),
-            metrics: Arc::new(RelayMetrics::default()),
+            metrics,
             xdp_hook: Mutex::new(None),
             draining: AtomicBool::new(false),
             auth: RegisterAuth::new(),
@@ -526,7 +675,37 @@ impl RelayServer {
                 per_ip: RateLimiter::new(IP_BURST, IP_REFILL_PER_SEC, MAX_TRACKED),
                 per_key: RateLimiter::new(KEY_BURST, KEY_REFILL_PER_SEC, MAX_TRACKED),
             }),
+            mesh,
         })
+    }
+
+    /// Replace this relay's siblings (their mesh addresses). New siblings are
+    /// asked for their keys and sent ours at once. No-op without a mesh.
+    pub async fn set_mesh_peers(&self, peers: Vec<SocketAddr>) {
+        let Some(mesh) = &self.mesh else { return };
+        let added: Vec<SocketAddr> = {
+            let mut current = mesh.peers.lock().expect("relay mesh poisoned");
+            let added = peers
+                .iter()
+                .filter(|p| !current.contains(p))
+                .copied()
+                .collect();
+            *current = peers;
+            self.metrics
+                .mesh_peers
+                .store(current.len() as u64, Ordering::Relaxed);
+            added
+        };
+        let sync = mesh.codec.sync();
+        for peer in &added {
+            let _ = mesh.socket.send_to(&sync, *peer).await;
+        }
+        self.announce_to(mesh, &added).await;
+    }
+
+    /// The mesh listener's address, when this relay is in a mesh.
+    pub fn mesh_addr(&self) -> Option<SocketAddr> {
+        self.mesh.as_ref().and_then(|m| m.socket.local_addr().ok())
     }
 
     /// The address the relay is listening on (useful when bound to port 0).
@@ -645,7 +824,164 @@ impl RelayServer {
         {
             hook.on_register(delta.key, delta.addr, delta.evicted_addr, delta.evicted_key);
         }
+        // Tell the siblings at once, so a client that just moved here is
+        // found here (and given up by the relay it left).
+        if let (true, Some(mesh)) = (delta.fresh, &self.mesh) {
+            let peers = mesh.peers.lock().expect("relay mesh poisoned").clone();
+            for msg in mesh.codec.present(&[(key, 0)]) {
+                for peer in &peers {
+                    let _ = mesh.socket.try_send_to(&msg, *peer);
+                }
+            }
+        }
         debug!(%from, "relay client registered");
+    }
+
+    fn xdp_remove(&self, key: PublicKey, addr: SocketAddr) {
+        if let Some(hook) = self
+            .xdp_hook
+            .lock()
+            .expect("relay xdp hook poisoned")
+            .as_ref()
+        {
+            hook.on_remove(key, addr);
+        }
+    }
+
+    /// Handle one datagram on the mesh socket.
+    async fn handle_mesh(&self, mesh: &Mesh, datagram: &[u8], from: SocketAddr) {
+        if !mesh
+            .peers
+            .lock()
+            .expect("relay mesh poisoned")
+            .contains(&from)
+        {
+            self.metrics.note_mesh_rejected();
+            debug!(%from, "relay mesh: datagram from a non-member; dropping");
+            return;
+        }
+        let Some((sender, counter, msg)) = relay_mesh::open(&mesh.key, datagram) else {
+            self.metrics.note_mesh_rejected();
+            debug!(%from, "relay mesh: bad tag or malformed; dropping");
+            return;
+        };
+        if msg.is_control()
+            && !mesh
+                .replay
+                .lock()
+                .expect("relay mesh poisoned")
+                .accept(from, sender, counter)
+        {
+            self.metrics.note_mesh_rejected();
+            debug!(%from, "relay mesh: replayed control message; dropping");
+            return;
+        }
+        let now = Instant::now();
+        match msg {
+            Msg::Present(entries) => {
+                let mut moved = Vec::new();
+                let mut fresher_here = Vec::new();
+                let (count, remote_keys) = {
+                    let mut clients = self.clients.lock().expect("relay table poisoned");
+                    let mut remote = mesh.remote.lock().expect("relay mesh poisoned");
+                    for (key, age_ms) in entries {
+                        let age = Duration::from_millis(age_ms.into());
+                        if age > relay_mesh::REMOTE_TTL {
+                            continue;
+                        }
+                        remote.learn(key, from, now.checked_sub(age).unwrap_or(now));
+                        let Some(heard) = clients.heard.get(&key).copied() else {
+                            continue;
+                        };
+                        let local_age = now.saturating_duration_since(heard);
+                        if relay_mesh::yields_to_sibling(local_age, age) {
+                            if let Some(addr) = clients.remove(&key) {
+                                moved.push((key, addr));
+                            }
+                        } else {
+                            fresher_here.push((key, relay_mesh::age_ms(heard, now)));
+                        }
+                    }
+                    (clients.by_key.len(), remote.len())
+                };
+                for (key, addr) in moved {
+                    self.xdp_remove(key, addr);
+                    debug!("relay mesh: a client moved to a sibling");
+                }
+                self.metrics.set_clients(count);
+                self.metrics
+                    .mesh_remote_keys
+                    .store(remote_keys as u64, Ordering::Relaxed);
+                // We heard from these more recently: say so, so the sibling
+                // gives them up now rather than at its next announce.
+                for msg in mesh.codec.present(&fresher_here) {
+                    let _ = mesh.socket.send_to(&msg, from).await;
+                }
+            }
+            Msg::Gone(keys) => {
+                let mut remote = mesh.remote.lock().expect("relay mesh poisoned");
+                for key in &keys {
+                    remote.forget(key, from);
+                }
+            }
+            Msg::Data { src, dst, payload } => {
+                let addr = self
+                    .clients
+                    .lock()
+                    .expect("relay table poisoned")
+                    .by_key
+                    .get(&dst)
+                    .copied();
+                match addr {
+                    Some(addr) => match self.socket.send_to(&data_frame(&src, payload), addr).await
+                    {
+                        Ok(_) => self.metrics.note_mesh_delivered(),
+                        Err(e) => {
+                            self.metrics.note_dropped();
+                            debug!(%addr, "relay mesh delivery failed: {e}");
+                        }
+                    },
+                    None => {
+                        // Not (or no longer) here: tell the sender to forget it.
+                        self.metrics.note_dropped();
+                        for msg in mesh.codec.gone(&[dst]) {
+                            let _ = mesh.socket.send_to(&msg, from).await;
+                        }
+                    }
+                }
+            }
+            Msg::Sync => self.announce_to(mesh, &[from]).await,
+        }
+    }
+
+    /// Send every key this relay holds to `peers`.
+    async fn announce_to(&self, mesh: &Mesh, peers: &[SocketAddr]) {
+        let ages = self
+            .clients
+            .lock()
+            .expect("relay table poisoned")
+            .ages(Instant::now());
+        for msg in mesh.codec.present(&ages) {
+            for peer in peers {
+                if let Err(e) = mesh.socket.send_to(&msg, *peer).await {
+                    debug!(%peer, "relay mesh announce failed: {e}");
+                }
+            }
+        }
+    }
+
+    /// The periodic mesh work: forget stale sibling keys, re-announce ours.
+    async fn mesh_tick(&self, mesh: &Mesh) {
+        let remote_keys = {
+            let mut remote = mesh.remote.lock().expect("relay mesh poisoned");
+            remote.expire(Instant::now());
+            remote.len()
+        };
+        self.metrics
+            .mesh_remote_keys
+            .store(remote_keys as u64, Ordering::Relaxed);
+        let peers = mesh.peers.lock().expect("relay mesh poisoned").clone();
+        self.announce_to(mesh, &peers).await;
     }
 
     /// Forward frames until the socket errors. Register frames refresh a live
@@ -659,9 +995,42 @@ impl RelayServer {
     #[tracing::instrument(skip_all, name = "relay_serve")]
     pub async fn serve(&self) -> Result<(), TransportError> {
         let mut buf = vec![0u8; FRAME_BUF];
+        let Some(mesh) = &self.mesh else {
+            loop {
+                let (n, from) = self.socket.recv_from(&mut buf).await?;
+                self.handle_client(&buf[..n], from).await;
+            }
+        };
+        let mut mesh_buf = vec![0u8; FRAME_BUF + 128];
+        // Ask every sibling for its keys once; the first tick announces ours.
+        let sync = mesh.codec.sync();
+        let peers = mesh.peers.lock().expect("relay mesh poisoned").clone();
+        for peer in &peers {
+            let _ = mesh.socket.send_to(&sync, *peer).await;
+        }
+        let mut announce = tokio::time::interval(relay_mesh::ANNOUNCE_EVERY);
+        announce.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            let (n, from) = self.socket.recv_from(&mut buf).await?;
-            let frame = &buf[..n];
+            tokio::select! {
+                r = self.socket.recv_from(&mut buf) => {
+                    let (n, from) = r?;
+                    self.handle_client(&buf[..n], from).await;
+                }
+                r = mesh.socket.recv_from(&mut mesh_buf) => match r {
+                    Ok((n, from)) => self.handle_mesh(mesh, &mesh_buf[..n], from).await,
+                    // A sibling that's down can surface as a reset (Windows
+                    // reports ICMP unreachable this way); keep serving.
+                    Err(e) => debug!("relay mesh receive: {e}"),
+                },
+                _ = announce.tick() => self.mesh_tick(mesh).await,
+            }
+        }
+    }
+
+    /// Handle one datagram from a client.
+    async fn handle_client(&self, frame: &[u8], from: SocketAddr) {
+        let n = frame.len();
+        {
             match frame.first() {
                 Some(&TAG_REGISTER) if n == REGISTER_LEN => {
                     let mut key = [0u8; KEY_LEN];
@@ -681,7 +1050,7 @@ impl RelayServer {
                         Admit::Refused => {}
                         Admit::Challenge => {
                             if !self.allow_ip(from) {
-                                continue;
+                                return;
                             }
                             let cookie = self.auth.issue(from, &key, Instant::now());
                             let out = challenge_frame(&self.auth.public(), &cookie);
@@ -701,7 +1070,7 @@ impl RelayServer {
                         frame[1 + KEY_LEN + COOKIE_LEN..].try_into().expect("sized");
                     let admit = self.admit(key, from);
                     if admit == Admit::Refused || !self.allow_ip(from) {
-                        continue;
+                        return;
                     }
                     // Cheap cookie check (return routability) first; only then
                     // spend an X25519 on the possession proof.
@@ -710,7 +1079,7 @@ impl RelayServer {
                     {
                         self.metrics.note_proof_rejected();
                         debug!(%from, "relay: register proof rejected");
-                        continue;
+                        return;
                     }
                     // A verified change of mapping is budgeted per key.
                     if admit == Admit::Challenge
@@ -723,33 +1092,67 @@ impl RelayServer {
                     {
                         self.metrics.note_rate_limited();
                         debug!(%from, "relay: per-key register rate limit");
-                        continue;
+                        return;
                     }
                     self.commit(key, from);
                 }
                 Some(&TAG_DATA) if n >= DATA_HEADER => {
                     let mut dst_key = [0u8; KEY_LEN];
                     dst_key.copy_from_slice(&frame[1..1 + KEY_LEN]);
-                    let (src_key, dst_addr) = {
-                        let clients = self.clients.lock().expect("relay table poisoned");
+                    let payload = &frame[DATA_HEADER..];
+                    let route = {
+                        let mut clients = self.clients.lock().expect("relay table poisoned");
                         // The sender must be registered, so we know whose packet
-                        // this is; the destination must be registered to receive.
-                        match (clients.by_addr.get(&from), clients.by_key.get(&dst_key)) {
-                            (Some(src), Some(dst)) => (*src, *dst),
-                            _ => {
-                                self.metrics.note_dropped();
-                                debug!(%from, "relay: unknown sender or destination; dropping");
-                                continue;
+                        // this is; the destination must be registered here or,
+                        // in a mesh, on a sibling.
+                        match clients.by_addr.get(&from).copied() {
+                            None => None,
+                            Some(src) => {
+                                clients.touch(&src);
+                                match clients.by_key.get(&dst_key) {
+                                    Some(dst) => Some((src, Route::Local(*dst))),
+                                    None => self
+                                        .mesh
+                                        .as_ref()
+                                        .and_then(|m| {
+                                            m.remote
+                                                .lock()
+                                                .expect("relay mesh poisoned")
+                                                .lookup(&dst_key, Instant::now())
+                                        })
+                                        .map(|sibling| (src, Route::Sibling(sibling))),
+                                }
                             }
                         }
                     };
-                    let payload = &frame[DATA_HEADER..];
-                    let out = data_frame(&src_key, payload);
-                    match self.socket.send_to(&out, dst_addr).await {
-                        Ok(_) => self.metrics.note_forwarded(payload.len()),
-                        Err(e) => {
+                    match route {
+                        Some((src_key, Route::Local(dst_addr))) => {
+                            let out = data_frame(&src_key, payload);
+                            match self.socket.send_to(&out, dst_addr).await {
+                                Ok(_) => self.metrics.note_forwarded(payload.len()),
+                                Err(e) => {
+                                    self.metrics.note_dropped();
+                                    warn!(%dst_addr, "relay forward failed: {e}");
+                                }
+                            }
+                        }
+                        Some((src_key, Route::Sibling(sibling))) => {
+                            let mesh = self.mesh.as_ref().expect("routed to a sibling");
+                            let out = mesh.codec.data(&src_key, &dst_key, payload);
+                            match mesh.socket.send_to(&out, sibling).await {
+                                Ok(_) => {
+                                    self.metrics.note_forwarded(payload.len());
+                                    self.metrics.note_mesh_forwarded();
+                                }
+                                Err(e) => {
+                                    self.metrics.note_dropped();
+                                    debug!(%sibling, "relay mesh forward failed: {e}");
+                                }
+                            }
+                        }
+                        None => {
                             self.metrics.note_dropped();
-                            warn!(%dst_addr, "relay forward failed: {e}");
+                            debug!(%from, "relay: unknown sender or destination; dropping");
                         }
                     }
                 }
@@ -1219,6 +1622,7 @@ mod tests {
                     .unwrap()
                     .push((key, addr, evicted_addr, evicted_key));
             }
+            fn on_remove(&self, _key: PublicKey, _addr: SocketAddr) {}
         }
 
         let server = Arc::new(
@@ -1770,5 +2174,260 @@ mod tests {
             "{refreshed} keepalives in 3.5 s after a goaway"
         );
         reader.abort();
+    }
+
+    // ---- relay mesh (PRD relay-mesh.md) ----
+
+    const MESH_KEY: [u8; 32] = [42; 32];
+
+    /// A relay in a mesh with no siblings yet; returns it with its mesh address.
+    async fn start_mesh_relay() -> (Arc<RelayServer>, SocketAddr) {
+        let server = Arc::new(
+            RelayServer::bind_with_mesh(
+                "127.0.0.1:0".parse().unwrap(),
+                MeshConfig {
+                    listen: "127.0.0.1:0".parse().unwrap(),
+                    peers: Vec::new(),
+                    key: MESH_KEY,
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        let mesh = server.mesh_addr().unwrap();
+        tokio::spawn({
+            let server = server.clone();
+            async move {
+                let _ = server.serve().await;
+            }
+        });
+        (server, mesh)
+    }
+
+    /// Two relays meshed with each other.
+    async fn start_mesh_pair() -> (Arc<RelayServer>, Arc<RelayServer>) {
+        let (a, a_mesh) = start_mesh_relay().await;
+        let (b, b_mesh) = start_mesh_relay().await;
+        a.set_mesh_peers(vec![b_mesh]).await;
+        b.set_mesh_peers(vec![a_mesh]).await;
+        (a, b)
+    }
+
+    /// Poll until metric `name` equals `want` (or fail after 3 s).
+    async fn wait_metric(metrics: &RelayMetrics, name: &str, want: u64) {
+        for _ in 0..150 {
+            if metric(metrics, name) == want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("{name} is {}, wanted {want}", metric(metrics, name));
+    }
+
+    /// A relay client for `secret`, knowing `peers` as (handle, key).
+    async fn mesh_client(
+        relay: &RelayServer,
+        secret: &StaticSecret,
+        peers: &[(SocketAddr, PublicKey)],
+    ) -> RelayMeshTransport {
+        RelayMeshTransport::connect(relay.local_addr().unwrap(), secret, peers)
+            .await
+            .unwrap()
+    }
+
+    /// Receive one payload within 2 s.
+    async fn recv_payload(t: &RelayMeshTransport) -> (Vec<u8>, SocketAddr) {
+        let mut buf = [0u8; 2048];
+        let (n, from) = tokio::time::timeout(Duration::from_secs(2), t.recv_from(&mut buf))
+            .await
+            .expect("nothing arrived")
+            .unwrap();
+        (buf[..n].to_vec(), from)
+    }
+
+    /// A stand-in sibling relay: a socket with the mesh key.
+    struct FakeSibling {
+        socket: UdpSocket,
+        codec: Codec,
+    }
+
+    impl FakeSibling {
+        async fn new(key: [u8; 32]) -> Self {
+            Self {
+                socket: UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+                codec: Codec::with_sender(key, 1),
+            }
+        }
+
+        fn addr(&self) -> SocketAddr {
+            self.socket.local_addr().unwrap()
+        }
+
+        async fn send(&self, msg: &[u8], to: SocketAddr) {
+            self.socket.send_to(msg, to).await.unwrap();
+        }
+
+        /// The next Present (`want_present`) or other non-Sync message from
+        /// the relay, within `ms`.
+        async fn next(&self, want_present: bool, ms: u64) -> Option<Vec<u8>> {
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(ms);
+            let mut buf = vec![0u8; 4096];
+            loop {
+                let (n, _) = tokio::time::timeout_at(deadline, self.socket.recv_from(&mut buf))
+                    .await
+                    .ok()?
+                    .ok()?;
+                let Some((_, _, msg)) = relay_mesh::open(&MESH_KEY, &buf[..n]) else {
+                    continue;
+                };
+                if matches!(msg, Msg::Present(_)) == want_present && !matches!(msg, Msg::Sync) {
+                    return Some(buf[..n].to_vec());
+                }
+            }
+        }
+    }
+
+    /// Peers on different relays reach each other through the mesh, both ways.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mesh_forwards_between_relays() {
+        let (a, b) = start_mesh_pair().await;
+        let ((sx, kx), (sy, ky)) = (ident(21), ident(22));
+        let hx: SocketAddr = "10.9.0.1:1".parse().unwrap();
+        let hy: SocketAddr = "10.9.0.2:1".parse().unwrap();
+        let x = mesh_client(&a, &sx, &[(hy, ky)]).await;
+        let y = mesh_client(&b, &sy, &[(hx, kx)]).await;
+        wait_metric(&a.metrics(), "ferrum_relay_mesh_remote_keys", 1).await;
+        wait_metric(&b.metrics(), "ferrum_relay_mesh_remote_keys", 1).await;
+
+        x.send_to(hy, b"x to y").await.unwrap();
+        assert_eq!(recv_payload(&y).await, (b"x to y".to_vec(), hx));
+        y.send_to(hx, b"y to x").await.unwrap();
+        assert_eq!(recv_payload(&x).await, (b"y to x".to_vec(), hy));
+
+        for (relay, name) in [
+            (&a, "ferrum_relay_mesh_frames_forwarded_total"),
+            (&b, "ferrum_relay_mesh_frames_delivered_total"),
+            (&b, "ferrum_relay_mesh_frames_forwarded_total"),
+            (&a, "ferrum_relay_mesh_frames_delivered_total"),
+        ] {
+            assert_eq!(metric(&relay.metrics(), name), 1, "{name}");
+        }
+    }
+
+    /// A client that re-registers on another relay is given up by the one it
+    /// left and reached at the new one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_client_that_moves_is_found_at_its_new_relay() {
+        let (a, b) = start_mesh_pair().await;
+        let ((sx, kx), (sy, ky)) = (ident(23), ident(24));
+        let hx: SocketAddr = "10.9.0.1:1".parse().unwrap();
+        let hy: SocketAddr = "10.9.0.2:1".parse().unwrap();
+        let x = mesh_client(&a, &sx, &[(hy, ky)]).await;
+        let y_old = mesh_client(&a, &sy, &[(hx, kx)]).await;
+        wait_metric(&a.metrics(), "ferrum_relay_clients_registered", 2).await;
+        x.send_to(hy, b"before").await.unwrap();
+        assert_eq!(recv_payload(&y_old).await.0, b"before");
+
+        // Let A's record of Y age a little, then Y moves to B.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(y_old);
+        let y = mesh_client(&b, &sy, &[(hx, kx)]).await;
+        wait_metric(&a.metrics(), "ferrum_relay_clients_registered", 1).await;
+        x.send_to(hy, b"after").await.unwrap();
+        assert_eq!(recv_payload(&y).await, (b"after".to_vec(), hx));
+    }
+
+    /// A sibling's Present only takes a client away when the sibling heard
+    /// from it more recently; otherwise the relay keeps it and says so.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_a_fresher_sibling_takes_a_client() {
+        let (a, a_mesh) = start_mesh_relay().await;
+        let sib = FakeSibling::new(MESH_KEY).await;
+        a.set_mesh_peers(vec![sib.addr()]).await;
+        let (sx, kx) = ident(25);
+        let _x = mesh_client(&a, &sx, &[]).await;
+        wait_metric(&a.metrics(), "ferrum_relay_clients_registered", 1).await;
+        // Drain the Present A sent for X's registration.
+        let _ = sib.next(true, 500).await;
+
+        // The sibling last heard from X a minute ago: A keeps X and answers
+        // with its own, fresher, Present.
+        for m in sib.codec.present(&[(kx, 60_000)]) {
+            sib.send(&m, a_mesh).await;
+        }
+        let reply = sib.next(true, 2000).await.expect("no fresher Present back");
+        match relay_mesh::open(&MESH_KEY, &reply).unwrap().2 {
+            Msg::Present(e) => assert!(e.iter().any(|(k, age)| *k == kx && *age < 60_000)),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(metric(&a.metrics(), "ferrum_relay_clients_registered"), 1);
+
+        // The sibling just heard from X: A gives it up.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for m in sib.codec.present(&[(kx, 0)]) {
+            sib.send(&m, a_mesh).await;
+        }
+        wait_metric(&a.metrics(), "ferrum_relay_clients_registered", 0).await;
+    }
+
+    /// Mesh Data is delivered to a local client; for an unknown key the
+    /// sender gets Gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mesh_data_is_delivered_or_answered_with_gone() {
+        let (a, a_mesh) = start_mesh_relay().await;
+        let sib = FakeSibling::new(MESH_KEY).await;
+        a.set_mesh_peers(vec![sib.addr()]).await;
+        let ((sx, kx), (_, ky)) = (ident(26), ident(27));
+        let hy: SocketAddr = "10.9.0.2:1".parse().unwrap();
+        let x = mesh_client(&a, &sx, &[(hy, ky)]).await;
+        wait_metric(&a.metrics(), "ferrum_relay_clients_registered", 1).await;
+
+        sib.send(&sib.codec.data(&ky, &kx, b"via mesh"), a_mesh)
+            .await;
+        assert_eq!(recv_payload(&x).await, (b"via mesh".to_vec(), hy));
+
+        sib.send(&sib.codec.data(&kx, &key(99), b"lost"), a_mesh)
+            .await;
+        let gone = sib.next(false, 2000).await.expect("no Gone");
+        assert_eq!(
+            relay_mesh::open(&MESH_KEY, &gone).unwrap().2,
+            Msg::Gone(vec![key(99)])
+        );
+    }
+
+    /// Nothing from outside the mesh is acted on: a non-member, a wrong key,
+    /// and a replayed control message are all rejected.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mesh_rejects_outsiders_forgeries_and_replays() {
+        let (a, a_mesh) = start_mesh_relay().await;
+        let sib = FakeSibling::new(MESH_KEY).await;
+        a.set_mesh_peers(vec![sib.addr()]).await;
+        let (sx, kx) = ident(28);
+        let _x = mesh_client(&a, &sx, &[]).await;
+        wait_metric(&a.metrics(), "ferrum_relay_clients_registered", 1).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let take_x = |c: &Codec| c.present(&[(kx, 0)]).remove(0);
+
+        // Right key, but not a member.
+        let outsider = FakeSibling::new(MESH_KEY).await;
+        outsider.send(&take_x(&outsider.codec), a_mesh).await;
+        // A member's address, but the wrong key.
+        let forger = Codec::with_sender([7; 32], 1);
+        sib.send(&take_x(&forger), a_mesh).await;
+        wait_metric(&a.metrics(), "ferrum_relay_mesh_rejected_total", 2).await;
+        assert_eq!(metric(&a.metrics(), "ferrum_relay_clients_registered"), 1);
+
+        // A genuine Sync, then the same datagram again.
+        let sync = sib.codec.sync();
+        sib.send(&sync, a_mesh).await;
+        sib.send(&sync, a_mesh).await;
+        wait_metric(&a.metrics(), "ferrum_relay_mesh_rejected_total", 3).await;
+    }
+
+    /// A relay without a mesh exposes no mesh metrics.
+    #[tokio::test]
+    async fn relay_without_a_mesh_has_no_mesh_metrics() {
+        let (_, metrics) = start_relay().await;
+        assert!(!metrics.render().contains("mesh"));
     }
 }

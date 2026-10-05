@@ -30,7 +30,9 @@ pub mod stun;
 
 pub mod relay;
 mod relay_auth;
+pub mod relay_mesh;
 pub use relay::{RelayMeshTransport, RelayMetrics, RelayServer, RelayXdpHook};
+pub use relay_mesh::MeshConfig;
 
 // The relay's eBPF/XDP fast path (PRD `phase-6-ebpf-xdp-relay.md`) — Linux
 // and `xdp`-feature gated; `aya` is a `[target.'cfg(target_os =
