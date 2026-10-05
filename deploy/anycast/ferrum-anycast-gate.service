@@ -1,0 +1,40 @@
+[Unit]
+Description=Ferrum anycast gate (announce the relay's anycast route only while it is ready)
+# Ordered after bird and the relay, so on shutdown the gate stops first:
+# the route is withdrawn before the relay starts draining.
+After=network-online.target bird.service ferrum-relay.service
+Wants=network-online.target ferrum-relay.service
+Requires=bird.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ferrum anycast-gate \
+    --readyz http://127.0.0.1:9101/readyz \
+    --protocol ferrum_anycast4 --protocol ferrum_anycast6 \
+    --birdc /usr/sbin/birdc
+# The gate withdraws on a clean exit. These cover a crash or a SIGKILL, so a
+# dead gate never leaves the route announced.
+ExecStopPost=-/usr/sbin/birdc disable ferrum_anycast4
+ExecStopPost=-/usr/sbin/birdc disable ferrum_anycast6
+Restart=always
+RestartSec=2
+
+# birdc needs the bird control socket (bird's group can use it on most
+# distributions; adjust to how your package sets it up).
+User=bird
+Group=bird
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=-/run/bird -/var/run/bird
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target
