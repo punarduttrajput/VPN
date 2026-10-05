@@ -40,6 +40,12 @@
 
 ## Follow-ups
 
-- Desktop **licences and bans**: Tauri's tree brings more MPL-2.0 crates
-  (`cssparser`, `option-ext`, ...) and duplicate/wildcard questions that need
-  their own policy decisions before that gate can be turned on.
+- [x] Desktop **licences, bans and sources** (2026-10-05). The desktop
+      `deny.toml` had no licence allow-list, so every crate failed. With the
+      root's list, the only new licence is MPL-2.0, allowed per crate for
+      Servo's CSS engine (`cssparser`, `cssparser-macros`, `dtoa-short`,
+      `selectors`, via tauri-utils/dom_query) and `option-ext` (via dirs), on
+      the same file-level-copyleft reasoning as `uniffi`. Bans and sources
+      match the root; the app is `publish = false` so its version-less path
+      dependencies pass the wildcard check. CI runs `cargo deny check all` on
+      the desktop.
