@@ -90,12 +90,30 @@ at the wrong offset on the kernel side, no frame would be eligible: the XDP
 counter would stay at 0 and userspace would forward all 2000. So the
 2000/2000 fast-path result is the live check that the new reads are right.
 
-The rejections themselves (fragments, wrong version, options, not addressed
-to the relay, length mismatches) are covered by the unit tests in
-`ferrum-relay-xdp-common`. A live negative test needs a **registered** sender:
-an unregistered one misses the `ADDR_TO_KEY` lookup and falls through anyway,
-so its result proves nothing. That would mean adding a fragmented-send mode to
-`relay_traffic` (optional, not required to close the item).
+**Live fragment check (the SEC-018 rejection that matters most).** Send Data
+frames bigger than the veth's 1500-byte MTU from the *registered* `a` client.
+Linux fragments an oversized UDP datagram by default, so each frame arrives as
+two IP fragments:
+
+```sh
+xdp_before=$(curl -s 10.99.0.2:9101/metrics | awk '/^ferrum_relay_xdp_frames_forwarded_total/{print $2}')
+user_before=$(curl -s 10.99.0.2:9101/metrics | awk '/^ferrum_relay_frames_forwarded_total/{print $2}')
+$R 10.99.0.2:51821 b recv 20 30 & b_pid=$!
+$R 10.99.0.2:51821 a send 20 3000
+wait "$b_pid"   # just the receiver: a bare `wait` would also wait on the relay from §3
+curl -s 10.99.0.2:9101/metrics | grep -E '^ferrum_relay_(xdp_)?frames_forwarded_total'
+echo "before: xdp=$xdp_before userspace=$user_before"
+```
+
+**Pass:** `b` receives 20/20; the XDP counter is unchanged; the userspace
+counter grows by 20. The kernel reassembles each pair and the userspace relay
+forwards the whole frame. Before SEC-018 the first fragment (it carries the
+UDP header and the relay port) was fast-pathed on its own and the second went
+to userspace, so `b` received nothing; 0/20 here means the check isn't
+working on the kernel side.
+
+The other rejections (wrong version, IP options, not addressed to the relay,
+length mismatches) are covered by the unit tests in `ferrum-relay-xdp-common`.
 
 **Then:** tick the SEC-018 XDP item in
 [the ticket](../tickets/security-hardening/SEC-018-low-severity-hardening.md)
