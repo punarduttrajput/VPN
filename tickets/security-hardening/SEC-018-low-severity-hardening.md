@@ -46,8 +46,18 @@ each is cheaper to fix than to explain to an auditor:
       (falls back to `XDP_PASS`) and validates lengths; `GatewayInfo` gets
       explicit padding; `checksum_update` gets unit tests against a reference
       full checksum. Re-run the `relay_traffic` netns check.
-      *(**Deferred to a Linux-host follow-up:** `relay-ebpf` is its own
-      workspace that needs nightly, the `bpfel-unknown-none` target and
-      `bpf-linker`, and changes to it only count once the verifier accepts them
-      and the netns traffic check passes. None of that can run on the Windows
-      dev host.)*
+      *(**Code and unit tests done (2026-10-05); verifier load and the netns
+      re-run still need a Linux host.** The rules live in
+      `ferrum-relay-xdp-common::fastpath_eligible`, called by the program
+      before it touches a packet: version nibble 4, IHL 5, UDP, no
+      More-Fragments flag and zero offset, destination equal to the relay's
+      own address (`GatewayInfo::relay_ip`), IPv4 total length equal to the
+      frame minus Ethernet, UDP length equal to the IPv4 payload, and room
+      for a Data header. `checksum_update`/`words_of` moved to the same crate
+      and are tested against a full RFC 791 recomputation over 2,003 headers
+      plus a targeted second-carry case (a single-fold mutant fails it).
+      `GatewayInfo` has explicit `_pad0`/`_pad1` and a zeroing
+      `GatewayInfo::new`, pinned at 20 bytes. The program type-checks for
+      `bpfel-unknown-none` on nightly and the Linux `xdp` loader passes
+      clippy (cross-checked), but neither the kernel verifier nor live traffic
+      has seen the new code.)*

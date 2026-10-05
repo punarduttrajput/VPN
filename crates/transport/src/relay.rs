@@ -1470,7 +1470,12 @@ mod tests {
         sock.send_to(&old_register, relay).await.unwrap(); // 33 bytes
         sock.send_to(&[0x7f, 1, 2, 3], relay).await.unwrap(); // unknown tag
         sock.send_to(&[TAG_DATA, 1, 2], relay).await.unwrap(); // truncated data
+
+        // Wait for both counters: the invalid count reaches 2 after the second
+        // datagram, and the relay may not have read the third (the truncated
+        // data frame) yet. Asserting right then raced on loaded CI runners.
         wait_for(&metrics, "ferrum_relay_control_frames_invalid_total 2\n").await;
+        wait_for(&metrics, "ferrum_relay_frames_dropped_total 1\n").await;
         assert_eq!(
             metric(&metrics, "ferrum_relay_control_frames_invalid_total"),
             2

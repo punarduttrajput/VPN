@@ -18,9 +18,10 @@ git checkout audit-2026-10
 git verify-tag audit-2026-10   # only if a signed tag was issued
 ```
 
-`audit-2026-10` is an annotated tag on the `main` merge commit that added this
-document. At that commit the full CI matrix (§4.1), the Fuzz workflow and the
-Supply chain gate were green.
+`audit-2026-10` is an annotated tag on a `main` commit that contains this
+document. It goes only on a commit where the full CI matrix (§4.1), the Fuzz
+workflow and the Supply chain gate have all passed; check the commit's status
+on GitHub before relying on it.
 
 **State at the tag.** Security tickets SEC-001 to SEC-022 are merged (see
 [tickets](../../tickets/security-hardening/README.md)). Open items the
@@ -209,7 +210,10 @@ how to mint test OIDC tokens (`deploy/oracle-vm/scripts/mint-token.py`).
   exists.
 - **SEC-018 eBPF/XDP parser checks** (IPv4 version nibble, fragments, "not for
   us", length fields; `GatewayInfo` padding; `checksum_update` unit tests) are
-  not done; they need a Linux host with the eBPF toolchain.
+  implemented and unit-tested (`ferrum-relay-xdp-common`), and the program
+  type-checks for `bpfel-unknown-none`. They have not been loaded through the
+  kernel verifier or re-run on live traffic (the §4.3 netns harness), which
+  needs a Linux host with the eBPF toolchain.
 - **SEC-019 Linux runs.** The default real-TUN run passed in CI on boringtun
   0.7. The QUIC mesh variant (`TEST_MESH=1 MESH_QUIC=1`) and
   `STRICT_THROUGHPUT=1` haven't been run.

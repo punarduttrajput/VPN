@@ -1,12 +1,11 @@
 # cargo-deny configuration for the desktop app (SEC-022). The desktop is its
 # own workspace, so the root `deny.toml` gate never saw its dependency tree:
 # it had drifted onto vulnerable h2, rustls and quick-xml releases. CI
-# (`.github/workflows/supply-chain.yml`) now runs `cargo deny check advisories`
-# here too.
+# (`.github/workflows/supply-chain.yml`) now runs `cargo deny check` here too.
 #
-# Advisories only for now. Tauri's tree also brings MPL-2.0 crates (cssparser,
-# option-ext, ...) and duplicate/wildcard questions; licences and bans for the
-# desktop are a follow-up that needs its own policy decisions.
+# Advisories, licences, bans and sources, with the same policy as the root
+# `deny.toml`. The only licence beyond the root allow-list is MPL-2.0, allowed
+# per crate below rather than globally.
 #
 # Every `ignore` names the advisory, why it can't be fixed here, and where it
 # comes from. Adding one without those is a review blocker.
@@ -30,3 +29,58 @@ ignore = [
     # (glib-macros), the Linux webview stack Tauri depends on.
     { id = "RUSTSEC-2024-0370", reason = "proc-macro-error, unmaintained, build-time only; via gtk/glib-macros 0.18" },
 ]
+
+[licenses]
+# Permissive licences only, the same list as the root deny.toml.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "WTFPL",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+# MPL-2.0 is weak, file-level copyleft: using these crates unmodified puts no
+# obligation on Ferrum's own code (the same reasoning as the root's uniffi
+# exceptions). cssparser, cssparser-macros, dtoa-short and selectors are
+# Servo's CSS engine, via tauri-utils -> dom_query; option-ext comes via
+# dirs-sys -> dirs (tauri).
+[[licenses.exceptions]]
+crate = "cssparser"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "cssparser-macros"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "dtoa-short"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "selectors"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+crate = "option-ext"
+allow = ["MPL-2.0"]
+
+[bans]
+# Duplicate versions are common transitively in Tauri's tree (windows-sys,
+# gtk-rs, toml, ...) and not a security issue on their own: reported, not failed.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+# Only crates.io.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
