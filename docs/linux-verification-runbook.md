@@ -130,7 +130,9 @@ line-rate sender (a single-socket `relay_traffic` saturates around 1 Gbps).
 Attach in native mode:
 
 ```sh
-sudo ./target/release/ferrum relay --listen 0.0.0.0:51821 --metrics-listen 0.0.0.0:9101   --xdp-iface <nic> --xdp-mode native   --xdp-program relay-ebpf/target/bpfel-unknown-none/release/ferrum-relay-ebpf
+sudo ./target/release/ferrum relay --listen 0.0.0.0:51821 --metrics-listen 0.0.0.0:9101 \
+  --xdp-iface <nic> --xdp-mode native \
+  --xdp-program relay-ebpf/target/bpfel-unknown-none/release/ferrum-relay-ebpf
 ```
 
 **Check the mode before measuring:** the relay logs `relay xdp fast path
