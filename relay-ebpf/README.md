@@ -160,10 +160,11 @@ sudo ferrum relay --listen 0.0.0.0:51821 \
   --xdp-program relay-ebpf/target/bpfel-unknown-none/release/ferrum-relay-ebpf
 ```
 
-Generic (SKB) XDP mode is the default the loader should request — broadly
-compatible across drivers/kernels, at some cost vs. native/driver mode
-(a deployment-time tuning choice, not a code difference — see the PRD's
-Risks section).
+Generic (SKB) XDP is the default: it works on any interface (veth included)
+at some cost vs. native/driver mode. Add `--xdp-mode native` to run it in the
+NIC driver, which line-rate forwarding needs (drivers with XDP support only).
+A native attach that fails leaves the relay userspace-only with a warning; it
+doesn't fall back to generic.
 
 ## Verify
 

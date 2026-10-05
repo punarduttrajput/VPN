@@ -40,7 +40,7 @@ pub use relay::{RelayMeshTransport, RelayMetrics, RelayServer, RelayXdpHook};
 #[cfg(all(target_os = "linux", feature = "xdp"))]
 pub mod relay_xdp;
 #[cfg(all(target_os = "linux", feature = "xdp"))]
-pub use relay_xdp::{RelayXdpError, RelayXdpLoader};
+pub use relay_xdp::{RelayXdpError, RelayXdpLoader, XdpAttachMode};
 
 pub mod fingerprint;
 pub use fingerprint::Fingerprint;
