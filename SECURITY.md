@@ -2,10 +2,10 @@
 
 ## Reporting a vulnerability
 
-Please report security issues **privately**, using a GitHub security advisory on
-this repository ("Report a vulnerability" on the Security tab). Don't open a
-public issue. Include the affected component, the version or commit, and steps
-to reproduce.
+Please report security issues **privately**, by email to
+**[contact@wovyr.com](mailto:contact@wovyr.com)**. Don't open a public issue.
+Include the affected component, the version or commit, and steps to
+reproduce.
 
 ## What Ferrum protects, and what it doesn't
 

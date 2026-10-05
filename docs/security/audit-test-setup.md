@@ -229,5 +229,5 @@ The Linux-only checks below are scripted, with their pass criteria, in
 ## 7. Contacts and reporting
 
 Report findings during the engagement through the channel agreed in the
-contract. Outside it, use the private reporting route in
-[SECURITY.md](../../SECURITY.md).
+contract. Outside it, email [contact@wovyr.com](mailto:contact@wovyr.com), as
+in [SECURITY.md](../../SECURITY.md).
