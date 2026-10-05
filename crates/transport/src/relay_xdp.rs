@@ -60,9 +60,10 @@ pub enum RelayXdpError {
         // (clippy::result_large_err).
         source: Box<aya::EbpfError>,
     },
-    #[error("attaching the XDP program to interface {iface}: {source}")]
+    #[error("attaching the XDP program to interface {iface} in {mode} mode: {source}")]
     Attach {
         iface: String,
+        mode: XdpAttachMode,
         source: anyhow::Error,
     },
     #[error("the eBPF object has no XDP program named {0:?}")]
@@ -71,6 +72,41 @@ pub enum RelayXdpError {
     Map(&'static str, aya::maps::MapError),
     #[error("could not resolve this relay's gateway/interface info: {0}")]
     GatewayResolution(String),
+}
+
+/// Where the kernel runs the XDP program (`ferrum relay --xdp-mode`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum XdpAttachMode {
+    /// Generic (SKB) XDP, run by the kernel network stack after the driver
+    /// has built a socket buffer. Works on any interface, including veth, but
+    /// gives up most of XDP's speed. The default: the fast path stays an
+    /// optional accelerator (PRD G4) that attaches anywhere.
+    #[default]
+    Generic,
+    /// Native (driver) XDP, run in the NIC driver before any socket buffer
+    /// exists. Needed for line-rate forwarding (NFR1); only on drivers with
+    /// XDP support. If the driver can't do it, the attach fails and the relay
+    /// stays userspace-only, rather than quietly falling back to generic mode
+    /// and making a benchmark measure the wrong thing.
+    Native,
+}
+
+impl XdpAttachMode {
+    fn aya(self) -> XdpMode {
+        match self {
+            Self::Generic => XdpMode::Skb,
+            Self::Native => XdpMode::Driver,
+        }
+    }
+}
+
+impl std::fmt::Display for XdpAttachMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Generic => "generic (SKB)",
+            Self::Native => "native (driver)",
+        })
+    }
 }
 
 /// Name the XDP program is exported under in the compiled object — must
@@ -95,15 +131,15 @@ pub struct RelayXdpLoader {
 
 impl RelayXdpLoader {
     /// Load `program_path` (built per `relay-ebpf/README.md`), attach it to
-    /// `iface` in generic (SKB) mode (the most broadly compatible — see the
-    /// PRD's Risks section on native/driver mode as a deployment-time
-    /// choice, not a code branch), configure the relay's own listen
-    /// `port`, and spawn the background gateway-refresh and stats-poll
-    /// tasks. `metrics` is the same handle `ferrum relay` already exposes
-    /// on `/metrics` (PRD FR4).
+    /// `iface` in `mode` (see [`XdpAttachMode`]; generic is the most broadly
+    /// compatible, native is what line rate needs), configure the relay's
+    /// own listen `port`, and spawn the background gateway-refresh and
+    /// stats-poll tasks. `metrics` is the same handle `ferrum relay` already
+    /// exposes on `/metrics` (PRD FR4).
     pub async fn attach(
         program_path: &Path,
         iface: &str,
+        mode: XdpAttachMode,
         port: u16,
         metrics: Arc<RelayMetrics>,
     ) -> Result<Arc<Self>, RelayXdpError> {
@@ -123,12 +159,14 @@ impl RelayXdpLoader {
             .map_err(|_| RelayXdpError::ProgramNotFound(PROGRAM_NAME))?;
         program.load().map_err(|e| RelayXdpError::Attach {
             iface: iface.to_string(),
+            mode,
             source: e.into(),
         })?;
         program
-            .attach(iface, XdpMode::Skb)
+            .attach(iface, mode.aya())
             .map_err(|e| RelayXdpError::Attach {
                 iface: iface.to_string(),
+                mode,
                 source: e.into(),
             })?;
 

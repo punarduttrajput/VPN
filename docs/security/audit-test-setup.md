@@ -212,8 +212,7 @@ The Linux-only checks below are scripted, with their pass criteria, in
 
 - **NFR1 at line rate.** The ≥ 10 Gbps relay figure needs real hardware with
   native (driver) XDP and a multi-queue sender. Only a ~1 Gbps netns comparison
-  exists. The loader also attaches in generic (SKB) mode only, so native mode
-  needs a `--xdp-mode` option first.
+  exists. Native mode is available via `ferrum relay --xdp-mode native`.
 - **SEC-018 eBPF/XDP parser checks** (IPv4 version nibble, fragments, "not for
   us", length fields; `GatewayInfo` padding; `checksum_update` unit tests) are
   implemented and unit-tested (`ferrum-relay-xdp-common`), and the program

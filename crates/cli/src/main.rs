@@ -97,6 +97,13 @@ enum Command {
         /// `--xdp-iface` to actually enable the fast path.
         #[arg(long)]
         xdp_program: Option<String>,
+        /// Where the kernel runs the XDP program: `skb` (generic, any
+        /// interface, the default) or `native` (in the NIC driver, needed for
+        /// line rate; drivers with XDP support only). A native attach that
+        /// fails leaves the relay userspace-only, with a warning; it doesn't
+        /// fall back to `skb`.
+        #[arg(long, value_enum, default_value_t = XdpModeArg::Skb)]
+        xdp_mode: XdpModeArg,
     },
     /// Print the pin (SHA-256 of the public key) of the QUIC/MASQUE TLS certificate this
     /// node presents (derived from the config's `private_key`, so it's stable
@@ -184,6 +191,7 @@ fn main() -> Result<()> {
             otlp_endpoint,
             xdp_iface,
             xdp_program,
+            xdp_mode,
         } => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?
@@ -197,6 +205,7 @@ fn main() -> Result<()> {
                 otlp_endpoint.as_deref(),
                 xdp_iface.as_deref(),
                 xdp_program.as_deref(),
+                xdp_mode,
             )),
         #[cfg(any(feature = "quic", feature = "masque"))]
         Command::TlsFingerprint { config } => tls_fingerprint(&config),
@@ -299,7 +308,7 @@ fn tls_fingerprint(config_path: &str) -> Result<()> {
 /// `RelayHeartbeat` RPC (PRD `phase-6-anycast-autoscaling.md` FR3) so the
 /// coordinator advertises it to devices, and sends a draining goodbye when
 /// the drain begins so it is withdrawn from advertisement immediately.
-// Nine parameters, all independent CLI flags of the one relay subcommand;
+// Ten parameters, all independent CLI flags of the one relay subcommand;
 // grouping them into a struct would only move the noise, so allow the lint.
 #[allow(clippy::too_many_arguments)]
 async fn relay(
@@ -312,6 +321,7 @@ async fn relay(
     otlp_endpoint: Option<&str>,
     xdp_iface: Option<&str>,
     xdp_program: Option<&str>,
+    xdp_mode: XdpModeArg,
 ) -> Result<()> {
     // Tracing: stderr logs always; OTLP span export (Phase 6 FR4) when
     // --otlp-endpoint is given and the `otlp` feature is built. The guard flushes
@@ -336,7 +346,7 @@ async fn relay(
         tokio::spawn(serve_relay_metrics(metrics_addr, metrics, server.clone()));
     }
 
-    enable_xdp_fastpath(&server, addr.port(), xdp_iface, xdp_program).await;
+    enable_xdp_fastpath(&server, addr.port(), xdp_iface, xdp_program, xdp_mode).await;
 
     // Announce this relay to a coordinator (PRD `phase-6-anycast-autoscaling.md`
     // FR3): heartbeat at the coordinator-directed cadence; `drain_goodbye`
@@ -410,6 +420,7 @@ async fn enable_xdp_fastpath(
     relay_port: u16,
     xdp_iface: Option<&str>,
     xdp_program: Option<&str>,
+    xdp_mode: XdpModeArg,
 ) {
     let (Some(iface), Some(program)) = (xdp_iface, xdp_program) else {
         if xdp_iface.is_some() || xdp_program.is_some() {
@@ -419,9 +430,14 @@ async fn enable_xdp_fastpath(
         }
         return;
     };
+    let mode = match xdp_mode {
+        XdpModeArg::Skb => ferrum_transport::XdpAttachMode::Generic,
+        XdpModeArg::Native => ferrum_transport::XdpAttachMode::Native,
+    };
     match ferrum_transport::RelayXdpLoader::attach(
         std::path::Path::new(program),
         iface,
+        mode,
         relay_port,
         server.metrics(),
     )
@@ -429,7 +445,7 @@ async fn enable_xdp_fastpath(
     {
         Ok(loader) => {
             server.set_xdp_hook(loader);
-            info!(%iface, %program, "relay xdp fast path enabled");
+            info!(%iface, %program, %mode, "relay xdp fast path enabled");
         }
         Err(e) => {
             tracing::warn!("relay xdp: failed to attach fast path ({e}); running userspace-only");
@@ -446,12 +462,24 @@ async fn enable_xdp_fastpath(
     _relay_port: u16,
     xdp_iface: Option<&str>,
     xdp_program: Option<&str>,
+    _xdp_mode: XdpModeArg,
 ) {
     if xdp_iface.is_some() || xdp_program.is_some() {
         tracing::warn!(
             "relay xdp: --xdp-iface/--xdp-program given, but this binary wasn't built with the `xdp` feature (or isn't running on Linux); running userspace-only"
         );
     }
+}
+
+/// `ferrum relay --xdp-mode`. Defined here (not as the transport crate's
+/// `XdpAttachMode`) because that type only exists in Linux `xdp` builds,
+/// while the flag is accepted everywhere.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum XdpModeArg {
+    /// Generic (SKB) XDP: any interface, including veth.
+    Skb,
+    /// Native (driver) XDP: line rate, on drivers with XDP support.
+    Native,
 }
 
 /// Keep this relay announced to the coordinator (PRD
@@ -1171,5 +1199,32 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `xdp_mode` a `ferrum relay` command line parses to.
+    fn relay_mode(args: &[&str]) -> Result<XdpModeArg, clap::Error> {
+        let argv = ["ferrum", "relay", "--listen", "0.0.0.0:51821"];
+        match Cli::try_parse_from(argv.iter().chain(args))?.command {
+            Command::Relay { xdp_mode, .. } => Ok(xdp_mode),
+            _ => unreachable!("parsed a relay command"),
+        }
+    }
+
+    /// `--xdp-mode` defaults to generic (unchanged behaviour), accepts
+    /// `native` for line-rate runs, and rejects anything else.
+    #[test]
+    fn xdp_mode_flag() {
+        assert_eq!(relay_mode(&[]).unwrap(), XdpModeArg::Skb);
+        assert_eq!(relay_mode(&["--xdp-mode", "skb"]).unwrap(), XdpModeArg::Skb);
+        assert_eq!(
+            relay_mode(&["--xdp-mode", "native"]).unwrap(),
+            XdpModeArg::Native
+        );
+        assert!(relay_mode(&["--xdp-mode", "hardware"]).is_err());
     }
 }

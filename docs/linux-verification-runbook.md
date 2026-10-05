@@ -11,7 +11,7 @@ Run them in order: later steps reuse earlier builds.
 | 3 | XDP program loads through the kernel verifier and attaches | SEC-018 XDP item (part 1) |
 | 4 | Live relay traffic over the fast path, including the new rejections | SEC-018 XDP item (part 2) |
 | 5 | Real-TUN mesh over QUIC, and strict throughput | SEC-019 test-matrix item |
-| 6 | ≥ 10 Gbps relay on real hardware | NFR1 (Phase 6 FR1); **blocked**, see §6 |
+| 6 | ≥ 10 Gbps relay on real hardware | NFR1 (Phase 6 FR1); needs hardware, see §6 |
 
 ## 1. Host
 
@@ -123,10 +123,23 @@ real TUN for the first time.
 [its ticket](../tickets/security-hardening/SEC-019-upgrade-boringtun.md),
 with the numbers in STATUS.md.
 
-## 6. NFR1 ≥ 10 Gbps relay (blocked)
+## 6. NFR1 ≥ 10 Gbps relay
 
-Needs real hardware: a multi-queue NIC with native (driver) XDP support and a
-line-rate sender. **Also needs a code change first:** the loader attaches in
-generic mode only (`XdpMode::Skb` in `crates/transport/src/relay_xdp.rs`), so
-native mode can't be requested. Add a `ferrum relay --xdp-mode skb|native`
-option before scheduling this run.
+Needs real hardware: a multi-queue NIC whose driver supports native XDP, and a
+line-rate sender (a single-socket `relay_traffic` saturates around 1 Gbps).
+Attach in native mode:
+
+```sh
+sudo ./target/release/ferrum relay --listen 0.0.0.0:51821 --metrics-listen 0.0.0.0:9101 \
+  --xdp-iface <nic> --xdp-mode native \
+  --xdp-program relay-ebpf/target/bpfel-unknown-none/release/ferrum-relay-ebpf
+```
+
+**Check the mode before measuring:** the relay logs `relay xdp fast path
+enabled` with `mode=native (driver)`, and `ip link show <nic>` shows `xdp`
+(native), not `xdpgeneric`. A native attach the driver can't do fails with a
+warning and leaves the relay userspace-only; it never falls back to generic
+mode, so a benchmark can't silently measure the wrong path.
+
+**Pass:** ≥ 10 Gbps forwarded with `ferrum_relay_frames_forwarded_total`
+(userspace) flat. Record the NIC, driver, kernel, packet size and sender.
