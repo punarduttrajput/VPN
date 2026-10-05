@@ -4,7 +4,7 @@
 |---|---|
 | **Product** | Ferrum (Rust) |
 | **Phase** | 6 — Scale & Acceleration (prerequisite for anycast M5 and multi-PoP M4) |
-| **Status** | M1 (static relay mesh) and M2 (coordinator membership) implemented and verified in-process (2026-10-05); M3 open |
+| **Status** | M1 (static relay mesh) and M2 (coordinator membership) implemented and verified in-process; M3 (autoscaling templates) committed and CI-validated (2026-10-05) |
 | **Owner** | punarduttrajput |
 | **Depends on** | the Phase 4 relay (`crates/transport/src/relay.rs`), the relay registry (`phase-6-anycast-autoscaling.md` FR3), the XDP fast path (`phase-6-ebpf-xdp-relay.md`) |
 
@@ -151,9 +151,9 @@ elsewhere, the new relay's Present makes the draining one drop them.
    against a real coordinator); it merges the coordinator's list with any
    `--mesh-peer`s and calls `set_mesh_peers` on every beat. Siblings learn a
    new relay within one heartbeat interval (15 s).
-3. **M3 — Autoscaling (anycast M5).** The OCI instance pool, scaling
-   signals and policies, Ansible node config, and the CI validation job, now
-   that a scaled-out pool works.
+3. **M3 — Autoscaling (anycast M5)** ✅ *(2026-10-05)*. The OCI instance pool,
+   scaling signals and policies, Ansible node config, and the CI validation
+   job, now that a scaled-out pool works. See `deploy/autoscaling/README.md`.
 
 ## 5. Risks
 

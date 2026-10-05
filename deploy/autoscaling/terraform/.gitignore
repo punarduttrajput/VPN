@@ -1,0 +1,7 @@
+# Local Terraform state and inputs: the tfvars hold the mesh key.
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+terraform.tfvars
+*.auto.tfvars

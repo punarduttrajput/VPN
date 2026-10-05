@@ -4,7 +4,7 @@
 |---|---|
 | **Product** | Ferrum (Rust) |
 | **Phase** | 6 of 6 — Scale & Acceleration (FR2 + FR3 drill-down) |
-| **Status** | M1 (health/readiness + relay graceful drain) and M2 (relay registry & dynamic advertisement) implemented and live-verified (2026-07-12); M3 (GoAway + rolling relay deploy) and M4 (anycast health gate) implemented and verified in-process (2026-10-05; the netns and bird runs are in the Linux runbook); M5 open |
+| **Status** | M1 (health/readiness + relay graceful drain) and M2 (relay registry & dynamic advertisement) implemented and live-verified (2026-07-12); M3 (GoAway + rolling relay deploy) and M4 (anycast health gate) implemented and verified in-process (2026-10-05; the netns and bird runs are in the Linux runbook); M5 (autoscaling templates) committed and CI-validated (2026-10-05; a live cloud run is external) |
 | **Owner** | punarduttrajput |
 | **Last updated** | 2026-10-05 |
 | **Depends on** | [phase-6-scale-acceleration.md](phase-6-scale-acceleration.md) FR2/FR3/FR6; the Phase 4 relay (`RelayServer`, `crates/transport/src/relay.rs`); the Phase 3 coordinator (`ferrum-coordinator`) and its relay advertisement (`--relay` → `NetworkMapResponse.relay`); the Phase 6 FR4 metrics endpoints |
@@ -252,6 +252,27 @@ NFR.
   needs; committed as documented policy templates alongside Terraform/
   Ansible skeletons (parent FR5). **External:** live scale-out/-in against
   a real cloud; NFR4 is *pre*-verified in-process by FR3's acceptance.
+- **As built (2026-10-05):** waited on the relay mesh ([relay-mesh.md](relay-mesh.md)),
+  since a scaled-out pool behind a load balancer can put two peers on
+  different relays. Then, on Oracle Cloud (the owner's platform):
+  `deploy/autoscaling/terraform/oci-relay-pool/` is an instance pool behind
+  a UDP network load balancer (health check = `/readyz`, source address
+  preserved, two-tuple hashing), OCI autoscaling on CPU (OCI pools scale
+  natively on CPU or memory only), a security group (clients UDP 51821,
+  mesh UDP 51822 between relays only, probes TCP 9101 from the VCN), and a
+  cloud-init template that installs the pinned binary (SHA-256 checked) and
+  runs a meshed relay announcing the NLB address to the coordinator.
+  `deploy/observability/prometheus/rules/relay_scaling.yml` records pool
+  clients, throughput and ready count and raises `FerrumRelayPoolScaleOut`,
+  `…ScaleIn` (not below two) and `…NoReadyRelay`; a draining relay's
+  clients count against the ready ones. `deploy/ansible/` (role
+  `ferrum_relay`) configures relays on fixed hosts. A new "Deploy templates"
+  workflow checks `terraform fmt/validate`, the rendered cloud-init against
+  `cloud-init schema`, the Ansible syntax and rendered unit
+  (`systemd-analyze verify`), and `bird -p` on the anycast config; the
+  observability job runs the scaling rules' promtool tests. **External:**
+  `terraform apply`, the NLB's UDP behaviour, scale-out time against NFR4,
+  and whether OCI scale-in shuts instances down cleanly (so they drain).
 
 ---
 
@@ -285,8 +306,9 @@ NFR.
    `deploy/anycast/` + `ferrum anycast-gate`, gate verified against a real
    draining relay; the real-bird run is in the Linux runbook §8; BGP
    convergence documented as external.
-5. **M5 — Autoscaling policies + IaC**: FR6; templates + docs; cloud
-   verification external.
+5. **M5 — Autoscaling policies + IaC** ✅ *(2026-10-05, CI-validated)*:
+   FR6; OCI relay pool module, Prometheus scaling rules, Ansible relay role,
+   Deploy templates workflow; cloud verification external.
 
 ---
 

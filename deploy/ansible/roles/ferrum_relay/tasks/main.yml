@@ -1,0 +1,68 @@
+---
+- name: Check the required settings
+  ansible.builtin.assert:
+    that:
+      - ferrum_url is match('^https://')
+      - ferrum_sha256 is match('^[0-9a-f]{64}$')
+      - ferrum_relay_mesh_listen == '' or ferrum_relay_mesh_key | length == 44
+      - (ferrum_relay_coordinator == '') == (ferrum_relay_advertise == '')
+    fail_msg: >-
+      Set ferrum_url (https) and ferrum_sha256; a mesh needs a 32-byte base64
+      ferrum_relay_mesh_key; --coordinator and --advertise go together.
+    quiet: true
+
+- name: Install the ferrum binary
+  ansible.builtin.get_url:
+    url: "{{ ferrum_url }}"
+    checksum: "sha256:{{ ferrum_sha256 }}"
+    dest: /usr/local/bin/ferrum
+    mode: "0755"
+    owner: root
+    group: root
+  notify: Restart ferrum-relay
+
+- name: Create /etc/ferrum
+  ansible.builtin.file:
+    path: /etc/ferrum
+    state: directory
+    mode: "0700"
+    owner: root
+    group: root
+
+- name: Write the mesh key
+  ansible.builtin.copy:
+    content: "{{ ferrum_relay_mesh_key }}\n"
+    dest: /etc/ferrum/mesh.key
+    mode: "0600"
+    owner: root
+    group: root
+  no_log: true
+  when: ferrum_relay_mesh_listen != ''
+  notify: Restart ferrum-relay
+
+- name: Write the relay token
+  ansible.builtin.copy:
+    content: "{{ ferrum_relay_token }}\n"
+    dest: /etc/ferrum/relay-token
+    mode: "0600"
+    owner: root
+    group: root
+  no_log: true
+  when: ferrum_relay_token != ''
+  notify: Restart ferrum-relay
+
+- name: Install the relay unit
+  ansible.builtin.template:
+    src: ferrum-relay.service.j2
+    dest: /etc/systemd/system/ferrum-relay.service
+    mode: "0644"
+    owner: root
+    group: root
+  notify: Restart ferrum-relay
+
+- name: Enable and start the relay
+  ansible.builtin.systemd_service:
+    name: ferrum-relay
+    enabled: true
+    state: started
+    daemon_reload: true

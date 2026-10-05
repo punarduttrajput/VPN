@@ -234,7 +234,7 @@ checks the committed bird config and the gate against real bird2 daemons: a
 
 ```sh
 sudo apt install bird2
-bird -p -c deploy/anycast/bird.conf          # the committed config parses as-is
+bird -p -c deploy/anycast/bird.conf          # also checked in CI (Deploy templates)
 
 sudo ip netns add pop && sudo ip netns add isp
 sudo ip link add v-pop netns pop type veth peer name v-isp netns isp

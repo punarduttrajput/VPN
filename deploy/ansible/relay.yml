@@ -1,0 +1,11 @@
+---
+# Configure fixed relay hosts (an anycast PoP, a standalone relay). Pool
+# instances on OCI configure themselves through cloud-init instead
+# (deploy/autoscaling/terraform/oci-relay-pool).
+#
+#   ansible-playbook -i inventory.ini relay.yml
+- name: Ferrum relays
+  hosts: ferrum_relays
+  become: true
+  roles:
+    - ferrum_relay
