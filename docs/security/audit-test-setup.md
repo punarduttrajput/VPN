@@ -94,7 +94,8 @@ pwsh scripts/build-android.ps1
 ### 4.1 Unit and integration tests (any OS)
 
 CI (`.github/workflows/ci.yml`) runs these on `ubuntu-latest` and
-`windows-latest` on every push and PR. Run them locally the same way:
+`windows-latest` on every PR and push to `main` (docs-only changes are
+skipped). Run them locally the same way:
 
 ```sh
 cargo fmt --all -- --check
@@ -176,8 +177,9 @@ cargo +nightly fuzz run <target> -- -max_total_time=600
 
 Targets: `stun_response`, `relay_challenge`, `pad_deframe`, `tls_spki`,
 `pin_parse`, `jwt_verify`, `masque_target`, `helper_request`. Seed corpora are
-in `fuzz/corpus/`. CI runs every target for 30 s on each push and for 10
-minutes nightly, and uploads any crash reproducer as an artifact.
+in `fuzz/corpus/`. CI runs every target for 30 s on each PR and push to
+`main`, and for 10 minutes weekly, and uploads any crash reproducer as an
+artifact.
 
 ### 4.6 Supply chain
 
