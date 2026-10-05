@@ -58,6 +58,13 @@ served same-origin (see below).
 npm test -- --watch=false --browsers=ChromeHeadless
 ```
 
+CI runs them in the Admin panel workflow
+(`.github/workflows/admin-panel.yml`) with the `ChromeHeadlessCI` launcher from
+`karma.conf.js` (`--no-sandbox`, which Ubuntu 24.04 runners need), then builds
+the panel and runs the coordinator's `admin-api` tests and clippy against the
+embedded build. It runs when anything under `apps/admin-panel/` or
+`crates/coordinator/src/admin.rs` changes.
+
 ## Building and embedding into the coordinator
 
 The coordinator embeds this app's build output at Rust compile time via
