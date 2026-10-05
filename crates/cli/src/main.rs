@@ -390,8 +390,12 @@ async fn relay(
             } else {
                 server.begin_drain();
                 drain_goodbye.notify_one();
+                // Tell registered clients directly too (GoAway, PRD FR4), in
+                // case the coordinator's withdrawal push doesn't reach them.
+                let told = server.announce_goaway().await;
                 info!(
                     grace_secs = drain_grace,
+                    goaway_sent = told,
                     "relay draining: readiness failing, new clients refused (signal again to stop now)"
                 );
                 tokio::select! {
