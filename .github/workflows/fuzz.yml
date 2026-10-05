@@ -1,22 +1,44 @@
 name: Fuzz
 
 # SEC-017: libFuzzer targets for the parsers of untrusted input (see
-# fuzz/src/lib.rs). A short run on every push/PR, a longer one nightly. A crash
-# fails the job and uploads the reproducer.
+# fuzz/src/lib.rs). A short run on every PR and push to main, a longer one
+# weekly (it was nightly, but 8 targets x 10 min a day was most of the
+# repo's Actions minutes). A crash fails the job and uploads the reproducer.
 
 on:
+  # Minutes are billed on this private repo (and Windows at 2x), so: run on
+  # PRs and on pushes to main only (not every branch push, which ran
+  # everything twice per PR commit), and skip docs-only changes.
   push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "PRD/**"
+      - "tickets/**"
   pull_request:
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "PRD/**"
+      - "tickets/**"
   schedule:
-    - cron: "17 3 * * *" # nightly, off the hour
+    - cron: "17 3 * * 0" # weekly, Sundays, off the hour
   workflow_dispatch:
+
+# A newer push to the same PR cancels its still-running run. Everything else
+# (main pushes, schedules, manual runs) is grouped by commit, so no main
+# commit's run is ever cancelled or replaced while pending.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   fuzz:
-    name: fuzz (${{ github.event_name == 'schedule' && 'nightly, 10 min/target' || '30 s/target' }})
+    name: fuzz (${{ github.event_name == 'schedule' && 'weekly, 10 min/target' || '30 s/target' }})
     runs-on: ubuntu-latest
     env:
       FUZZ_SECONDS: ${{ github.event_name == 'schedule' && '600' || '30' }}

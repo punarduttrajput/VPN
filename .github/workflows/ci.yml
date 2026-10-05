@@ -1,14 +1,35 @@
 name: CI
 
 on:
+  # Minutes are billed on this private repo (and Windows at 2x), so: run on
+  # PRs and on pushes to main only (not every branch push, which ran
+  # everything twice per PR commit), and skip docs-only changes.
   push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "PRD/**"
+      - "tickets/**"
   pull_request:
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "PRD/**"
+      - "tickets/**"
   workflow_dispatch:
     inputs:
       test_quic:
         description: "Also run QUIC end-to-end verification over a real TUN"
         type: boolean
         default: false
+
+# A newer push to the same PR cancels its still-running run. Everything else
+# (main pushes, schedules, manual runs) is grouped by commit, so no main
+# commit's run is ever cancelled or replaced while pending.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
