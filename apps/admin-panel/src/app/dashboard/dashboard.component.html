@@ -1,36 +1,60 @@
 <div class="section-actions">
   <button class="secondary" [disabled]="loading()" (click)="refresh()">Refresh</button>
+  @if (updatedLabel()) {
+    <span class="updated">{{ updatedLabel() }}</span>
+  }
 </div>
 
 <h2>Overview</h2>
-<div class="stat-grid">
+<div class="stat-grid" [attr.aria-busy]="loading()">
   <div class="stat-card">
     <span class="stat-label">Devices</span>
-    <span class="stat-value">{{ deviceCount() }}</span>
-    <span class="stat-detail">registered with the coordinator</span>
+    <span class="stat-value" [class.placeholder]="deviceCount() === null">{{ deviceCount() ?? '—' }}</span>
+    @if (devicesError()) {
+      <span class="stat-detail err">{{ devices() ? "couldn't refresh" : "couldn't load" }}</span>
+    } @else {
+      <span class="stat-detail">registered with the coordinator</span>
+    }
   </div>
   <div class="stat-card">
     <span class="stat-label">Awaiting endpoint</span>
-    <span class="stat-value" [class.warn]="pendingCount() > 0">{{ pendingCount() }}</span>
+    <span
+      class="stat-value"
+      [class.placeholder]="pendingCount() === null"
+      [class.warn]="(pendingCount() ?? 0) > 0"
+      >{{ pendingCount() ?? '—' }}</span
+    >
     <span class="stat-detail">not yet reachable</span>
   </div>
   <div class="stat-card">
     <span class="stat-label">Tags in use</span>
-    <span class="stat-value">{{ tagCount() }}</span>
+    <span class="stat-value" [class.placeholder]="tagCount() === null">{{ tagCount() ?? '—' }}</span>
     <span class="stat-detail">distinct policy tags</span>
   </div>
   <div class="stat-card">
     <span class="stat-label">ACL policy</span>
-    <span class="stat-value" [class.ok]="policy()?.allow_all">{{ policyLabel() }}</span>
-    <span class="stat-detail">
-      <a routerLink="/policy">edit policy →</a>
-    </span>
+    <span class="stat-value" [class.placeholder]="policy() === null" [class.ok]="policy()?.allow_all">{{
+      policyLabel()
+    }}</span>
+    @if (policyError()) {
+      <span class="stat-detail err">{{ policy() ? "couldn't refresh" : "couldn't load" }}</span>
+    } @else {
+      <span class="stat-detail">
+        <a routerLink="/policy">edit policy →</a>
+      </span>
+    }
   </div>
 </div>
 
 <h2>Recent devices</h2>
 <ul class="rows">
-  @if (recentDevices().length === 0) {
+  @if (devices() === null) {
+    @if (devicesError()) {
+      <li class="empty err">Couldn't load devices: {{ devicesError() }}</li>
+    } @else {
+      <li class="empty loading" aria-busy="true">Loading devices…</li>
+    }
+  } @else if (empty()) {
     <li class="empty">No devices registered.</li>
   }
   @for (d of recentDevices(); track d.public_key) {
@@ -47,7 +71,7 @@
     </li>
   }
 </ul>
-@if (deviceCount() > recentDevices().length) {
+@if ((deviceCount() ?? 0) > recentDevices().length) {
   <p class="hint">
     <a routerLink="/devices">view all {{ deviceCount() }} devices →</a>
   </p>

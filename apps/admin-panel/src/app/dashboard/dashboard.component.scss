@@ -1,1 +1,25 @@
-// Layout/palette are global (src/styles.scss); nothing component-specific yet.
+// Layout/palette are global (src/styles.scss); these are the Dashboard's own
+// load states (DASH-002/003/009).
+
+.section-actions {
+  align-items: center;
+}
+
+.updated {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.stat-value.placeholder {
+  color: var(--muted);
+}
+
+.stat-detail.err,
+.rows .empty.err {
+  color: var(--err);
+}
+
+.rows .empty.loading {
+  color: var(--muted);
+  font-style: italic;
+}

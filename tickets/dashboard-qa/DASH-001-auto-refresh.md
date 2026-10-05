@@ -23,10 +23,10 @@ indication they're stale.
 
 ## Acceptance criteria
 
-- [ ] The Dashboard refreshes on a sensible interval while the view is active.
-- [ ] Polling pauses when the route/tab is not visible (no needless load).
-- [ ] Reflected within the interval without a manual reload (AC1).
-- [ ] Paired with DASH-009 (a visible last-updated time).
+- [x] The Dashboard refreshes on a sensible interval while the view is active.
+- [x] Polling pauses when the route/tab is not visible (no needless load).
+- [x] Reflected within the interval without a manual reload (AC1).
+- [x] Paired with DASH-009 (a visible last-updated time).
 
 ## Implementation notes
 

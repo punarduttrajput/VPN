@@ -16,9 +16,9 @@ numbers are current or minutes old — a trust problem for an operational overvi
 
 ## Acceptance criteria
 
-- [ ] A visible "Updated N s/min ago" (or an absolute timestamp) that updates on
+- [x] A visible "Updated N s/min ago" (or an absolute timestamp) that updates on
       each successful refresh.
-- [ ] Present alongside the Refresh control (AC1).
+- [x] Present alongside the Refresh control (AC1).
 
 ## Implementation notes
 
